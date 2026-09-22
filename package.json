@@ -1,0 +1,26 @@
+{
+  "name": "teslab",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TeslaB monorepo — Next.js client + Express API",
+  "workspaces": [
+    "client",
+    "server"
+  ],
+  "scripts": {
+    "dev": "concurrently -n api,web -c magenta,cyan \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:client": "npm run dev --workspace client",
+    "dev:server": "npm run dev --workspace server",
+    "build": "npm run build --workspace client",
+    "start": "concurrently -n api,web -c magenta,cyan \"npm:start:server\" \"npm:start:client\"",
+    "start:client": "npm run start --workspace client",
+    "start:server": "npm run start --workspace server",
+    "lint": "npm run lint --workspace client"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
