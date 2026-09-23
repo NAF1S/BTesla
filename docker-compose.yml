@@ -1,6 +1,9 @@
 services:
   db:
-    image: postgres:17-alpine
+    # PostGIS build of the same PostgreSQL major version, so the existing
+    # teslab-pgdata volume keeps working. The plain postgres image has no
+    # PostGIS shared library, so `CREATE EXTENSION postgis` would fail on it.
+    image: postgis/postgis:17-3.5
     container_name: teslab-db
     restart: unless-stopped
     environment:

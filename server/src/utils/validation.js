@@ -2,7 +2,7 @@ import { ApiError } from './ApiError.js';
 
 /**
  * Stable codes are lower-case machine-readable values, matching the code
- * CHECK constraints in server/db/03-transport-network.sql.
+ * CHECK constraints in server/db/05-postgis-location.sql.
  */
 export const CODE_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 

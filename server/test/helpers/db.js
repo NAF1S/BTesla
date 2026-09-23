@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 
 import { applyMigrations } from '../../src/db/migrations.js';
 import { disconnect, prisma } from '../../src/db/prisma.js';
-import { seedTransportNetwork } from '../../src/db/seeds/transport-network.seed.js';
+import { seedLocationNetwork } from '../../src/db/seeds/location.seed.js';
 
 /**
  * Raw-SQL executor that reproduces the `{ rows }` shape the pg driver used to
@@ -45,10 +45,21 @@ export const pool = withRawQuery(prisma);
 /** Releases the Prisma client. */
 export const closePool = disconnect;
 
-/** Runs the transport seeder in its own transaction and returns its summary. */
-export const runSeed = () => prisma.$transaction((tx) => seedTransportNetwork(tx));
+/**
+ * The location seed is a long chain of sequential writes followed by a graph
+ * validation pass, so it needs more headroom than Prisma's 5s default
+ * transaction timeout.
+ */
+const TRANSACTION_OPTIONS = { timeout: 60_000 };
 
-/** Applies server/db/*.sql (idempotent) and seeds, so tests run on a fresh database. */
+/** Runs the location seeder in its own transaction and returns its summary. */
+export const runSeed = () =>
+  prisma.$transaction((tx) => seedLocationNetwork(tx), TRANSACTION_OPTIONS);
+
+/**
+ * Applies server/db/*.sql (idempotent) and the location seed, so tests run
+ * against a database that already holds the seeded zones, points and graph.
+ */
 export const prepareDatabase = async () => {
   await applyMigrations();
   return runSeed();

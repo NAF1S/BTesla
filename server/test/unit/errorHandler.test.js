@@ -25,7 +25,7 @@ const handle = (err) => {
     },
   };
 
-  errorHandler(err, { method: 'GET', originalUrl: '/api/transport' }, res, () => {});
+  errorHandler(err, { method: 'GET', originalUrl: '/api/location' }, res, () => {});
   return captured;
 };
 
