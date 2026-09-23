@@ -21,7 +21,8 @@ TeslaB/
 │   ├── db/                 # SQL applied by migrate / on first container boot
 │   │   ├── 01-schema.sql
 │   │   ├── 02-seed.sql
-│   │   └── 03-transport-network.sql   # zones, stops, corridors, travel estimates
+│   │   ├── 03-transport-network.sql   # zones, stops, corridors, travel estimates
+│   │   └── 04-auth.sql     # roles, profiles, vehicles
 │   ├── prisma/
 │   │   └── schema.prisma   # Prisma view of the SQL schema (introspected)
 │   ├── prisma7.config.ts   # Prisma CLI config (reuses src/config/env.js)
@@ -30,13 +31,13 @@ TeslaB/
 │   │   ├── app.js          # Express app: middleware, routes, error handling
 │   │   ├── config/env.js   # Environment configuration
 │   │   ├── db/             # Prisma client, health probe, migration runner, seeder
-│   │   │   └── seeds/      # transport demo data + idempotent upserts
-│   │   ├── routes/         # Route definitions (index, health, users, transport)
+│   │   │   └── seeds/      # transport + demo account seed data, idempotent upserts
+│   │   ├── routes/         # Route definitions (index, health, auth, users, transport)
 │   │   ├── controllers/    # Request handlers
-│   │   ├── services/       # Business logic / SQL queries
-│   │   ├── serializers/    # Row -> response DTO mappers
-│   │   ├── middleware/     # notFound, errorHandler
-│   │   └── utils/          # ApiError, validation helpers
+│   │   ├── services/       # Business logic / queries
+│   │   ├── serializers/    # Record -> response DTO mappers
+│   │   ├── middleware/     # notFound, errorHandler, auth (requireAuth, requireRole)
+│   │   └── utils/          # ApiError, validation, password, token, cookies
 │   ├── test/               # node --test suites (unit + integration)
 │   └── .env.example
 ├── docker-compose.yml      # PostgreSQL 17 (database "TeslaB")
@@ -63,34 +64,34 @@ The container runs `server/db/*.sql` automatically the first time its volume is 
 
 ## Scripts (run from the repo root)
 
-| Script                 | Description                                     |
-| ---------------------- | ----------------------------------------------- |
-| `npm run dev`        | Run the API and the web client concurrently     |
-| `npm run dev:server` | Express only, with`node --watch` on port 4000 |
-| `npm run dev:client` | Next.js dev server on port 3000                 |
-| `npm run build`      | Production build of the Next.js client          |
-| `npm start`          | Run both apps in production mode                |
-| `npm run lint`       | ESLint for the client                           |
-| `npm run db:up`      | Start the PostgreSQL container                  |
-| `npm run db:down`    | Stop the container (keeps data)                 |
-| `npm run db:reset`   | Recreate the container **and wipe data**  |
-| `npm run db:generate` | Regenerate the Prisma client from the schema          |
-| `npm run db:migrate` | Apply `server/db/*.sql` to the database      |
-| `npm run db:seed`    | Apply the transport demo seed (idempotent)      |
-| `npm run db:psql`    | Open a psql shell in the container              |
-| `npm run db:logs`    | Follow the Postgres logs                        |
-| `npm test`           | API unit + integration tests (needs the database) |
+| Script                  | Description                                       |
+| ----------------------- | ------------------------------------------------- |
+| `npm run dev`         | Run the API and the web client concurrently       |
+| `npm run dev:server`  | Express only, with`node --watch` on port 4000   |
+| `npm run dev:client`  | Next.js dev server on port 3000                   |
+| `npm run build`       | Production build of the Next.js client            |
+| `npm start`           | Run both apps in production mode                  |
+| `npm run lint`        | ESLint for the client                             |
+| `npm run db:up`       | Start the PostgreSQL container                    |
+| `npm run db:down`     | Stop the container (keeps data)                   |
+| `npm run db:reset`    | Recreate the container**and wipe data**     |
+| `npm run db:generate` | Regenerate the Prisma client from the schema      |
+| `npm run db:migrate`  | Apply`server/db/*.sql` to the database          |
+| `npm run db:seed`     | Apply the transport demo seed (idempotent)        |
+| `npm run db:psql`     | Open a psql shell in the container                |
+| `npm run db:logs`     | Follow the Postgres logs                          |
+| `npm test`            | API unit + integration tests (needs the database) |
 
 ## Database
 
 PostgreSQL 17 runs via `docker-compose.yml`:
 
-| Setting          | Value                                             |
-| ---------------- | ------------------------------------------------- |
-| Database         | `TeslaB`                                        |
-| User / password  | `postgres` / `postgres`                         |
-| Host port        | **`55432`** (container port 5432)            |
-| Connection URL   | `postgres://postgres:postgres@localhost:55432/TeslaB` |
+| Setting         | Value                                                   |
+| --------------- | ------------------------------------------------------- |
+| Database        | `TeslaB`                                              |
+| User / password | `postgres` / `postgres`                             |
+| Host port       | **`55432`** (container port 5432)               |
+| Connection URL  | `postgres://postgres:postgres@localhost:55432/TeslaB` |
 
 > **Why port 55432?** This machine already has a local PostgreSQL service on `5432` and another container on `5433`. Override with `POSTGRES_PORT` in a root `.env` (see `.env.example`) and update `DATABASE_URL` in `server/.env` to match.
 
@@ -128,13 +129,13 @@ Postgres errors are translated to HTTP responses in `server/src/middleware/error
 
 ### Transport network tables (`server/db/03-transport-network.sql`)
 
-| Table              | Purpose                                                                    |
-| ------------------ | -------------------------------------------------------------------------- |
-| `zones`            | Geographical grouping; unique `code`, `active` flag                        |
-| `stops`            | Pickup/drop-off points, each in one zone; unique `code`, optional coordinates |
-| `corridors`        | Named route corridors; unique `code`, `active` flag                        |
-| `corridor_stops`   | Ordered corridor membership: `(corridor_id, stop_id)` PK + `position`     |
-| `travel_estimates` | Directional hop estimates: minutes, kilometres, fare                      |
+| Table                | Purpose                                                                        |
+| -------------------- | ------------------------------------------------------------------------------ |
+| `zones`            | Geographical grouping; unique`code`, `active` flag                         |
+| `stops`            | Pickup/drop-off points, each in one zone; unique`code`, optional coordinates |
+| `corridors`        | Named route corridors; unique`code`, `active` flag                         |
+| `corridor_stops`   | Ordered corridor membership:`(corridor_id, stop_id)` PK + `position`       |
+| `travel_estimates` | Directional hop estimates: minutes, kilometres, fare                           |
 
 Design notes:
 
@@ -148,19 +149,23 @@ Design notes:
 
 Base URL: `http://localhost:4000/api`
 
-| Method   | Endpoint       | Description                                   |
-| -------- | -------------- | --------------------------------------------- |
-| `GET`  | `/health`    | Service status, uptime, and database probe    |
-| `GET`  | `/users`     | List users                                    |
-| `GET`  | `/users/:id` | Get a single user (`404` if missing)        |
-| `POST` | `/users`     | Create a user — body:`{ "name", "email" }` |
-| `GET`  | `/transport/zones` | List active zones                        |
-| `GET`  | `/transport/stops` | List active stops, optional `?zoneCode=` |
-| `GET`  | `/transport/stops/:code` | Get one stop by code               |
-| `GET`  | `/transport/corridors` | List active corridors                |
-| `GET`  | `/transport/corridors/:code` | Corridor with its stops ordered by `position` |
-| `GET`  | `/transport/corridors/match` | Corridors serving a pickup/drop-off pair, e.g. `?pickupStopCode=banani-road-11&dropoffStopCode=mohakhali-bus-terminal` |
-| `GET`  | `/transport/travel-estimates` | Direct estimate, e.g. `?fromStopCode=banani-road-11&toStopCode=gulshan-1` |
+| Method   | Endpoint                        | Description                                                                                                             |
+| -------- | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `GET`  | `/health`                     | Service status, uptime, and database probe                                                                              |
+| `GET`  | `/users` must be locked       | List users (lock kora lagbe)                                                                                            |
+| `GET`  | `/users/:id`                  | Get a single user (`404` if missing)                                                                                  |
+| `POST` | `/users`                      | Create a user (**ADMIN only**) — body: `{ "name", "email" }`                                                   |
+| `POST` | `/auth/register`              | Sign up as PASSENGER or DRIVER; signs in — body:`{ "name", "email", "password", "role"? }`                           |
+| `POST` | `/auth/login`                 | Log in; sets the HttpOnly auth cookie — body:`{ "email", "password" }`                                               |
+| `GET`  | `/auth/me`                    | Current user (requires authentication)                                                                                  |
+| `POST` | `/auth/logout`                | Clear the auth cookie (safe to retry)                                                                                   |
+| `GET`  | `/transport/zones`            | List active zones                                                                                                       |
+| `GET`  | `/transport/stops`            | List active stops, optional`?zoneCode=`                                                                               |
+| `GET`  | `/transport/stops/:code`      | Get one stop by code                                                                                                    |
+| `GET`  | `/transport/corridors`        | List active corridors                                                                                                   |
+| `GET`  | `/transport/corridors/:code`  | Corridor with its stops ordered by`position`                                                                          |
+| `GET`  | `/transport/corridors/match`  | Corridors serving a pickup/drop-off pair, e.g.`?pickupStopCode=banani-road-11&dropoffStopCode=mohakhali-bus-terminal` |
+| `GET`  | `/transport/travel-estimates` | Direct estimate, e.g.`?fromStopCode=banani-road-11&toStopCode=gulshan-1`                                              |
 
 Transport endpoints are read-only and return DTOs (`server/src/serializers/transport.serializer.js`) instead of raw rows, so database column names and audit timestamps never leak into responses.
 
@@ -176,11 +181,11 @@ Codes are stable machine-readable values (lower-case letters, digits, `-` and `_
 
 Status codes are consistent across the transport endpoints:
 
-| Status | Meaning                                                                 |
-| ------ | ----------------------------------------------------------------------- |
-| `400`  | Missing, malformed, repeated or unsupported query parameter             |
-| `404`  | Unknown code, or no record for the requested directional pair           |
-| `409`  | The record exists but is inactive (also used for database conflicts)    |
+| Status  | Meaning                                                              |
+| ------- | -------------------------------------------------------------------- |
+| `400` | Missing, malformed, repeated or unsupported query parameter          |
+| `404` | Unknown code, or no record for the requested directional pair        |
+| `409` | The record exists but is inactive (also used for database conflicts) |
 
 `/health` reports `"ok"` when the database is reachable and `"degraded"` when it is not, and never fails the request:
 
@@ -198,6 +203,125 @@ Errors use a consistent shape:
 ```json
 { "error": { "message": "User 99 not found" } }
 ```
+
+## Authentication
+
+Authentication is a **signed JWT carried in an HttpOnly cookie**. There is no server-side session store, and nothing is ever put in `localStorage`.
+
+### Why this design
+
+- The browser only ever talks to the same origin — `next.config.mjs` proxies `/api/*` to Express — so `SameSite=Lax` is sufficient and no CSRF token is needed.
+- The cookie is `HttpOnly`, so JavaScript (and therefore any XSS payload) cannot read the token.
+- The token payload carries **only the user id**. It deliberately never carries the role or the profile, because nothing in the token is trusted for authorization: `requireAuth` re-loads the user from the database on every request. A deactivated account, a deleted account or a changed role therefore takes effect on the very next request instead of at token expiry.
+
+### Signing up
+
+`POST /auth/register` creates an account and signs it in immediately, using the same HttpOnly cookie as login. It returns `201`.
+
+| Field        | Required | Notes                                                                       |
+| ------------ | -------- | --------------------------------------------------------------------------- |
+| `name`     | yes      | Trimmed; must not be blank                                                  |
+| `email`    | yes      | The login identifier; trimmed and lower-cased before storage                |
+| `password` | yes      | At least 8 characters, at most 72 bytes (bcrypt's input limit)              |
+| `role`     | no       | `PASSENGER` (default) or `DRIVER`. **`ADMIN` is not accepted.** |
+
+- A `PASSENGER` is created with a passenger profile; a `DRIVER` is created with a driver profile that starts `OFFLINE` and has no vehicle, so a self-registered driver cannot be matched until a vehicle exists.
+- **`ADMIN` can never be self-selected.** It is not an accepted value for `role`, so a client cannot promote itself by adding a field to the body — the attempt is simply a `400`. Admins are created by an existing admin through `POST /api/users`.
+- An email that is already registered returns `409`, including a case variant, because the identifier is normalised before it is stored.
+
+```bash
+curl -i -c cookies.txt -H 'Content-Type: application/json' \
+  -d '{"name":"Ayesha","email":"ayesha@example.com","password":"BrandNewPass1!","role":"DRIVER"}' \
+  http://localhost:4000/api/auth/register
+```
+
+> **Known trade-off.** Because sign-up reports that an email is already registered, this endpoint can be used to probe whether an account exists. Login deliberately does not leak that. The usual fix is to accept the request and confirm by email instead, which needs the email-verification flow that is not built yet (see Next steps).
+
+### Demo accounts
+
+Seeded by `npm run db:seed`. **Development/demo only — never seed these in production.**
+
+| Actor  | Email                  | Role          | Profile / vehicle                         |
+| ------ | ---------------------- | ------------- | ----------------------------------------- |
+| Nusrat | `nusrat@example.com` | `PASSENGER` | Passenger profile                         |
+| Rafiq  | `rafiq@example.com`  | `PASSENGER` | Passenger profile                         |
+| Shirin | `shirin@example.com` | `PASSENGER` | Passenger profile                         |
+| Jashim | `jashim@example.com` | `DRIVER`    | Driver profile + vehicle Bullet (3 seats) |
+
+The demo password is **not** stored in the repository. Every demo account is given the value of `DEMO_SEED_PASSWORD` (default `DemoPass123!`), hashed with bcrypt before it reaches the database. To change it, set `DEMO_SEED_PASSWORD` in `server/.env` and re-run the seed.
+
+> **Production warning.** The seeder refuses to run when `NODE_ENV=production` unless `ALLOW_DEMO_SEED=true`, and even then it requires `DEMO_SEED_PASSWORD` to be set explicitly. The server separately refuses to start in production without `JWT_SECRET`.
+
+### Example requests
+
+```bash
+# Log in. The token is returned only as a Set-Cookie, never in the body.
+curl -i -c cookies.txt -H 'Content-Type: application/json' \
+  -d '{"email":"nusrat@example.com","password":"DemoPass123!"}' \
+  http://localhost:4000/api/auth/login
+
+# Current user
+curl -b cookies.txt http://localhost:4000/api/auth/me
+
+# Log out (safe to retry)
+curl -i -b cookies.txt -X POST http://localhost:4000/api/auth/logout
+```
+
+Successful login and current-user responses:
+
+```json
+{
+  "user": {
+    "id": "…",
+    "name": "Nusrat",
+    "role": "PASSENGER",
+    "active": true,
+    "passengerProfile": { "id": "…" }
+  }
+}
+```
+
+Jashim's response carries `driverProfile` instead, including the active vehicle summary:
+
+```json
+{
+  "user": {
+    "id": "…",
+    "name": "Jashim",
+    "role": "DRIVER",
+    "active": true,
+    "driverProfile": {
+      "id": "…",
+      "status": "OFFLINE",
+      "vehicles": [{ "id": "…", "name": "Bullet", "seatCapacity": 3 }]
+    }
+  }
+}
+```
+
+Only the profile belonging to the role is returned: `passengerProfile` for a passenger, `driverProfile` for a driver, and neither for an admin. `passwordHash` and the audit timestamps are never part of the response — `server/src/serializers/user.serializer.js` builds its output as a whitelist, so a new column cannot leak by accident.
+
+### Authentication errors
+
+| Status  | Meaning                                                        |
+| ------- | -------------------------------------------------------------- |
+| `400` | Missing or malformed credentials, or an unsupported body field |
+| `401` | Credentials rejected, or no valid authentication               |
+| `403` | Authenticated, but not permitted for this role                 |
+
+Every rejected login returns the same `401` with the same message, so a caller cannot tell an unknown account from a wrong password. Validation errors never echo the submitted password.
+
+### Authorization
+
+`server/src/middleware/auth.js` is the reusable foundation:
+
+- `requireAuth` — loads the user from the database and rejects inactive or deleted accounts.
+- `requireRole('ADMIN')` — role guard; must be mounted after `requireAuth`.
+- `currentUser(req)` — the authenticated user attached to the request.
+
+`POST /api/users` is gated with `requireRole(Role.ADMIN)`. That is both a real use of the guard and what stops a client from choosing `ADMIN` when creating an account. The read endpoints (`GET /api/users`) are still public so the Next.js demo page keeps working; tightening them is a follow-up once the client can send the cookie.
+
+Authorization is always decided on the server from the database record. Hiding routes in the front end is not authorization.
 
 ## How the client talks to the API
 
@@ -224,14 +348,14 @@ The seed script upserts by stable `code` inside one transaction, so:
 
 Demo trips with a seeded estimate:
 
-| From                    | To                        |
-| ----------------------- | ------------------------- |
-| Banani Road 11          | Gulshan 1                 |
-| Banani Road 11          | Mohakhali Bus Terminal    |
-| Banani Kakoli           | Gulshan 1                 |
-| Banani Kakoli           | Mohakhali Wireless Gate   |
-| Gulshan 1               | Mohakhali Wireless Gate   |
-| Mohakhali Wireless Gate | Mohakhali Bus Terminal    |
+| From                    | To                      |
+| ----------------------- | ----------------------- |
+| Banani Road 11          | Gulshan 1               |
+| Banani Road 11          | Mohakhali Bus Terminal  |
+| Banani Kakoli           | Gulshan 1               |
+| Banani Kakoli           | Mohakhali Wireless Gate |
+| Gulshan 1               | Mohakhali Wireless Gate |
+| Mohakhali Wireless Gate | Mohakhali Bus Terminal  |
 
 The reverse of each of these is deliberately *not* seeded, which is what the directional tests assert.
 
@@ -250,5 +374,9 @@ Coverage highlights: seed idempotency and non-deletion of user data, zone filter
 ## Next steps
 
 - Decide how schema changes are reviewed now that Prisma is in place: either keep the idempotent `server/db/*.sql` files as the source of truth (the current setup, and what preserves the `CHECK` constraints Prisma cannot model), or move fully to Prisma Migrate and express those constraints another way.
+- Authenticate the client: send the auth cookie from the Next.js app, then tighten `GET /api/users`, which is still public so the demo page keeps rendering.
+- Add email verification and password reset. Sign-up currently accepts any address a caller supplies, so nobody proves they own the email they register with.
+- Rate-limit `POST /api/auth/login` and `POST /api/auth/register`. No limiter is installed yet, so password guessing and bulk sign-ups are unthrottled.
+- JWT logout cannot revoke a token before it expires. Add a token denylist (or move to opaque server-side sessions) if immediate revocation becomes a requirement.
 - Add validation (e.g. `zod`) for request bodies once write endpoints exist.
 - Add Playwright coverage for the client.

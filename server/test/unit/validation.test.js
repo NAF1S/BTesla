@@ -4,7 +4,15 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import { ApiError } from '../../src/utils/ApiError.js';
-import { assertQueryKeys, optionalCode, requireCode } from '../../src/utils/validation.js';
+import {
+  assertQueryKeys,
+  MIN_PASSWORD_LENGTH,
+  optionalCode,
+  requireCode,
+  requireEmail,
+  requireName,
+  requirePassword,
+} from '../../src/utils/validation.js';
 
 /** Runs `fn` and returns the ApiError it must throw. */
 const catchApiError = (fn, expectedStatus) => {
@@ -70,5 +78,60 @@ describe('assertQueryKeys', () => {
     );
     assert.match(err.message, /page/);
     assert.match(err.message, /zoneCode/);
+  });
+});
+
+describe('requireEmail', () => {
+  it('normalises case and padding, returning the form that gets stored', () => {
+    assert.strictEqual(requireEmail('  Nusrat@Example.COM '), 'nusrat@example.com');
+  });
+
+  it('rejects missing, empty, malformed, over-long and non-string values', () => {
+    assert.match(catchApiError(() => requireEmail(undefined), 400).message, /required/);
+    assert.match(catchApiError(() => requireEmail('   '), 400).message, /must not be empty/);
+    assert.match(catchApiError(() => requireEmail('nope'), 400).message, /valid email/);
+    assert.match(catchApiError(() => requireEmail('a@b'), 400).message, /valid email/);
+    assert.match(catchApiError(() => requireEmail(42), 400).message, /must be a string/);
+    catchApiError(() => requireEmail(`${'a'.repeat(250)}@example.com`), 400);
+  });
+});
+
+describe('requireName', () => {
+  it('trims the name it returns', () => {
+    assert.strictEqual(requireName('  Nusrat  '), 'Nusrat');
+  });
+
+  it('rejects missing, blank, non-string and over-long names', () => {
+    assert.match(catchApiError(() => requireName(undefined), 400).message, /required/);
+    assert.match(catchApiError(() => requireName('   '), 400).message, /must not be empty/);
+    assert.match(catchApiError(() => requireName(42), 400).message, /must be a string/);
+    catchApiError(() => requireName('a'.repeat(121)), 400);
+  });
+});
+
+describe('requirePassword', () => {
+  it('accepts the minimum length and rejects one character fewer', () => {
+    const password = 'a'.repeat(MIN_PASSWORD_LENGTH);
+    const options = { minLength: MIN_PASSWORD_LENGTH };
+
+    assert.strictEqual(requirePassword(password, 'password', options), password);
+
+    const err = catchApiError(
+      () => requirePassword('a'.repeat(MIN_PASSWORD_LENGTH - 1), 'password', options),
+      400,
+    );
+    assert.match(err.message, new RegExp(`at least ${MIN_PASSWORD_LENGTH}`));
+  });
+
+  it('never echoes the submitted password in an error', () => {
+    const secret = 'short';
+    const err = catchApiError(() => requirePassword(secret, 'password', { minLength: 8 }), 400);
+
+    assert.ok(!err.message.includes(secret), 'the password must not appear in the message');
+  });
+
+  it('rejects a password beyond the 72-byte bcrypt limit', () => {
+    assert.strictEqual(requirePassword('a'.repeat(72)).length, 72);
+    catchApiError(() => requirePassword('a'.repeat(73)), 400);
   });
 });

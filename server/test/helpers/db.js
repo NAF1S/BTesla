@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 
 import { applyMigrations } from '../../src/db/migrations.js';
 import { disconnect, prisma } from '../../src/db/prisma.js';
+import { seedDemoAccounts } from '../../src/db/seeds/auth.seed.js';
 import { seedTransportNetwork } from '../../src/db/seeds/transport-network.seed.js';
 
 /**
@@ -45,12 +46,27 @@ export const pool = withRawQuery(prisma);
 /** Releases the Prisma client. */
 export const closePool = disconnect;
 
-/** Runs the transport seeder in its own transaction and returns its summary. */
-export const runSeed = () => prisma.$transaction((tx) => seedTransportNetwork(tx));
+/**
+ * The seeders run long chains of sequential writes and hash passwords, so they
+ * need more headroom than Prisma's 5s default transaction timeout.
+ */
+const TRANSACTION_OPTIONS = { timeout: 60_000 };
 
-/** Applies server/db/*.sql (idempotent) and seeds, so tests run on a fresh database. */
+/** Runs the transport seeder in its own transaction and returns its summary. */
+export const runSeed = () =>
+  prisma.$transaction((tx) => seedTransportNetwork(tx), TRANSACTION_OPTIONS);
+
+/** Runs the demo-account seeder in its own transaction and returns its summary. */
+export const runAuthSeed = () =>
+  prisma.$transaction((tx) => seedDemoAccounts(tx), TRANSACTION_OPTIONS);
+
+/**
+ * Applies server/db/*.sql (idempotent) and both seeds, so tests run against a
+ * database that already has the demo cast.
+ */
 export const prepareDatabase = async () => {
   await applyMigrations();
+  await runAuthSeed();
   return runSeed();
 };
 

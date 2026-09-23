@@ -14,12 +14,56 @@ const defaultDatabaseUrl = () => {
   return `postgres://${user}:${password}@${host}:${port}/${database}`;
 };
 
+const toBoolean = (value, fallback) => {
+  if (value === undefined || value === '') return fallback;
+  return value === 'true' || value === '1';
+};
+
+const nodeEnv = process.env.NODE_ENV ?? 'development';
+const isProduction = nodeEnv === 'production';
+
+/**
+ * A development-only fallback so the API still runs with no .env file, matching
+ * the database URL convention above. Production must supply a real secret;
+ * `assertProductionSecrets()` enforces that when the server boots.
+ */
+const DEV_JWT_SECRET = 'dev-only-insecure-jwt-secret-do-not-use-in-production';
+
 export const env = {
-  nodeEnv: process.env.NODE_ENV ?? 'development',
+  nodeEnv,
+  isProduction,
   port: toNumber(process.env.PORT, 4000),
   clientOrigin: process.env.CLIENT_ORIGIN ?? 'http://localhost:3000',
   // The single source of the connection string: the Prisma CLI resolves it
   // through this module too (see prisma7.config.ts), so the API and the CLI
   // can never drift apart.
   databaseUrl: process.env.DATABASE_URL ?? defaultDatabaseUrl(),
+
+  // --- Authentication ---------------------------------------------------
+  jwtSecret: process.env.JWT_SECRET ?? (isProduction ? '' : DEV_JWT_SECRET),
+  /** Token lifetime, in seconds. Drives both the JWT `exp` and the cookie Max-Age. */
+  authTokenTtlSeconds: toNumber(process.env.AUTH_TOKEN_TTL_SECONDS, 60 * 60 * 2),
+  authCookieName: process.env.AUTH_COOKIE_NAME ?? 'teslab_auth',
+  /** Secure cookies are the default in production; override for TLS terminators. */
+  cookieSecure: toBoolean(process.env.COOKIE_SECURE, isProduction),
+  /** 'lax' suits the same-origin proxy setup; use 'none' only for cross-site use. */
+  cookieSameSite: process.env.COOKIE_SAME_SITE ?? 'lax',
+  bcryptCost: toNumber(process.env.BCRYPT_COST, 10),
+
+  // --- Demo seed (development only) -------------------------------------
+  demoSeedPassword: process.env.DEMO_SEED_PASSWORD ?? 'DemoPass123!',
+  allowDemoSeed: toBoolean(process.env.ALLOW_DEMO_SEED, false),
+};
+
+/**
+ * Fails fast when a production deployment is missing required secrets.
+ *
+ * Called from the server bootstrap rather than at module load, so that tooling
+ * which merely imports this module (the Prisma CLI, for example) keeps working
+ * in a production build image where the secret is supplied only at runtime.
+ */
+export const assertProductionSecrets = () => {
+  if (isProduction && env.jwtSecret === '') {
+    throw new Error('JWT_SECRET must be set when NODE_ENV=production');
+  }
 };

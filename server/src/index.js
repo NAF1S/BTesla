@@ -1,8 +1,11 @@
 import { createServer } from 'node:http';
 
 import app from './app.js';
-import { env } from './config/env.js';
+import { assertProductionSecrets, env } from './config/env.js';
 import { checkDatabase, disconnect } from './db/prisma.js';
+
+// Fail fast: never serve a production deployment that is missing its secrets.
+assertProductionSecrets();
 
 const server = createServer(app);
 

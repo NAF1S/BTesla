@@ -21,11 +21,20 @@ export const startApiServer = async () => {
 
   return {
     baseUrl,
-    /** GET a path under /api; returns { status, body }. */
+    /**
+     * Request a path under /api.
+     *
+     * Returns { status, body, setCookie }. `setCookie` is exposed because the
+     * authentication tests have to replay the cookie the API issued.
+     */
     request: async (path, options = {}) => {
       const response = await fetch(`${baseUrl}${path}`, options);
       const text = await response.text();
-      return { status: response.status, body: text ? JSON.parse(text) : null };
+      return {
+        status: response.status,
+        body: text ? JSON.parse(text) : null,
+        setCookie: response.headers.get('set-cookie'),
+      };
     },
     close: () => new Promise((resolve) => server.close(resolve)),
   };
