@@ -1,0 +1,26 @@
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: teslab-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-TeslaB}
+    ports:
+      # 55432 on the host: 5432 is taken by a local PostgreSQL service and 5433
+      # by another container. Override with POSTGRES_PORT in a root .env file.
+      - "${POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - teslab-pgdata:/var/lib/postgresql/data
+      # Files here run automatically the first time the volume is created.
+      - ./server/db:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-TeslaB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  teslab-pgdata:

@@ -15,7 +15,15 @@
     "start": "concurrently -n api,web -c magenta,cyan \"npm:start:server\" \"npm:start:client\"",
     "start:client": "npm run start --workspace client",
     "start:server": "npm run start --workspace server",
-    "lint": "npm run lint --workspace client"
+    "lint": "npm run lint --workspace client",
+    "db:up": "docker compose up -d db",
+    "db:down": "docker compose down",
+    "db:reset": "docker compose down -v && docker compose up -d db",
+    "db:logs": "docker compose logs -f db",
+    "db:psql": "docker compose exec db psql -U postgres -d TeslaB",
+    "db:migrate": "npm run db:migrate --workspace server",
+    "db:seed": "npm run db:seed --workspace server",
+    "test": "npm run test --workspace server"
   },
   "devDependencies": {
     "concurrently": "^9.2.1"

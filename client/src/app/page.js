@@ -25,19 +25,35 @@ export default async function Home() {
 
         {error ? (
           <div className="mt-8 rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200">
-            <p className="font-medium">Could not reach the API.</p>
+            <p className="font-medium">Could not load data from the API.</p>
             <p className="mt-1">{error}</p>
             <p className="mt-2">
-              Start it with <code className="font-mono">npm run dev:server</code>.
+              Make sure the database and API are running:{" "}
+              <code className="font-mono">npm run db:up</code>, then{" "}
+              <code className="font-mono">npm run dev</code>.
             </p>
           </div>
         ) : (
           <>
-            <dl className="mt-8 grid grid-cols-2 gap-4 text-sm">
+            <dl className="mt-8 grid gap-4 text-sm sm:grid-cols-3">
               <div className="rounded-lg border border-black/[.08] p-4 dark:border-white/[.145]">
                 <dt className="text-zinc-500 dark:text-zinc-400">API status</dt>
                 <dd className="mt-1 font-medium text-black dark:text-zinc-50">
                   {health?.status ?? "unknown"}
+                </dd>
+              </div>
+              <div className="rounded-lg border border-black/[.08] p-4 dark:border-white/[.145]">
+                <dt className="text-zinc-500 dark:text-zinc-400">Database</dt>
+                <dd
+                  className={`mt-1 font-medium ${
+                    health?.database?.status === "up"
+                      ? "text-emerald-600 dark:text-emerald-400"
+                      : "text-red-600 dark:text-red-400"
+                  }`}
+                >
+                  {health?.database?.status ?? "unknown"}
+                  {health?.database?.latencyMs != null &&
+                    ` (${health.database.latencyMs}ms)`}
                 </dd>
               </div>
               <div className="rounded-lg border border-black/[.08] p-4 dark:border-white/[.145]">

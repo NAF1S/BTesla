@@ -1,17 +1,30 @@
-import { randomUUID } from 'node:crypto';
+import { query } from '../db/pool.js';
 
-// In-memory store — swap for a real database later.
-const users = [
-  { id: '1', name: 'Ada Lovelace', email: 'ada@example.com' },
-  { id: '2', name: 'Alan Turing', email: 'alan@example.com' },
-];
+const COLUMNS = 'id, name, email, created_at';
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-export const findAll = () => users;
+export const findAll = async () => {
+  const { rows } = await query(`SELECT ${COLUMNS} FROM users ORDER BY created_at, name`);
+  return rows;
+};
 
-export const findById = (id) => users.find((user) => user.id === id) ?? null;
+export const findById = async (id) => {
+  // Avoid a Postgres cast error (and a round-trip) for malformed ids.
+  if (!UUID_RE.test(id)) return null;
 
-export const create = ({ name, email }) => {
-  const user = { id: randomUUID(), name, email };
-  users.push(user);
-  return user;
+  const { rows } = await query(`SELECT ${COLUMNS} FROM users WHERE id = $1`, [id]);
+  return rows[0] ?? null;
+};
+
+export const findByEmail = async (email) => {
+  const { rows } = await query(`SELECT ${COLUMNS} FROM users WHERE lower(email) = lower($1)`, [email]);
+  return rows[0] ?? null;
+};
+
+export const create = async ({ name, email }) => {
+  const { rows } = await query(
+    `INSERT INTO users (name, email) VALUES ($1, $2) RETURNING ${COLUMNS}`,
+    [name, email],
+  );
+  return rows[0];
 };
