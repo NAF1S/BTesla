@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { applyMigrations } from '../../src/db/migrations.js';
 import { disconnect, prisma } from '../../src/db/prisma.js';
 import { seedDemoAccounts } from '../../src/db/seeds/auth.seed.js';
-import { seedTransportNetwork } from '../../src/db/seeds/transport-network.seed.js';
+import { seedLocationNetwork } from '../../src/db/seeds/location.seed.js';
 
 /**
  * Raw-SQL executor that reproduces the `{ rows }` shape the pg driver used to
@@ -47,14 +47,15 @@ export const pool = withRawQuery(prisma);
 export const closePool = disconnect;
 
 /**
- * The seeders run long chains of sequential writes and hash passwords, so they
- * need more headroom than Prisma's 5s default transaction timeout.
+ * The seeders run long chains of sequential writes, hash passwords and then
+ * validate the routing graph, so they need more headroom than Prisma's 5s
+ * default transaction timeout.
  */
 const TRANSACTION_OPTIONS = { timeout: 60_000 };
 
-/** Runs the transport seeder in its own transaction and returns its summary. */
+/** Runs the location seeder in its own transaction and returns its summary. */
 export const runSeed = () =>
-  prisma.$transaction((tx) => seedTransportNetwork(tx), TRANSACTION_OPTIONS);
+  prisma.$transaction((tx) => seedLocationNetwork(tx), TRANSACTION_OPTIONS);
 
 /** Runs the demo-account seeder in its own transaction and returns its summary. */
 export const runAuthSeed = () =>
@@ -62,7 +63,8 @@ export const runAuthSeed = () =>
 
 /**
  * Applies server/db/*.sql (idempotent) and both seeds, so tests run against a
- * database that already has the demo cast.
+ * database that already holds the demo accounts, the service zones, the points
+ * and the routing graph.
  */
 export const prepareDatabase = async () => {
   await applyMigrations();

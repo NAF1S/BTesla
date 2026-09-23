@@ -1,18 +1,24 @@
 import { prisma, disconnect } from './prisma.js';
 import { hashDemoPasswords, seedDemoAccounts } from './seeds/auth.seed.js';
-import { seedTransportNetwork } from './seeds/transport-network.seed.js';
+import { seedLocationNetwork } from './seeds/location.seed.js';
 
 /**
  * Applies all development seed data:
  *
- *   1. the transport network (zones, stops, corridors and directional travel
- *      estimates);
+ *   1. the PostGIS location foundation -- the Dhaka service zones, their pickup
+ *      and drop-off points, the routing vertices those points map onto, and the
+ *      directed edges that join them into one connected graph (validated for
+ *      coordinate bounds, edge geometry and connectivity before it commits);
  *   2. the demo cast -- Nusrat, Rafiq, Shirin, Jashim and Jashim's vehicle
  *      Bullet -- with passwords hashed from DEMO_SEED_PASSWORD.
  *
  * Safe to run repeatedly: every record is upserted by a stable key inside a
  * single transaction, so re-running updates existing rows instead of
- * duplicating them and never overwrites non-seed data.
+ * duplicating them and never deletes or overwrites data it does not own.
+ *
+ * Never runs automatically: it is only ever reached through `npm run db:seed`,
+ * and the demo accounts refuse to seed when NODE_ENV=production unless
+ * ALLOW_DEMO_SEED=true.
  *
  * Usage: npm run db:seed   (run `npm run db:migrate` first)
  */
@@ -28,22 +34,23 @@ try {
   // transaction itself stays short.
   const passwordHashes = await hashDemoPasswords();
 
-  const { transport, accounts } = await prisma.$transaction(
+  const { location, accounts } = await prisma.$transaction(
     async (tx) => ({
-      transport: await seedTransportNetwork(tx),
+      location: await seedLocationNetwork(tx),
       accounts: await seedDemoAccounts(tx, { passwordHashes }),
     }),
     {
-      // Both seeds are long chains of sequential dependent writes; give them
-      // more headroom than Prisma's 5s default so a slow machine cannot abort.
+      // Both seeds are long chains of sequential writes, and the location seed
+      // ends with a graph validation pass; give them more headroom than
+      // Prisma's 5s default so a slow machine cannot abort half way.
       timeout: 60_000,
     },
   );
 
   console.log(
-    `[db] transport seed applied: ${transport.zones} zones, ${transport.stops} stops, ` +
-      `${transport.corridors} corridors, ${transport.corridorStops} corridor stops, ` +
-      `${transport.travelEstimates} travel estimates`,
+    `[db] location seed applied: ${location.zones} zones, ${location.points} service points, ` +
+      `${location.vertices} routing vertices, ${location.edges} routing edges ` +
+      `(${location.bidirectionalEdges} bidirectional, ${location.oneWayEdges} one-way)`,
   );
   console.log(
     `[db] demo accounts applied: ${accounts.users} users, ${accounts.vehicles} vehicles ` +
