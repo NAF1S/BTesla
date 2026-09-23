@@ -6,12 +6,18 @@ import { describe, it } from 'node:test';
 import * as dto from '../../src/serializers/transport.serializer.js';
 
 /**
- * The DTO mappers are the only place where database rows become API payloads,
+ * The DTO mappers are the only place where Prisma records become API payloads,
  * so these tests pin down three promises: camelCase shape, numbers instead of
- * NUMERIC strings, and no internal audit columns.
+ * Decimal values, and no internal audit columns.
+ *
+ * The inputs below mirror what Prisma actually returns, including nested
+ * relations and decimal.js instances for NUMERIC columns.
  */
 
-const TIMESTAMPS = { created_at: new Date(), updated_at: new Date() };
+const TIMESTAMPS = { createdAt: new Date(), updatedAt: new Date() };
+
+/** Values arrive from Prisma as decimal.js instances, which stringify like this. */
+const decimal = (text) => text;
 
 describe('toZoneDto', () => {
   it('keeps only the public fields', () => {
@@ -22,14 +28,15 @@ describe('toZoneDto', () => {
 });
 
 describe('toStopDto', () => {
-  it('maps snake_case and converts NUMERIC coordinates to numbers', () => {
+  it('flattens the zone relation and converts Decimal coordinates to numbers', () => {
     const stop = dto.toStopDto({
       id: 's1',
       code: 'banani-road-11',
       name: 'Banani Road 11',
-      latitude: '23.793700',
-      longitude: '90.404300',
-      zone_code: 'banani',
+      latitude: decimal('23.793700'),
+      longitude: decimal('90.404300'),
+      zoneId: 'z1',
+      zone: { code: 'banani' },
       active: true,
       ...TIMESTAMPS,
     });
@@ -52,11 +59,17 @@ describe('toStopDto', () => {
       name: 'Somewhere',
       latitude: null,
       longitude: null,
-      zone_code: 'banani',
+      zone: { code: 'banani' },
     });
 
     assert.strictEqual(stop.latitude, null);
     assert.strictEqual(stop.longitude, null);
+  });
+
+  it('tolerates a stop whose zone relation was not loaded', () => {
+    const stop = dto.toStopDto({ id: 's3', code: 'orphan', name: 'Orphan', latitude: null, longitude: null });
+
+    assert.strictEqual(stop.zoneCode, null);
   });
 });
 
@@ -65,8 +78,28 @@ describe('toCorridorDetailDto', () => {
     const detail = dto.toCorridorDetailDto(
       { id: 'c1', code: 'northbound-demo', name: 'Northbound', active: true, ...TIMESTAMPS },
       [
-        { position: 1, id: 's1', code: 'banani-road-11', name: 'A', zone_code: 'banani', latitude: null, longitude: null },
-        { position: 2, id: 's2', code: 'gulshan-1', name: 'B', zone_code: 'gulshan', latitude: '1.5', longitude: null },
+        {
+          position: 1,
+          stop: {
+            id: 's1',
+            code: 'banani-road-11',
+            name: 'A',
+            zone: { code: 'banani' },
+            latitude: null,
+            longitude: null,
+          },
+        },
+        {
+          position: 2,
+          stop: {
+            id: 's2',
+            code: 'gulshan-1',
+            name: 'B',
+            zone: { code: 'gulshan' },
+            latitude: decimal('1.5'),
+            longitude: null,
+          },
+        },
       ],
     );
 
@@ -101,11 +134,9 @@ describe('toCorridorDetailDto', () => {
 describe('toCorridorMatchDto', () => {
   it('nests the corridor and converts positions', () => {
     const match = dto.toCorridorMatchDto({
-      id: 'c1',
-      code: 'northbound-demo',
-      name: 'Northbound',
-      pickup_position: 1,
-      dropoff_position: 6,
+      corridor: { id: 'c1', code: 'northbound-demo', name: 'Northbound' },
+      pickupPosition: 1,
+      dropoffPosition: 6,
     });
 
     assert.deepStrictEqual(match, {
@@ -120,14 +151,14 @@ describe('toTravelEstimateDto', () => {
   it('converts money and distance without leaking ids or timestamps', () => {
     const estimate = dto.toTravelEstimateDto({
       id: 'e1',
-      estimated_minutes: 18,
-      estimated_distance_km: '5.40',
-      base_fare: '165.00',
+      estimatedMinutes: 18,
+      estimatedDistanceKm: decimal('5.40'),
+      baseFare: decimal('165.00'),
       currency: 'BDT',
-      from_stop_code: 'banani-road-11',
-      from_stop_name: 'Banani Road 11',
-      to_stop_code: 'gulshan-1',
-      to_stop_name: 'Gulshan 1',
+      fromStopId: 's1',
+      toStopId: 's4',
+      fromStop: { code: 'banani-road-11', name: 'Banani Road 11' },
+      toStop: { code: 'gulshan-1', name: 'Gulshan 1' },
       ...TIMESTAMPS,
     });
 

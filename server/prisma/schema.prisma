@@ -1,0 +1,130 @@
+// Prisma view of the TeslaB database.
+//
+// ---------------------------------------------------------------------------
+// BASELINE, NOT SOURCE OF TRUTH
+// ---------------------------------------------------------------------------
+// This schema was produced by introspecting (`prisma db pull`) a database built
+// from the idempotent SQL files in server/db. Those files remain the source of
+// truth for the physical schema; this file only describes it to Prisma.
+//
+// Consequently:
+//   * `prisma migrate` is deliberately NOT used -- it would try to take
+//     ownership of the schema and to drop the CHECK constraints below, which
+//     Prisma does not model.
+//   * `prisma db pull` was used to create this file, so re-running it is safe
+//     and will only surface genuine schema drift.
+//
+// Naming: models and fields use idiomatic Prisma casing and are mapped onto the
+// existing snake_case tables/columns with @@map/@map. These names are a Prisma
+// concern only -- the database itself is unchanged.
+
+// The classic generator is used deliberately: this server is plain JavaScript
+// (no build step), and it emits a JavaScript client into node_modules that is
+// imported as `@prisma/client`. The newer `prisma-client` generator emits
+// TypeScript only, which would require a compile step or --experimental-strip-types.
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+model Zone {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code      String   @unique
+  name      String
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+  stops     Stop[]
+
+  @@index([active])
+  @@map("zones")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+model Stop {
+  id                  String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  zoneId              String           @map("zone_id") @db.Uuid
+  code                String           @unique
+  name                String
+  latitude            Decimal?         @db.Decimal(9, 6)
+  longitude           Decimal?         @db.Decimal(9, 6)
+  active              Boolean          @default(true)
+  createdAt           DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime         @default(now()) @map("updated_at") @db.Timestamptz(6)
+  zone                Zone             @relation(fields: [zoneId], references: [id], onUpdate: NoAction)
+  corridorStops       CorridorStop[]
+  travelEstimatesFrom TravelEstimate[] @relation("TravelEstimateFrom")
+  travelEstimatesTo   TravelEstimate[] @relation("TravelEstimateTo")
+
+  @@index([active])
+  @@index([zoneId])
+  @@map("stops")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+model Corridor {
+  id            String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code          String         @unique
+  name          String
+  active        Boolean        @default(true)
+  createdAt     DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime       @default(now()) @map("updated_at") @db.Timestamptz(6)
+  corridorStops CorridorStop[]
+
+  @@index([active])
+  @@map("corridors")
+}
+
+/// Ordered membership of a stop in a corridor. `position` is 1-based.
+/// A stop may appear at most once per corridor, and no two stops may share a
+/// position -- both are enforced by the unique constraints below.
+///
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+model CorridorStop {
+  corridorId String   @map("corridor_id") @db.Uuid
+  stopId     String   @map("stop_id") @db.Uuid
+  position   Int
+  corridor   Corridor @relation(fields: [corridorId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  stop       Stop     @relation(fields: [stopId], references: [id], onUpdate: NoAction)
+
+  @@id([corridorId, stopId])
+  @@unique([corridorId, position], map: "corridor_stops_unique_position")
+  @@index([stopId])
+  @@map("corridor_stops")
+}
+
+/// A directional estimate. A -> B and B -> A are separate rows: the unique
+/// constraint is on the ordered (from, to) pair, not on an unordered set.
+///
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+model TravelEstimate {
+  id                  String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  fromStopId          String   @map("from_stop_id") @db.Uuid
+  toStopId            String   @map("to_stop_id") @db.Uuid
+  estimatedMinutes    Int      @map("estimated_minutes")
+  estimatedDistanceKm Decimal  @map("estimated_distance_km") @db.Decimal(6, 2)
+  baseFare            Decimal  @map("base_fare") @db.Decimal(10, 2)
+  currency            String   @default("BDT")
+  createdAt           DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+  fromStop            Stop     @relation("TravelEstimateFrom", fields: [fromStopId], references: [id], onUpdate: NoAction)
+  toStop              Stop     @relation("TravelEstimateTo", fields: [toStopId], references: [id], onUpdate: NoAction)
+
+  @@unique([fromStopId, toStopId], map: "travel_estimates_unique_pair")
+  @@index([toStopId])
+  @@map("travel_estimates")
+}
+
+/// This model contains an expression index which requires additional setup for migrations. Visit https://pris.ly/d/expression-indexes for more info.
+model User {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name      String
+  email     String   @unique
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@map("users")
+}

@@ -1,29 +1,52 @@
 import assert from 'node:assert/strict';
 
 import { applyMigrations } from '../../src/db/migrations.js';
-import { closePool, pool } from '../../src/db/pool.js';
+import { disconnect, prisma } from '../../src/db/prisma.js';
 import { seedTransportNetwork } from '../../src/db/seeds/transport-network.seed.js';
 
-export { closePool, pool };
+/**
+ * Raw-SQL executor that reproduces the `{ rows }` shape the pg driver used to
+ * provide, so the tests that assert database-level behaviour keep working
+ * unchanged while Prisma remains the only database client in the project.
+ *
+ * It deliberately keeps the historical `pool` / `closePool` names those tests
+ * were written against: the object still answers `.query(sql, params)` with
+ * `{ rows }`, it is simply backed by Prisma now.
+ *
+ * Placeholders stay PostgreSQL-style ($1, $2, ...).
+ */
+const executor = (tx) => ({
+  query: async (sql, params = []) => {
+    const rows = await tx.$queryRawUnsafe(sql, ...params);
+    // `rowCount` mirrors pg for reads, which is how the tests use it. It is not
+    // an affected-row count for writes, and no test relies on that.
+    return { rows, rowCount: Array.isArray(rows) ? rows.length : 0 };
+  },
+});
 
 /**
- * Runs the transport seeder in its own transaction and returns its summary.
- * Used by tests to prove that repeated seeding is idempotent.
+ * A Prisma client that also answers `.query()`, so a single object can be used
+ * both to drive Prisma models (for example to run the seeder) and to drop to
+ * raw SQL for assertions in the same test.
  */
-export const runSeed = async () => {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const summary = await seedTransportNetwork(client);
-    await client.query('COMMIT');
-    return summary;
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
-  }
-};
+const withRawQuery = (tx) =>
+  new Proxy(tx, {
+    get(target, prop) {
+      if (prop === 'query') return executor(target).query;
+      const value = target[prop];
+      // Bind so Prisma's own methods keep the correct receiver.
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+
+/** A standalone raw-SQL executor, for setup/teardown and direct assertions. */
+export const pool = withRawQuery(prisma);
+
+/** Releases the Prisma client. */
+export const closePool = disconnect;
+
+/** Runs the transport seeder in its own transaction and returns its summary. */
+export const runSeed = () => prisma.$transaction((tx) => seedTransportNetwork(tx));
 
 /** Applies server/db/*.sql (idempotent) and seeds, so tests run on a fresh database. */
 export const prepareDatabase = async () => {
@@ -31,23 +54,39 @@ export const prepareDatabase = async () => {
   return runSeed();
 };
 
-/** Runs `fn` inside a transaction that is always rolled back. */
+/** Sentinel used to force a rollback without surfacing as a test failure. */
+const ROLLBACK = Symbol('rollback');
+
+/**
+ * Runs `fn` inside a transaction that is always rolled back. `fn` receives a
+ * Prisma transaction client that also answers `.query()`.
+ */
 export const withRollback = async (fn) => {
-  const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-    return await fn(client);
-  } finally {
-    await client.query('ROLLBACK');
-    client.release();
+    await prisma.$transaction(async (tx) => {
+      await fn(withRawQuery(tx));
+      throw ROLLBACK;
+    });
+  } catch (err) {
+    if (err !== ROLLBACK) throw err;
   }
 };
 
 /** SELECT count(*) as a number. */
-export const scalarCount = async (executor, sql, params = []) => {
-  const { rows } = await executor.query(sql, params);
+export const scalarCount = async (exec, sqlText, params = []) => {
+  const { rows } = await exec.query(sqlText, params);
   return Number(rows[0].count);
 };
+
+/**
+ * Extracts the PostgreSQL SQLSTATE from whatever Prisma threw.
+ *
+ * Raw SQL that fails is reported as P2010 with the original SQLSTATE nested in
+ * the driver adapter error; errors that already carry a `code` are passed
+ * through unchanged.
+ */
+export const sqlStateOf = (err) =>
+  err?.meta?.driverAdapterError?.cause?.originalCode ?? err?.code ?? null;
 
 /**
  * Asserts that `action()` fails with the given PostgreSQL SQLSTATE.
@@ -60,19 +99,19 @@ export const scalarCount = async (executor, sql, params = []) => {
  *
  * Returns the error so individual tests can make further assertions.
  */
-export const expectPgError = async (client, action, sqlState) => {
-  await client.query('SAVEPOINT expect_pg_error');
+export const expectPgError = async (exec, action, sqlState) => {
+  await exec.query('SAVEPOINT expect_pg_error');
   try {
     await action();
   } catch (err) {
     assert.strictEqual(
-      err.code,
+      sqlStateOf(err),
       sqlState,
-      `expected SQLSTATE ${sqlState} but got ${err.code} (${err.message})`,
+      `expected SQLSTATE ${sqlState} but got ${sqlStateOf(err)} (${err.message})`,
     );
-    await client.query('ROLLBACK TO SAVEPOINT expect_pg_error');
+    await exec.query('ROLLBACK TO SAVEPOINT expect_pg_error');
     return err;
   }
-  await client.query('RELEASE SAVEPOINT expect_pg_error');
+  await exec.query('RELEASE SAVEPOINT expect_pg_error');
   assert.fail(`expected the query to fail with SQLSTATE ${sqlState}, but it succeeded`);
 };

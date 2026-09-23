@@ -22,11 +22,14 @@ TeslaB/
 │   │   ├── 01-schema.sql
 │   │   ├── 02-seed.sql
 │   │   └── 03-transport-network.sql   # zones, stops, corridors, travel estimates
+│   ├── prisma/
+│   │   └── schema.prisma   # Prisma view of the SQL schema (introspected)
+│   ├── prisma7.config.ts   # Prisma CLI config (reuses src/config/env.js)
 │   ├── src/
 │   │   ├── index.js        # HTTP server bootstrap + graceful shutdown
 │   │   ├── app.js          # Express app: middleware, routes, error handling
 │   │   ├── config/env.js   # Environment configuration
-│   │   ├── db/             # pg pool, health probe, migration runner, seeder
+│   │   ├── db/             # Prisma client, health probe, migration runner, seeder
 │   │   │   └── seeds/      # transport demo data + idempotent upserts
 │   │   ├── routes/         # Route definitions (index, health, users, transport)
 │   │   ├── controllers/    # Request handlers
@@ -71,6 +74,7 @@ The container runs `server/db/*.sql` automatically the first time its volume is 
 | `npm run db:up`      | Start the PostgreSQL container                  |
 | `npm run db:down`    | Stop the container (keeps data)                 |
 | `npm run db:reset`   | Recreate the container **and wipe data**  |
+| `npm run db:generate` | Regenerate the Prisma client from the schema          |
 | `npm run db:migrate` | Apply `server/db/*.sql` to the database      |
 | `npm run db:seed`    | Apply the transport demo seed (idempotent)      |
 | `npm run db:psql`    | Open a psql shell in the container              |
@@ -90,7 +94,24 @@ PostgreSQL 17 runs via `docker-compose.yml`:
 
 > **Why port 55432?** This machine already has a local PostgreSQL service on `5432` and another container on `5433`. Override with `POSTGRES_PORT` in a root `.env` (see `.env.example`) and update `DATABASE_URL` in `server/.env` to match.
 
-The server uses a `pg` connection pool (`server/src/db/pool.js`), reads `DATABASE_URL` from the environment, and falls back to the URL above when it is unset. `server/src/db/migrate.js` applies the SQL files in `server/db` in filename order, one transaction per file.
+### ORM (Prisma)
+
+All database access goes through **Prisma**. `server/src/db/prisma.js` exports the single client, built on the official `@prisma/adapter-pg` driver adapter (which Prisma 7 requires for PostgreSQL). Services use Prisma models rather than hand-written SQL, and error handling maps both Prisma error codes (`P2002` → 409, `P2025` → 404) and the SQLSTATEs Prisma nests inside raw-SQL errors, so the 400/404/409 contract is unchanged.
+
+The relationship between Prisma and the SQL files is deliberate:
+
+- **`server/db/*.sql` remains the source of truth for the physical schema.** `server/prisma/schema.prisma` was produced by introspecting it (`prisma db pull`) and maps onto the existing snake_case tables and columns with `@@map`/`@map`, so renaming a Prisma model does not rename a table.
+- **`prisma migrate` is intentionally not used.** Prisma does not model `CHECK` constraints, so handing it ownership of migrations would try to drop constraints such as `travel_estimates_distinct_stops`. Migrations stay hand-written and are applied by `npm run db:migrate`, which executes each file through Prisma, one transaction per file.
+- `DATABASE_URL` is resolved by `server/src/config/env.js` for both the API and the Prisma CLI (`prisma7.config.ts` imports that module), so the two cannot drift apart and the API still runs with no `.env` file at all.
+
+To check that the Prisma view still matches the live database:
+
+```bash
+cd server
+npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --script
+```
+
+An empty migration means there is no drift. Like `pg_typeof()`, a few PostgreSQL internals cannot be read through Prisma raw queries; cast them (`pg_typeof(x)::text`) when you need them.
 
 Schema (`server/db/01-schema.sql`):
 
@@ -228,6 +249,6 @@ Coverage highlights: seed idempotency and non-deletion of user data, zone filter
 
 ## Next steps
 
-- Add a real migration tool (e.g. `node-pg-migrate` or Drizzle) once the schema starts changing; the current runner re-applies idempotent SQL files.
+- Decide how schema changes are reviewed now that Prisma is in place: either keep the idempotent `server/db/*.sql` files as the source of truth (the current setup, and what preserves the `CHECK` constraints Prisma cannot model), or move fully to Prisma Migrate and express those constraints another way.
 - Add validation (e.g. `zod`) for request bodies once write endpoints exist.
 - Add Playwright coverage for the client.

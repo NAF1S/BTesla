@@ -221,11 +221,14 @@ describe('stops and zones constraints', () => {
       const stopA = await createStop(client, 'test-constraint-numeric-stop-a');
       const stopB = await createStop(client, 'test-constraint-numeric-stop-b');
 
+      // pg_typeof() returns the internal `regtype` type, which Prisma cannot
+      // deserialize, so both readings are cast to text. That also proves the
+      // value round-trips exactly (99.99, not 99.98999999999999).
       const { rows } = await client.query(
         `INSERT INTO travel_estimates
            (from_stop_id, to_stop_id, estimated_minutes, estimated_distance_km, base_fare, currency)
          VALUES ($1, $2, 7, 12.35, 99.99, 'BDT')
-         RETURNING pg_typeof(base_fare) AS fare_type, base_fare, currency`,
+         RETURNING pg_typeof(base_fare)::text AS fare_type, base_fare::text AS base_fare, currency`,
         [stopA, stopB],
       );
 

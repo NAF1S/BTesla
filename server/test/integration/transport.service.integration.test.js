@@ -64,7 +64,7 @@ describe('transport.service stops', () => {
       banani.map((stop) => stop.code),
       ['banani-chairman-bari', 'banani-kakoli', 'banani-road-11'],
     );
-    assert.ok(banani.every((stop) => stop.zone_code === 'banani'));
+    assert.ok(banani.every((stop) => stop.zone.code === 'banani'));
 
     const mohakhali = await transport.findActiveStops({ zoneCode: 'mohakhali' });
     assert.deepStrictEqual(
@@ -87,7 +87,7 @@ describe('transport.service stops', () => {
   it('returns the zone of a stop by code regardless of case handling elsewhere', async () => {
     const stop = await transport.findStopByCode('banani-road-11');
 
-    assert.strictEqual(stop.zone_code, 'banani');
+    assert.strictEqual(stop.zone.code, 'banani');
     assert.strictEqual(stop.name, 'Banani Road 11');
   });
 });
@@ -105,11 +105,11 @@ describe('transport.service corridors', () => {
     const stops = await transport.findCorridorStops(corridor.id);
 
     assert.deepStrictEqual(
-      stops.map((stop) => stop.code),
+      stops.map((membership) => membership.stop.code),
       EXPECTED_CORRIDOR_ORDER,
     );
     assert.deepStrictEqual(
-      stops.map((stop) => Number(stop.position)),
+      stops.map((membership) => membership.position),
       [1, 2, 3, 4, 5, 6],
     );
   });
@@ -121,7 +121,7 @@ describe('transport.service corridors', () => {
     const matches = await transport.findCorridorsForStopPair(pickup, dropoff);
 
     assert.deepStrictEqual(
-      matches.map((match) => [match.code, Number(match.pickup_position), Number(match.dropoff_position)]),
+      matches.map((match) => [match.corridor.code, match.pickupPosition, match.dropoffPosition]),
       [[NORTHBOUND_CORRIDOR, 1, 6]],
     );
   });
@@ -133,7 +133,7 @@ describe('transport.service corridors', () => {
     const matches = await transport.findCorridorsForStopPair(pickup, dropoff);
 
     assert.ok(
-      !matches.some((match) => match.code === NORTHBOUND_CORRIDOR),
+      !matches.some((match) => match.corridor.code === NORTHBOUND_CORRIDOR),
       'a one-way corridor must not match its own stops in reverse order',
     );
   });
@@ -146,11 +146,11 @@ describe('transport.service travel estimates', () => {
 
     const estimate = await transport.findTravelEstimate(from, to);
 
-    assert.strictEqual(estimate.from_stop_code, 'banani-kakoli');
-    assert.strictEqual(estimate.to_stop_code, 'mohakhali-wireless-gate');
-    assert.strictEqual(Number(estimate.estimated_minutes), 24);
-    assert.strictEqual(Number(estimate.estimated_distance_km), 7.1);
-    assert.strictEqual(Number(estimate.base_fare), 215);
+    assert.strictEqual(estimate.fromStop.code, 'banani-kakoli');
+    assert.strictEqual(estimate.toStop.code, 'mohakhali-wireless-gate');
+    assert.strictEqual(estimate.estimatedMinutes, 24);
+    assert.strictEqual(Number(estimate.estimatedDistanceKm), 7.1);
+    assert.strictEqual(Number(estimate.baseFare), 215);
     assert.strictEqual(estimate.currency, 'BDT');
   });
 

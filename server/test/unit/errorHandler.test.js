@@ -53,7 +53,37 @@ describe('errorHandler', () => {
 
     const foreignKey = handle(Object.assign(new Error('violates foreign key constraint'), { code: '23503' }));
     assert.strictEqual(foreignKey.status, 409);
-    assert.match(foreignKey.body.error.message, /foreign key/);
+    assert.strictEqual(foreignKey.body.error.message, 'Referenced record does not exist');
+  });
+
+  it('maps Prisma error codes to the same statuses', () => {
+    const unique = handle(Object.assign(new Error('Unique constraint failed'), { code: 'P2002' }));
+    assert.strictEqual(unique.status, 409);
+    assert.strictEqual(unique.body.error.message, 'A record with those values already exists');
+
+    const foreignKey = handle(Object.assign(new Error('Foreign key constraint failed'), { code: 'P2003' }));
+    assert.strictEqual(foreignKey.status, 409);
+    assert.strictEqual(foreignKey.body.error.message, 'Referenced record does not exist');
+
+    const missing = handle(
+      Object.assign(new Error('An operation failed because a required record was not found'), {
+        code: 'P2025',
+      }),
+    );
+    assert.strictEqual(missing.status, 404);
+    assert.strictEqual(missing.body.error.message, 'Record not found');
+  });
+
+  it('unwraps the SQLSTATE that Prisma nests inside raw-SQL errors', () => {
+    const check = handle(
+      Object.assign(new Error('Invalid `prisma.$executeRawUnsafe()` invocation'), {
+        code: 'P2010',
+        meta: { driverAdapterError: { cause: { originalCode: '23514' } } },
+      }),
+    );
+
+    assert.strictEqual(check.status, 400);
+    assert.strictEqual(check.body.error.message, 'A value violates a database constraint');
   });
 
   it('maps PostgreSQL input errors to 400', () => {

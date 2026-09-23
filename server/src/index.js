@@ -2,7 +2,7 @@ import { createServer } from 'node:http';
 
 import app from './app.js';
 import { env } from './config/env.js';
-import { checkDatabase, closePool } from './db/pool.js';
+import { checkDatabase, disconnect } from './db/prisma.js';
 
 const server = createServer(app);
 
@@ -20,7 +20,7 @@ server.listen(env.port, async () => {
 const shutdown = (signal) => {
   console.log(`[api] ${signal} received, shutting down...`);
   server.close(async () => {
-    await closePool();
+    await disconnect();
     process.exit(0);
   });
 };

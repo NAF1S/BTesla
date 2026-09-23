@@ -1,4 +1,4 @@
-import { closePool, pool } from './pool.js';
+import { prisma, disconnect } from './prisma.js';
 import { seedTransportNetwork } from './seeds/transport-network.seed.js';
 
 /**
@@ -11,26 +11,29 @@ import { seedTransportNetwork } from './seeds/transport-network.seed.js';
  *
  * Usage: npm run db:seed   (run `npm run db:migrate` first)
  */
-const client = await pool.connect();
+
+/** True when the error means the tables have not been created yet. */
+const isMissingTable = (err) =>
+  err.code === 'P2021' ||
+  err.meta?.driverAdapterError?.cause?.originalCode === '42P01' ||
+  /relation .* does not exist/i.test(err.message);
+
 try {
-  await client.query('BEGIN');
-  const summary = await seedTransportNetwork(client);
-  await client.query('COMMIT');
+  const summary = await prisma.$transaction((tx) => seedTransportNetwork(tx), {
+    // The seed is a long chain of sequential dependent upserts; give it more
+    // headroom than Prisma's 5s default so a slow machine cannot abort it.
+    timeout: 30_000,
+  });
+
   console.log(
     `[db] transport seed applied: ${summary.zones} zones, ${summary.stops} stops, ` +
       `${summary.corridors} corridors, ${summary.corridorStops} corridor stops, ` +
       `${summary.travelEstimates} travel estimates`,
   );
 } catch (err) {
-  try {
-    await client.query('ROLLBACK');
-  } catch {
-    // The connection is already gone; the original error is the useful one.
-  }
   console.error('[db] transport seed failed:', err.message);
-  if (err.code === '42P01') console.error('[db] hint: run `npm run db:migrate` first');
+  if (isMissingTable(err)) console.error('[db] hint: run `npm run db:migrate` first');
   process.exitCode = 1;
 } finally {
-  client.release();
-  await closePool();
+  await disconnect();
 }

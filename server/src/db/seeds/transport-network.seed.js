@@ -17,9 +17,10 @@ import {
  *   * it runs in a single transaction supplied by the caller, so a failure
  *     leaves the database untouched.
  *
- * Call it with a connected pg client, e.g.
- *   BEGIN; seedTransportNetwork(client); COMMIT;
+ * Call it with a Prisma transaction client, e.g.
+ *   prisma.$transaction((tx) => seedTransportNetwork(tx))
  */
+
 const PARKING_OFFSET = 10_000;
 
 /**
@@ -83,42 +84,42 @@ const assertSeedDataIsCoherent = () => {
   }
 };
 
-const upsertZone = async (client, { code, name, active = true }) => {
-  const { rows } = await client.query(
-    `INSERT INTO zones (code, name, active)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (code) DO UPDATE SET name = EXCLUDED.name, active = EXCLUDED.active
-     RETURNING id`,
-    [code, name, active],
-  );
-  return rows[0].id;
+const upsertZone = async (tx, { code, name, active = true }) => {
+  const { id } = await tx.zone.upsert({
+    where: { code },
+    update: { name, active },
+    create: { code, name, active },
+    select: { id: true },
+  });
+  return id;
 };
 
-const upsertStop = async (client, stop, zoneId) => {
-  const { rows } = await client.query(
-    `INSERT INTO stops (zone_id, code, name, latitude, longitude, active)
-     VALUES ($1, $2, $3, $4, $5, $6)
-     ON CONFLICT (code) DO UPDATE
-       SET zone_id = EXCLUDED.zone_id,
-           name = EXCLUDED.name,
-           latitude = EXCLUDED.latitude,
-           longitude = EXCLUDED.longitude,
-           active = EXCLUDED.active
-     RETURNING id`,
-    [zoneId, stop.code, stop.name, stop.latitude ?? null, stop.longitude ?? null, stop.active ?? true],
-  );
-  return rows[0].id;
+const upsertStop = async (tx, stop, zoneId) => {
+  const attributes = {
+    zoneId,
+    name: stop.name,
+    latitude: stop.latitude ?? null,
+    longitude: stop.longitude ?? null,
+    active: stop.active ?? true,
+  };
+
+  const { id } = await tx.stop.upsert({
+    where: { code: stop.code },
+    update: attributes,
+    create: { code: stop.code, ...attributes },
+    select: { id: true },
+  });
+  return id;
 };
 
-const upsertCorridor = async (client, { code, name, active = true }) => {
-  const { rows } = await client.query(
-    `INSERT INTO corridors (code, name, active)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (code) DO UPDATE SET name = EXCLUDED.name, active = EXCLUDED.active
-     RETURNING id`,
-    [code, name, active],
-  );
-  return rows[0].id;
+const upsertCorridor = async (tx, { code, name, active = true }) => {
+  const { id } = await tx.corridor.upsert({
+    where: { code },
+    update: { name, active },
+    create: { code, name, active },
+    select: { id: true },
+  });
+  return id;
 };
 
 /**
@@ -133,11 +134,11 @@ const upsertCorridor = async (client, { code, name, active = true }) => {
  *
  * Only rows belonging to this seeded corridor are touched.
  */
-const upsertCorridorStops = async (client, corridorId, corridorCode, stopCodes, stopIds) => {
-  await client.query(`UPDATE corridor_stops SET position = position + $2 WHERE corridor_id = $1`, [
-    corridorId,
-    PARKING_OFFSET,
-  ]);
+const upsertCorridorStops = async (tx, corridorId, corridorCode, stopCodes, stopIds) => {
+  await tx.corridorStop.updateMany({
+    where: { corridorId },
+    data: { position: { increment: PARKING_OFFSET } },
+  });
 
   let position = 0;
   for (const stopCode of stopCodes) {
@@ -145,70 +146,63 @@ const upsertCorridorStops = async (client, corridorId, corridorCode, stopCodes, 
     const stopId = stopIds.get(stopCode);
     if (!stopId) throw new Error(`Corridor "${corridorCode}" references unknown stop "${stopCode}"`);
 
-    await client.query(
-      `INSERT INTO corridor_stops (corridor_id, stop_id, position)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (corridor_id, stop_id) DO UPDATE SET position = EXCLUDED.position`,
-      [corridorId, stopId, position],
-    );
+    await tx.corridorStop.upsert({
+      where: { corridorId_stopId: { corridorId, stopId } },
+      update: { position },
+      create: { corridorId, stopId, position },
+    });
   }
 
-  await client.query(
-    `DELETE FROM corridor_stops WHERE corridor_id = $1 AND position > $2`,
-    [corridorId, PARKING_OFFSET],
-  );
+  await tx.corridorStop.deleteMany({
+    where: { corridorId, position: { gt: PARKING_OFFSET } },
+  });
 
   return position;
 };
 
-const upsertTravelEstimate = async (client, estimate, stopIds) => {
+const upsertTravelEstimate = async (tx, estimate, stopIds) => {
   const fromStopId = stopIds.get(estimate.fromStopCode);
   const toStopId = stopIds.get(estimate.toStopCode);
 
-  await client.query(
-    `INSERT INTO travel_estimates
-       (from_stop_id, to_stop_id, estimated_minutes, estimated_distance_km, base_fare, currency)
-     VALUES ($1, $2, $3, $4, $5, $6)
-     ON CONFLICT (from_stop_id, to_stop_id) DO UPDATE
-       SET estimated_minutes = EXCLUDED.estimated_minutes,
-           estimated_distance_km = EXCLUDED.estimated_distance_km,
-           base_fare = EXCLUDED.base_fare,
-           currency = EXCLUDED.currency`,
-    [
-      fromStopId,
-      toStopId,
-      estimate.estimatedMinutes,
-      estimate.estimatedDistanceKm,
-      estimate.baseFare,
-      estimate.currency ?? 'BDT',
-    ],
-  );
+  const attributes = {
+    estimatedMinutes: estimate.estimatedMinutes,
+    estimatedDistanceKm: estimate.estimatedDistanceKm,
+    baseFare: estimate.baseFare,
+    currency: estimate.currency ?? 'BDT',
+  };
+
+  await tx.travelEstimate.upsert({
+    // Directional by construction: the key is the ordered (from, to) pair.
+    where: { fromStopId_toStopId: { fromStopId, toStopId } },
+    update: attributes,
+    create: { fromStopId, toStopId, ...attributes },
+  });
 };
 
 /**
- * Applies the transport seed data with the given client.
+ * Applies the transport seed data with the given transaction client.
  * Returns a small summary that is handy for CLI output and tests.
  */
-export const seedTransportNetwork = async (client) => {
+export const seedTransportNetwork = async (tx) => {
   assertSeedDataIsCoherent();
 
   const zoneIds = new Map();
-  for (const zone of seedZones) zoneIds.set(zone.code, await upsertZone(client, zone));
+  for (const zone of seedZones) zoneIds.set(zone.code, await upsertZone(tx, zone));
 
   const stopIds = new Map();
   for (const stop of seedStops) {
-    stopIds.set(stop.code, await upsertStop(client, stop, zoneIds.get(stop.zoneCode)));
+    stopIds.set(stop.code, await upsertStop(tx, stop, zoneIds.get(stop.zoneCode)));
   }
 
   const corridorIds = new Map();
   for (const corridor of seedCorridors) {
-    corridorIds.set(corridor.code, await upsertCorridor(client, corridor));
+    corridorIds.set(corridor.code, await upsertCorridor(tx, corridor));
   }
 
   let corridorStopCount = 0;
   for (const [corridorCode, stopCodes] of Object.entries(seedCorridorStops)) {
     corridorStopCount += await upsertCorridorStops(
-      client,
+      tx,
       corridorIds.get(corridorCode),
       corridorCode,
       stopCodes,
@@ -217,7 +211,7 @@ export const seedTransportNetwork = async (client) => {
   }
 
   for (const estimate of seedTravelEstimates) {
-    await upsertTravelEstimate(client, estimate, stopIds);
+    await upsertTravelEstimate(tx, estimate, stopIds);
   }
 
   return {

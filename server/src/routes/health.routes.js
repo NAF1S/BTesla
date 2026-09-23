@@ -1,6 +1,6 @@
 import { Router } from 'express';
 
-import { checkDatabase } from '../db/pool.js';
+import { checkDatabase } from '../db/prisma.js';
 
 const router = Router();
 

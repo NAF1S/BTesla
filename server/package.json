@@ -8,20 +8,26 @@
   "scripts": {
     "dev": "node --watch src/index.js",
     "start": "node src/index.js",
+    "db:generate": "prisma generate",
     "db:migrate": "node src/db/migrate.js",
     "db:seed": "node src/db/seed.js",
     "test": "node --test --test-concurrency=1 \"test/**/*.test.js\"",
     "test:unit": "node --test \"test/unit/*.test.js\"",
-    "test:integration": "node --test --test-concurrency=1 \"test/integration/*.test.js\""
+    "test:integration": "node --test --test-concurrency=1 \"test/integration/*.test.js\"",
+    "postinstall": "prisma generate"
   },
   "dependencies": {
+    "@prisma/adapter-pg": "^7.10.0",
+    "@prisma/client": "^7.10.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
-    "morgan": "^1.10.1",
-    "pg": "^8.16.3"
+    "morgan": "^1.10.1"
   },
   "engines": {
     "node": ">=20"
+  },
+  "devDependencies": {
+    "prisma": "^7.10.0"
   }
 }

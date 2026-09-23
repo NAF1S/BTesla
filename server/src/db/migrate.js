@@ -1,5 +1,5 @@
 import { applyMigrations } from './migrations.js';
-import { closePool } from './pool.js';
+import { disconnect } from './prisma.js';
 
 /** CLI runner for `npm run db:migrate`. The logic lives in ./migrations.js. */
 try {
@@ -8,5 +8,5 @@ try {
   console.error('[db]', err.message);
   process.exitCode = 1;
 } finally {
-  await closePool();
+  await disconnect();
 }

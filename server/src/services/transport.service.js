@@ -1,114 +1,129 @@
-import { query } from '../db/pool.js';
+import { prisma } from '../db/prisma.js';
 
 /**
  * Read-only queries for the transport network (zones, stops, corridors and
  * directional travel estimates).
  *
- * Conventions follow services/user.service.js: plain SQL through the shared
- * pool, rows returned as-is, HTTP status decisions left to the controller.
+ * Conventions follow services/user.service.js: Prisma results are returned
+ * as-is, HTTP status decisions are left to the controller, and
+ * serializers/transport.serializer.js turns them into DTOs so no raw record
+ * ever reaches the client.
  */
 
-const STOP_COLUMNS = `
-  s.id, s.code, s.name, s.latitude, s.longitude, s.active,
-  z.code AS zone_code
-`;
-
-const CORRIDOR_COLUMNS = 'c.id, c.code, c.name, c.active';
-
-export const findActiveZones = async () => {
-  const { rows } = await query(
-    `SELECT id, code, name FROM zones WHERE active ORDER BY name, code`,
-  );
-  return rows;
+const STOP_SELECT = {
+  id: true,
+  code: true,
+  name: true,
+  latitude: true,
+  longitude: true,
+  active: true,
+  zone: { select: { code: true } },
 };
 
-export const findZoneByCode = async (code) => {
-  const { rows } = await query(`SELECT id, code, name, active FROM zones WHERE code = $1`, [code]);
-  return rows[0] ?? null;
-};
+export const findActiveZones = () =>
+  prisma.zone.findMany({
+    where: { active: true },
+    select: { id: true, code: true, name: true },
+    orderBy: [{ name: 'asc' }, { code: 'asc' }],
+  });
+
+export const findZoneByCode = (code) =>
+  prisma.zone.findUnique({
+    where: { code },
+    select: { id: true, code: true, name: true, active: true },
+  });
 
 /**
  * Active stops, optionally narrowed to one zone code.
  * Pass `zoneCode: null` for every active stop.
  */
-export const findActiveStops = async ({ zoneCode = null } = {}) => {
-  const { rows } = await query(
-    `SELECT ${STOP_COLUMNS}
-       FROM stops s
-       JOIN zones z ON z.id = s.zone_id
-      WHERE s.active
-        AND ($1::text IS NULL OR z.code = $1::text)
-      ORDER BY z.name, s.name, s.code`,
-    [zoneCode],
-  );
-  return rows;
-};
+export const findActiveStops = ({ zoneCode = null } = {}) =>
+  prisma.stop.findMany({
+    where: { active: true, ...(zoneCode ? { zone: { code: zoneCode } } : {}) },
+    select: STOP_SELECT,
+    orderBy: [{ zone: { name: 'asc' } }, { name: 'asc' }, { code: 'asc' }],
+  });
 
 /**
- * A single stop by code. Returns the row even when it is inactive so the
+ * A single stop by code. Returns the record even when it is inactive so the
  * caller can answer 409 ("exists but is switched off") instead of 404.
  */
-export const findStopByCode = async (code) => {
-  const { rows } = await query(
-    `SELECT ${STOP_COLUMNS} FROM stops s JOIN zones z ON z.id = s.zone_id WHERE s.code = $1`,
-    [code],
-  );
-  return rows[0] ?? null;
-};
+export const findStopByCode = (code) =>
+  prisma.stop.findUnique({
+    where: { code },
+    select: STOP_SELECT,
+  });
 
-export const findActiveCorridors = async () => {
-  const { rows } = await query(
-    `SELECT ${CORRIDOR_COLUMNS} FROM corridors c WHERE c.active ORDER BY c.name, c.code`,
-  );
-  return rows;
-};
+export const findActiveCorridors = () =>
+  prisma.corridor.findMany({
+    where: { active: true },
+    select: { id: true, code: true, name: true, active: true },
+    orderBy: [{ name: 'asc' }, { code: 'asc' }],
+  });
 
 /** A single corridor by code; inactive corridors are returned so the caller can answer 409. */
-export const findCorridorByCode = async (code) => {
-  const { rows } = await query(`SELECT ${CORRIDOR_COLUMNS} FROM corridors c WHERE c.code = $1`, [
-    code,
-  ]);
-  return rows[0] ?? null;
-};
+export const findCorridorByCode = (code) =>
+  prisma.corridor.findUnique({
+    where: { code },
+    select: { id: true, code: true, name: true, active: true },
+  });
 
 /**
  * The ordered stop list of a corridor. Inactive stops are omitted from reads,
  * matching the "reject inactive stops" rule of the rest of the feature; the
  * remaining positions keep their stored values so the order stays unambiguous.
  */
-export const findCorridorStops = async (corridorId) => {
-  const { rows } = await query(
-    `SELECT cs.position, ${STOP_COLUMNS}
-       FROM corridor_stops cs
-       JOIN stops s ON s.id = cs.stop_id
-       JOIN zones z ON z.id = s.zone_id
-      WHERE cs.corridor_id = $1
-        AND s.active
-      ORDER BY cs.position`,
-    [corridorId],
-  );
-  return rows;
-};
+export const findCorridorStops = (corridorId) =>
+  prisma.corridorStop.findMany({
+    where: { corridorId, stop: { active: true } },
+    select: { position: true, stop: { select: STOP_SELECT } },
+    orderBy: { position: 'asc' },
+  });
 
 /**
  * Active corridors that contain both stops with the pickup strictly before the
  * drop-off. Direction matters: a one-way corridor never matches the reversed
- * pair, because the comparison is done on corridor positions, not on codes.
+ * pair, because the comparison is made on corridor positions, not on codes.
+ *
+ * One query fetches the membership rows for both stops; pairing them per
+ * corridor and applying the position comparison is then pure in-memory work.
  */
 export const findCorridorsForStopPair = async (pickupStopId, dropoffStopId) => {
-  const { rows } = await query(
-    `SELECT c.id, c.code, c.name,
-            pickup.position  AS pickup_position,
-            dropoff.position AS dropoff_position
-       FROM corridors c
-       JOIN corridor_stops pickup  ON pickup.corridor_id = c.id AND pickup.stop_id = $1
-       JOIN corridor_stops dropoff ON dropoff.corridor_id = c.id AND dropoff.stop_id = $2
-      WHERE c.active
-        AND pickup.position < dropoff.position
-      ORDER BY c.name, c.code`,
-    [pickupStopId, dropoffStopId],
-  );
-  return rows;
+  const memberships = await prisma.corridorStop.findMany({
+    where: {
+      stopId: { in: [pickupStopId, dropoffStopId] },
+      corridor: { active: true },
+    },
+    select: {
+      corridorId: true,
+      stopId: true,
+      position: true,
+      corridor: { select: { id: true, code: true, name: true } },
+    },
+  });
+
+  const matches = new Map();
+  for (const row of memberships) {
+    const entry = matches.get(row.corridorId) ?? {
+      corridor: row.corridor,
+      pickupPosition: null,
+      dropoffPosition: null,
+    };
+    if (row.stopId === pickupStopId) entry.pickupPosition = row.position;
+    if (row.stopId === dropoffStopId) entry.dropoffPosition = row.position;
+    matches.set(row.corridorId, entry);
+  }
+
+  return [...matches.values()]
+    .filter(
+      ({ pickupPosition, dropoffPosition }) =>
+        pickupPosition !== null && dropoffPosition !== null && pickupPosition < dropoffPosition,
+    )
+    .sort(
+      (a, b) =>
+        a.corridor.name.localeCompare(b.corridor.name) ||
+        a.corridor.code.localeCompare(b.corridor.code),
+    );
 };
 
 /**
@@ -117,23 +132,15 @@ export const findCorridorsForStopPair = async (pickupStopId, dropoffStopId) => {
  * Travel estimates are directional: there is deliberately no fallback that
  * looks up the reverse pair, so A -> B is not answered by a B -> A record.
  */
-export const findTravelEstimate = async (fromStopId, toStopId) => {
-  const { rows } = await query(
-    `SELECT te.id,
-            te.estimated_minutes,
-            te.estimated_distance_km,
-            te.base_fare,
-            te.currency,
-            origin.code AS from_stop_code,
-            origin.name AS from_stop_name,
-            destination.code AS to_stop_code,
-            destination.name AS to_stop_name
-       FROM travel_estimates te
-       JOIN stops origin      ON origin.id = te.from_stop_id
-       JOIN stops destination ON destination.id = te.to_stop_id
-      WHERE te.from_stop_id = $1
-        AND te.to_stop_id = $2`,
-    [fromStopId, toStopId],
-  );
-  return rows[0] ?? null;
-};
+export const findTravelEstimate = (fromStopId, toStopId) =>
+  prisma.travelEstimate.findUnique({
+    where: { fromStopId_toStopId: { fromStopId, toStopId } },
+    select: {
+      estimatedMinutes: true,
+      estimatedDistanceKm: true,
+      baseFare: true,
+      currency: true,
+      fromStop: { select: { code: true, name: true } },
+      toStop: { select: { code: true, name: true } },
+    },
+  });
