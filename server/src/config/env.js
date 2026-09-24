@@ -87,6 +87,22 @@ export const env = {
      */
     pricingCode: process.env.FARE_PRICING_CODE ?? 'dhaka-solo',
   },
+
+  // --- Ride requests ----------------------------------------------------
+  rideRequests: {
+    /**
+     * How long a WAITING request looks for a ride before it expires. Drives
+     * `search_expires_at = requested_at + this`, and is the deadline the
+     * expiration sweep acts on.
+     */
+    searchTtlSeconds: toNumber(process.env.RIDE_REQUEST_SEARCH_TTL_SECONDS, 600),
+    /** Ceiling for the interactive transaction a lifecycle write runs in. */
+    transactionTimeoutMs: toNumber(process.env.RIDE_REQUEST_TRANSACTION_TIMEOUT_MS, 10_000),
+    /** Default page size for the passenger's own request history. */
+    historyPageSize: toNumber(process.env.RIDE_REQUEST_PAGE_SIZE, 20),
+    /** Largest page a client may ask for, so a history read cannot be unbounded. */
+    historyMaxPageSize: toNumber(process.env.RIDE_REQUEST_MAX_PAGE_SIZE, 100),
+  },
 };
 
 /**

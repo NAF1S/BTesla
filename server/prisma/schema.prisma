@@ -91,19 +91,21 @@ model RoutingVertex {
 /// twice; `code` is globally unique because it is both the seed key and the
 /// public identifier.
 model ServicePoint {
-  id                String                   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  zoneId            String                   @map("zone_id") @db.Uuid
-  routingVertexId   String                   @map("routing_vertex_id") @db.Uuid
-  code              String                   @unique
-  name              String
-  location          Unsupported("geography")
-  active            Boolean                  @default(true)
-  createdAt         DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt         DateTime                 @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-  zone              ServiceZone              @relation(fields: [zoneId], references: [id], onDelete: Restrict, onUpdate: NoAction)
-  routingVertex     RoutingVertex            @relation(fields: [routingVertexId], references: [id], onDelete: Restrict, onUpdate: NoAction)
-  originQuotes      FareQuote[]              @relation("FareQuoteOrigin")
-  destinationQuotes FareQuote[]              @relation("FareQuoteDestination")
+  id                  String                   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  zoneId              String                   @map("zone_id") @db.Uuid
+  routingVertexId     String                   @map("routing_vertex_id") @db.Uuid
+  code                String                   @unique
+  name                String
+  location            Unsupported("geography")
+  active              Boolean                  @default(true)
+  createdAt           DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime                 @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  zone                ServiceZone              @relation(fields: [zoneId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  routingVertex       RoutingVertex            @relation(fields: [routingVertexId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  originQuotes        FareQuote[]              @relation("FareQuoteOrigin")
+  destinationQuotes   FareQuote[]              @relation("FareQuoteDestination")
+  pickupRideRequests  RideRequest[]            @relation("RideRequestPickup")
+  dropoffRideRequests RideRequest[]            @relation("RideRequestDropoff")
 
   @@unique([zoneId, name], map: "service_points_zone_name_unique")
   @@index([zoneId])
@@ -204,43 +206,132 @@ model FarePolicy {
 /// and the total is `subtotal + trafficAdjustment`, so the multiplier can never
 /// be applied twice without the row failing `fare_quotes_total_consistent`.
 ///
-/// There is no passenger or RideRequest relationship in this phase; a later
-/// milestone adds the request that accepts a quote.
+/// `passengerProfileId` is the passenger the quote was calculated for, taken
+/// from authentication rather than from the request. It is nullable because
+/// quotes created before that rule existed have no owner -- and "no owner" has
+/// to stay distinguishable from "belongs to this passenger", since an unowned
+/// quote can never be accepted by anyone.
 model FareQuote {
-  id                        String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  originServicePointId      String         @map("origin_service_point_id") @db.Uuid
-  destinationServicePointId String         @map("destination_service_point_id") @db.Uuid
-  departureAt               DateTime       @map("departure_at") @db.Timestamptz(6)
-  estimatedArrivalAt        DateTime       @map("estimated_arrival_at") @db.Timestamptz(6)
-  trafficProfile            TrafficProfile @map("traffic_profile")
-  distanceMeters            Int            @map("distance_meters")
-  durationSeconds           Int            @map("duration_seconds")
-  farePolicyId              String         @map("fare_policy_id") @db.Uuid
-  pricingCode               String         @map("pricing_code")
-  pricingVersion            Int            @map("pricing_version")
+  id                        String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  originServicePointId      String            @map("origin_service_point_id") @db.Uuid
+  destinationServicePointId String            @map("destination_service_point_id") @db.Uuid
+  departureAt               DateTime          @map("departure_at") @db.Timestamptz(6)
+  estimatedArrivalAt        DateTime          @map("estimated_arrival_at") @db.Timestamptz(6)
+  trafficProfile            TrafficProfile    @map("traffic_profile")
+  distanceMeters            Int               @map("distance_meters")
+  durationSeconds           Int               @map("duration_seconds")
+  farePolicyId              String            @map("fare_policy_id") @db.Uuid
+  pricingCode               String            @map("pricing_code")
+  pricingVersion            Int               @map("pricing_version")
   currency                  String
-  baseFare                  Decimal        @map("base_fare") @db.Decimal(14, 6)
-  distanceFare              Decimal        @map("distance_fare") @db.Decimal(14, 6)
-  timeFare                  Decimal        @map("time_fare") @db.Decimal(14, 6)
-  preTrafficSubtotal        Decimal        @map("pre_traffic_subtotal") @db.Decimal(14, 6)
-  trafficMultiplier         Decimal        @map("traffic_multiplier") @db.Decimal(14, 6)
-  trafficAdjustment         Decimal        @map("traffic_adjustment") @db.Decimal(14, 6)
-  minimumFare               Decimal        @map("minimum_fare") @db.Decimal(14, 6)
-  minimumFareApplied        Boolean        @map("minimum_fare_applied")
-  finalFare                 Decimal        @map("final_fare") @db.Decimal(14, 6)
-  routeSnapshot             Json           @map("route_snapshot")
-  fareBreakdown             Json           @map("fare_breakdown")
-  expiresAt                 DateTime       @map("expires_at") @db.Timestamptz(6)
-  createdAt                 DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
-  originServicePoint        ServicePoint   @relation("FareQuoteOrigin", fields: [originServicePointId], references: [id], onDelete: Restrict, onUpdate: NoAction)
-  destinationServicePoint   ServicePoint   @relation("FareQuoteDestination", fields: [destinationServicePointId], references: [id], onDelete: Restrict, onUpdate: NoAction)
-  farePolicy                FarePolicy     @relation(fields: [farePolicyId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  baseFare                  Decimal           @map("base_fare") @db.Decimal(14, 6)
+  distanceFare              Decimal           @map("distance_fare") @db.Decimal(14, 6)
+  timeFare                  Decimal           @map("time_fare") @db.Decimal(14, 6)
+  preTrafficSubtotal        Decimal           @map("pre_traffic_subtotal") @db.Decimal(14, 6)
+  trafficMultiplier         Decimal           @map("traffic_multiplier") @db.Decimal(14, 6)
+  trafficAdjustment         Decimal           @map("traffic_adjustment") @db.Decimal(14, 6)
+  minimumFare               Decimal           @map("minimum_fare") @db.Decimal(14, 6)
+  minimumFareApplied        Boolean           @map("minimum_fare_applied")
+  finalFare                 Decimal           @map("final_fare") @db.Decimal(14, 6)
+  routeSnapshot             Json              @map("route_snapshot")
+  fareBreakdown             Json              @map("fare_breakdown")
+  expiresAt                 DateTime          @map("expires_at") @db.Timestamptz(6)
+  createdAt                 DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+  passengerProfileId        String?           @map("passenger_profile_id") @db.Uuid
+  originServicePoint        ServicePoint      @relation("FareQuoteOrigin", fields: [originServicePointId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  destinationServicePoint   ServicePoint      @relation("FareQuoteDestination", fields: [destinationServicePointId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  farePolicy                FarePolicy        @relation(fields: [farePolicyId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  passengerProfile          PassengerProfile? @relation(fields: [passengerProfileId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  rideRequest               RideRequest?
 
   @@index([expiresAt])
   @@index([farePolicyId])
   @@index([createdAt])
   @@index([originServicePointId, destinationServicePointId], map: "fare_quotes_endpoints_idx")
+  @@index([passengerProfileId])
   @@map("fare_quotes")
+}
+
+// ---------------------------------------------------------------------------
+// Ride requests
+// ---------------------------------------------------------------------------
+
+/// One passenger travelling from one pickup point to one destination point.
+///
+/// **There is no seat count, and there will not be one.** A request is one
+/// passenger; future vehicle-capacity planning counts assigned passenger
+/// requests rather than seats, so this model never has to be migrated away.
+///
+/// The `accepted*` columns are frozen copies of the quote -- a later FarePolicy
+/// version must not change what a passenger already agreed to. A database
+/// trigger makes them, and the passenger/quote/endpoints, write-once.
+///
+/// Three rules are enforced by the database rather than by a service, because
+/// they are the ones that break under concurrency: `fareQuoteId` is unique (one
+/// request per accepted quote), `(passengerProfileId, idempotencyKey)` is unique
+/// (idempotent retries), and the partial unique index
+/// `one_active_ride_request_per_passenger` allows exactly one active request per
+/// passenger. Prisma cannot express a partial index, so that one appears as an
+/// expected difference in `prisma migrate diff` -- like the GiST indexes.
+model RideRequest {
+  id                      String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  passengerProfileId      String              @map("passenger_profile_id") @db.Uuid
+  fareQuoteId             String              @unique @map("fare_quote_id") @db.Uuid
+  pickupServicePointId    String              @map("pickup_service_point_id") @db.Uuid
+  dropoffServicePointId   String              @map("dropoff_service_point_id") @db.Uuid
+  status                  RideRequestStatus   @default(WAITING)
+  requestedAt             DateTime            @map("requested_at") @db.Timestamptz(6)
+  searchExpiresAt         DateTime            @map("search_expires_at") @db.Timestamptz(6)
+  cancelledAt             DateTime?           @map("cancelled_at") @db.Timestamptz(6)
+  cancellationReason      CancellationReason? @map("cancellation_reason")
+  idempotencyKey          String              @map("idempotency_key")
+  requestFingerprint      String              @map("request_fingerprint")
+  acceptedFare            Decimal             @map("accepted_fare") @db.Decimal(14, 6)
+  currency                String
+  acceptedPricingCode     String              @map("accepted_pricing_code")
+  acceptedPricingVersion  Int                 @map("accepted_pricing_version")
+  acceptedDistanceMeters  Int                 @map("accepted_distance_meters")
+  acceptedDurationSeconds Int                 @map("accepted_duration_seconds")
+  createdAt               DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt               DateTime            @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  passengerProfile        PassengerProfile    @relation(fields: [passengerProfileId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  fareQuote               FareQuote           @relation(fields: [fareQuoteId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  pickupServicePoint      ServicePoint        @relation("RideRequestPickup", fields: [pickupServicePointId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  dropoffServicePoint     ServicePoint        @relation("RideRequestDropoff", fields: [dropoffServicePointId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  events                  RideEvent[]
+
+  @@unique([passengerProfileId, idempotencyKey], map: "ride_requests_passenger_idempotency_key_unique")
+  @@index([passengerProfileId, requestedAt], map: "ride_requests_passenger_requested_at_idx")
+  @@index([status, searchExpiresAt])
+  @@map("ride_requests")
+}
+
+/// Append-only lifecycle history: one row per thing that happened.
+///
+/// `sequence` is per request and unique, so the order events happened in is a
+/// fact rather than a convention. `metadata` is audit-safe by rule -- it records
+/// the transition, never the passenger; no tokens, no contact details, no free
+/// text from a client.
+///
+/// UPDATE is refused by a trigger; DELETE is not, because a deleted passenger
+/// account cascades and a future retention job would need it. Nothing in the
+/// application deletes an event.
+model RideEvent {
+  id             String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  rideRequestId  String             @map("ride_request_id") @db.Uuid
+  sequence       Int
+  eventType      RideEventType      @map("event_type")
+  actorType      RideActorType      @map("actor_type")
+  actorUserId    String?            @map("actor_user_id") @db.Uuid
+  previousStatus RideRequestStatus? @map("previous_status")
+  newStatus      RideRequestStatus  @map("new_status")
+  metadata       Json               @default("{}")
+  createdAt      DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  rideRequest    RideRequest        @relation(fields: [rideRequestId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  actorUser      User?              @relation(fields: [actorUserId], references: [id], onDelete: SetNull, onUpdate: NoAction)
+
+  @@unique([rideRequestId, sequence], map: "ride_events_request_sequence_unique")
+  @@map("ride_events")
 }
 
 /// This model contains an expression index which requires additional setup for migrations. Visit https://pris.ly/d/expression-indexes for more info.
@@ -259,6 +350,7 @@ model User {
 
   passengerProfile PassengerProfile?
   driverProfile    DriverProfile?
+  rideEvents       RideEvent[]
 
   @@index([role])
   @@map("users")
@@ -268,11 +360,13 @@ model User {
 /// be expressed as a foreign key, so it is enforced in the application service.
 /// `userId` being unique is what enforces "at most one profile per user".
 model PassengerProfile {
-  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  userId    String   @unique @map("user_id") @db.Uuid
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  id           String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId       String        @unique @map("user_id") @db.Uuid
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  fareQuotes   FareQuote[]
+  rideRequests RideRequest[]
 
   @@map("passenger_profiles")
 }
@@ -330,4 +424,51 @@ enum TrafficProfile {
   RUSH_HOUR
 
   @@map("traffic_profile")
+}
+
+/// The full passenger-visible lifecycle, created by 08-ride-requests.sql.
+/// MATCHED, IN_PROGRESS and COMPLETED exist now so that matching and trip
+/// milestones never have to alter an enum that is already in use; only the
+/// WAITING transitions are implemented in this phase.
+enum RideRequestStatus {
+  WAITING
+  MATCHED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  EXPIRED
+
+  @@map("ride_request_status")
+}
+
+/// RIDE_REQUESTED, RIDE_CANCELLED and RIDE_EXPIRED are written today; the rest
+/// are reserved for matching and the trip itself.
+enum RideEventType {
+  RIDE_REQUESTED
+  RIDE_CANCELLED
+  RIDE_EXPIRED
+  PASSENGER_MATCHED
+  RIDE_STARTED
+  RIDE_COMPLETED
+  PASSENGER_PICKED_UP
+  PASSENGER_DROPPED_OFF
+
+  @@map("ride_event_type")
+}
+
+enum RideActorType {
+  PASSENGER
+  SYSTEM
+  ADMIN
+
+  @@map("ride_actor_type")
+}
+
+enum CancellationReason {
+  CHANGED_MIND
+  WRONG_LOCATION
+  WAIT_TOO_LONG
+  OTHER
+
+  @@map("ride_cancellation_reason")
 }

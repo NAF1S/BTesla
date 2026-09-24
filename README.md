@@ -25,22 +25,24 @@ TeslaB/
 │   │   ├── 04-drop-transport-network.sql  # forward migration removing the old location model
 │   │   ├── 05-postgis-location.sql        # PostGIS zones, points and routing graph
 │   │   ├── 06-pgrouting-routing.sql       # pgRouting + the integer graph identifiers
-│   │   └── 07-fare-pricing.sql            # versioned fare policies + immutable quotes
+│   │   ├── 07-fare-pricing.sql            # versioned fare policies + immutable quotes
+│   │   └── 08-ride-requests.sql           # owned quotes, ride requests + append-only history
 │   ├── prisma/
 │   │   └── schema.prisma   # Prisma view of the SQL schema (hand-mapped)
 │   ├── prisma7.config.ts   # Prisma CLI config (reuses src/config/env.js)
 │   ├── src/
 │   │   ├── index.js        # HTTP server bootstrap + graceful shutdown
 │   │   ├── app.js          # Express app: middleware, routes, error handling
+│   │   ├── commands/       # Operational scripts (expire-ride-requests)
 │   │   ├── config/env.js   # Environment configuration
 │   │   ├── db/             # Prisma client, health probe, migration runner, seeder
 │   │   │   ├── seeds/      # location + routing graph + pricing + demo accounts, idempotent
 │   │   │   └── seeds/graph-ids.js  # deterministic pgRouting identifiers (shared rule)
-│   │   ├── routes/         # Route definitions (index, health, auth, users, location, routes, fare-quotes)
+│   │   ├── routes/         # Route definitions (index, health, auth, users, location, routes, fare-quotes, ride-requests)
 │   │   ├── controllers/    # Request handlers
-│   │   ├── services/       # Business logic / queries (location, routing, fare)
+│   │   ├── services/       # Business logic / queries (location, routing, fare, ride-request, ride.status)
 │   │   ├── serializers/    # Record -> response DTO mappers
-│   │   ├── middleware/     # notFound, errorHandler, auth (requireAuth, requireRole)
+│   │   ├── middleware/     # notFound, errorHandler, auth (requireAuth, requireRole, requirePassengerProfileId)
 │   │   └── utils/          # ApiError, validation, geo, time, password, token, cookies
 │   ├── test/               # node --test suites (unit + integration)
 │   └── .env.example
@@ -84,6 +86,7 @@ The container runs `server/db/*.sql` automatically the first time its volume is 
 | `npm run db:generate` | Regenerate the Prisma client from the schema          |
 | `npm run db:migrate` | Apply `server/db/*.sql` to the database      |
 | `npm run db:seed`    | Apply the location + routing graph + demo account seed (idempotent) |
+| `npm run ride-requests:expire --workspace server` | Expire ride requests whose search window has closed (the operation a scheduler would run) |
 | `npm run db:psql`    | Open a psql shell in the container              |
 | `npm run db:logs`    | Follow the Postgres logs                        |
 | `npm test`           | API unit + integration tests (needs the database) |
@@ -148,10 +151,11 @@ cd server
 npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --script
 ```
 
-An empty migration is the ideal result. Two things will show up as intended differences, and neither is drift to "fix":
+An empty migration is the ideal result. Three things will show up as intended differences, and none is drift to "fix":
 
 1. the GiST spatial indexes, which Prisma cannot express on an `Unsupported` column, so it always proposes dropping them;
-2. any leftover object from a database that predates the current migration files -- for example a table created by a migration that has since been removed. The database in this workspace has some of these from an earlier, abandoned branch; `npm run db:reset` gives a clean database built only from the files in `server/db`.
+2. `ride_requests_passenger_requested_at_idx`, which is declared `(passenger_profile_id, requested_at DESC)` -- Prisma can express the columns but not the sort direction, so it proposes recreating the same index without `DESC`. The index Prisma cannot see at all is `one_active_ride_request_per_passenger`, the partial unique index behind the one-active-request rule: Prisma does not model `WHERE` clauses on indexes, which is the second reason migrations stay hand-written;
+3. any leftover object from a database that predates the current migration files -- for example a table created by a migration that has since been removed. The database in this workspace has some of these from an earlier, abandoned branch; `npm run db:reset` gives a clean database built only from the files in `server/db`.
 
 Like `pg_typeof()`, a few PostgreSQL internals cannot be read through Prisma raw queries; cast them (`pg_typeof(x)::text`) when you need them.
 
@@ -206,7 +210,11 @@ Base URL: `http://localhost:4000/api`
 | `GET`  | `/location/points`         | List active service points, optional `?zoneCode=`                                   |
 | `GET`  | `/location/points/:code`   | Get one service point by code                                                         |
 | `POST` | `/routes/estimate`         | Estimate a route between two service points (**requires authentication**) -- see [Routing](#routing) |
-| `POST` | `/fare-quotes`             | Quote a solo fare in BDT (**requires authentication**) -- see [Fare quotes](#fare-quotes) |
+| `POST` | `/fare-quotes`             | Quote a solo fare in BDT (**PASSENGER only**) -- see [Fare quotes](#fare-quotes) |
+| `POST` | `/ride-requests`           | Ask for a ride from a quote the caller owns (**PASSENGER only**) -- see [Ride requests](#ride-requests) |
+| `GET`  | `/ride-requests/my`        | The caller's own ride requests, newest first, paged (**PASSENGER only**) |
+| `GET`  | `/ride-requests/:id`       | One of the caller's own ride requests (**PASSENGER only**) |
+| `POST` | `/ride-requests/:id/cancel`| Cancel a request that is still waiting (**PASSENGER only**) |
 
 The location endpoints are read-only and return DTOs (`server/src/serializers/location.serializer.js`) instead of raw rows, so database column names, routing vertices and audit timestamps never leak into responses. `/location` is only ever about places: there is deliberately no route, distance, ETA, quote or fare endpoint under it, and none should be added. Route estimation lives at `/routes/estimate` instead.
 
@@ -231,7 +239,7 @@ Status codes are consistent across the location endpoints:
 | `409`  | The record exists but is inactive (also used for database conflicts)    |
 | `422`  | The request is well-formed but has no answer (an unreachable destination) |
 
-Both write-less calculation endpoints are authenticated, and neither is wrapped in a `data` envelope: a route estimate and a fare quote are the answer, not a list of answers. The location endpoints are the only ones that return `{ "data": [...] }`.
+Both calculation endpoints are authenticated, and neither is wrapped in a `data` envelope: a route estimate and a fare quote are the answer, not a list of answers. The location and ride-request-history endpoints return `{ "data": [...] }`.
 `/health` reports `"ok"` when the database is reachable and `"degraded"` when it is not, and never fails the request:
 
 ```json
@@ -748,7 +756,7 @@ Because the breakdown is stored with the quote, a quote stays reproducible after
 
 ### Fare-quote request
 
-`POST /api/fare-quotes` — **requires authentication**, like `/routes/estimate`. Any active role may ask. The caller's identity is not part of the quote and is **not stored**: this phase has no passenger ownership, and a later `RideRequest` -- not the quote -- is what will reference a passenger.
+`POST /api/fare-quotes` — **requires authentication and the `PASSENGER` role**. A quote belongs to the passenger who asked for it: ownership is what stops one passenger accepting another passenger's quote with a ride request, and it arrived with the ride-request milestone. A driver is refused with `403` rather than served a quote nobody could accept.
 
 | Field | Required | Notes |
 | ----- | -------- | ----- |
@@ -756,7 +764,7 @@ Because the breakdown is stored with the quote, a quote stays reproducible after
 | `destinationServicePointCode` | yes | A different `service_points.code` |
 | `departureAt` | no | ISO 8601 **with an explicit offset**; defaults to now. Decides both the traffic profile and which policy version applies |
 
-Sending anything else -- `distanceMeters`, `durationSeconds`, `finalFare`, `pricingVersion`, `pricingCode`, `trafficMultiplier`, `currency` -- is a `400`, not a silently ignored field.
+Sending anything else -- `distanceMeters`, `durationSeconds`, `finalFare`, `pricingVersion`, `pricingCode`, `trafficMultiplier`, `currency` -- is a `400`, not a silently ignored field. There is no field that names a passenger: the owner is taken from the session, and the response never says who it is.
 
 ### Fare-quote response
 
@@ -829,9 +837,208 @@ The fare tests are explicit about the parts that are easy to get quietly wrong: 
 
 ### What is deliberately not here
 
-Fare quoting stops at a price. There is **no** ride request, ride event, passenger ownership, request idempotency, pool, pool member, shared fare, pooling discount, ride matching, seat reservation, driver assignment, payment, wallet or demand-based surge pricing -- and no external pricing or routing API. The fare is a **solo** fare: one journey, one passenger, one price.
+Fare quoting stops at a price. There is **no** ride request, ride event, pool, pool member, shared fare, pooling discount, ride matching, seat reservation, driver assignment, payment, wallet or demand-based surge pricing -- and no external pricing or routing API. The fare is a **solo** fare: one journey, one passenger, one price.
 
-A quote is not attached to a user in this phase. The next milestone adds the `RideRequest` that accepts one, which is when ownership and idempotency become meaningful, and which is why quotes are stored rather than recomputed.
+A quote **is** owned by the passenger who asked for it -- ownership arrived with the ride-request milestone, which is what stops one passenger accepting another passenger's quote. The ride request that accepts it is the next section.
+
+## Ride requests
+
+A ride request is one passenger asking for one ride from one quote they own. It is the first endpoint in this project that creates something a passenger can come back and find, so most of its design is about identity, ownership and what happens when a client retries.
+
+```bash
+# 1. Quote the journey (the caller owns the quote).
+curl -i -X POST http://localhost:4000/api/fare-quotes \
+  -H 'Content-Type: application/json' -b cookies.txt \
+  -d '{"originServicePointCode":"banani-road-11","destinationServicePointCode":"mohakhali-bus-terminal","departureAt":"2026-09-24T08:41:00+06:00"}'
+
+# 2. Ask for the ride, naming the quote and an idempotency key.
+curl -i -X POST http://localhost:4000/api/ride-requests \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: ride-2026-09-24-0001' \
+  -b cookies.txt -d '{"fareQuoteId":"cc1116ae-0a82-4d4c-9d06-92d8084c26e4"}'
+```
+
+### One passenger, one journey, no seats
+
+A request is **one passenger** travelling from one pickup point to one destination point. There is no seat count, no requested-seats field and no per-seat fare anywhere -- not in the request table, not in the DTO, and not in the lifecycle module. Capacity planning for a future pool counts *assigned passenger requests*, which is why the model has none of those fields to migrate away from later.
+
+### Statuses and transitions
+
+| Status | Meaning | Active? |
+| ------ | ------- | ------- |
+| `WAITING` | Requested, looking for a ride | yes |
+| `MATCHED` | A pool has been matched (future milestone) | yes |
+| `IN_PROGRESS` | The ride is under way (future milestone) | yes |
+| `COMPLETED` | The ride finished (future milestone) | no -- terminal |
+| `CANCELLED` | The passenger cancelled while waiting | no -- terminal |
+| `EXPIRED` | The search window closed with nobody matched | no -- terminal |
+
+```mermaid
+stateDiagram-v2
+    [*] --> WAITING
+    WAITING --> CANCELLED: passenger cancels (implemented)
+    WAITING --> EXPIRED: search window closes (implemented)
+    WAITING --> MATCHED: matching (reserved)
+    MATCHED --> IN_PROGRESS: trip starts (reserved)
+    MATCHED --> CANCELLED: cancel a matched ride (reserved)
+    IN_PROGRESS --> COMPLETED: trip ends (reserved)
+    COMPLETED --> [*]
+    CANCELLED --> [*]
+    EXPIRED --> [*]
+```
+
+**Implemented in this milestone:** `WAITING -> CANCELLED` and `WAITING -> EXPIRED`. **Reserved:** the matching and trip transitions. The database trigger already allows every transition in the diagram, so the matching milestone needs no migration -- but nothing in the API can reach a reserved one, and `IMPLEMENTED_TRANSITIONS` in `server/src/services/ride.status.js` is what says so. Terminal statuses are terminal: they have no outgoing transition at all, reserved or otherwise.
+
+The rules live in one place, `server/src/services/ride.status.js`, with no database access, and three things share them: the service, the `enforce_ride_request_update()` trigger in `08-ride-requests.sql`, and the tests.
+
+### Status, money and identity are frozen
+
+`ride_requests` is written once and then only moves along the table above. A trigger refuses an `UPDATE` of the passenger, the quote, either endpoint, `requested_at`, the idempotency key, the fingerprint or any of the five accepted amounts; the service is the only writer of `status`, `cancelled_at` and `cancellation_reason`, in the same transaction as the event that records the change.
+
+The accepted fare is a **copy**, not a join: `accepted_fare`, `currency`, `accepted_pricing_code`, `accepted_pricing_version`, `accepted_distance_meters` and `accepted_duration_seconds` are columns on the request. Combined with the quote's own immutability, there is no path by which a later repricing could change what a passenger agreed to.
+
+### Append-only history
+
+Every lifecycle step appends a `ride_events` row in the same transaction as the change it describes, so a status can never exist without the history that explains it:
+
+| Column | Meaning |
+| ------ | ------- |
+| `sequence` | 1, 2, 3... per request, unique per request, taken under the request's row lock |
+| `event_type` | `RIDE_REQUESTED`, `RIDE_CANCELLED`, `RIDE_EXPIRED`, plus reserved matching/trip events |
+| `actor_type` / `actor_user_id` | `PASSENGER`, `SYSTEM` or `ADMIN`; null for a `SYSTEM` event, and `SET NULL` if the account is later deleted |
+| `previous_status` / `new_status` | What the request moved from and to -- null `previous_status` for creation |
+| `metadata` | A JSON object: the quote id on creation, the reason on cancellation, the deadline on expiry. Never a person, a token or client free text |
+
+`UPDATE` on an event is refused by a trigger; `DELETE` is allowed only so that a cascading account deletion (and a future retention job) can work. No endpoint exposes history: it is recorded for audit, and this milestone has no read model for it.
+
+### Idempotency
+
+`POST /api/ride-requests` requires an `Idempotency-Key` header -- 8-128 characters of `A-Z a-z 0-9 . _ : -`, a shape pinned in both the validator and a `CHECK` constraint.
+
+- A retry with the **same key, same passenger and same quote** returns the request that already exists, as `200` with the same body. It never creates a second request.
+- The same key sent with a **different** request is a `409`, because one key cannot mean two things.
+- The key is scoped to the passenger: two passengers may use the same string.
+- "The same request" is decided by a **fingerprint**, a SHA-256 of the canonical inputs (passenger, quote, endpoints, accepted fare, currency, price version, distance, duration), computed server-side and stored. A client can neither send one nor influence it, and it is never returned.
+- Two callers racing with the same key and the same quote both get the request: one created it (`201`), the other replayed it (`200`). This is the case the quote lock and the re-read in `createRideRequest` exist for.
+
+A key is spent once it has created a request. Cancelling the request does not free the key -- a retry after a cancellation returns the cancelled request, which is what a network retry actually wants.
+
+### One active request at a time
+
+A passenger may have at most one request that is `WAITING`, `MATCHED` or `IN_PROGRESS`. It is enforced by a partial unique index (`one_active_ride_request_per_passenger`) rather than by a check the service performs, so a race cannot get two through:
+
+```sql
+CREATE UNIQUE INDEX one_active_ride_request_per_passenger
+  ON ride_requests (passenger_profile_id)
+  WHERE status IN ('WAITING', 'MATCHED', 'IN_PROGRESS');
+```
+
+The service checks first and answers `409`, but the index is the guard: when the check loses a race, the insert fails and the service re-reads the committed state to work out which of the three constraints was hit and report *that*, rather than a generic conflict. The rule inherits into matching for free -- a passenger with a matched ride already cannot start a second one.
+
+### Quote ownership
+
+`POST /api/fare-quotes` now requires the `PASSENGER` role, and the quote records the passenger profile that asked for it. A request may only be created from a quote the caller owns:
+
+- somebody else's quote is a `404`, the same answer as a quote that does not exist, so this cannot be used to discover quotes;
+- a quote with **no** owner (written before this milestone) is refused too, and logged, because it belongs to nobody and could never be safely claimed;
+- one quote is accepted **once** (`fare_quotes` is referenced `ON DELETE RESTRICT` from a unique column), so a spent quote cannot be re-used under a fresh key;
+- an expired quote is a `409` telling the caller to ask for a new one, and a quote whose endpoint has since been deactivated is a `409` as well.
+
+### Search window and expiration
+
+Creating a request opens a search window: `search_expires_at = requested_at + RIDE_REQUEST_SEARCH_TTL_SECONDS` (600 s by default). A `CHECK` constraint refuses a window that is empty or inverted, so a request can never be born already expired.
+
+There is no scheduler in this project, so expiration is an **operation** rather than a background job:
+
+```bash
+npm run ride-requests:expire --workspace server
+```
+
+`expireOverdueRideRequests()` finds `WAITING` requests whose window has closed and expires each one in its own transaction, taking the request's row lock and re-checking the state before it writes. A request that was cancelled in the meantime is skipped rather than failed -- the sweep reports `{ examined, expired, skipped }`. Expiry appends a `RIDE_EXPIRED` event with the `SYSTEM` actor, leaves `cancelled_at` untouched (an expiry is not a cancellation) and never deletes the row. It is idempotent, and it frees the passenger's active slot. The clock is injectable, which is what makes all of it testable without waiting for a deadline.
+
+### Cancelling
+
+`POST /api/ride-requests/:id/cancel` cancels a **WAITING** request only -- cancelling a matched ride means releasing a pool, which is the matching milestone's problem. The body is optional:
+
+| Field | Required | Notes |
+| ----- | -------- | ----- |
+| `reason` | no | `CHANGED_MIND`, `WRONG_LOCATION`, `WAIT_TOO_LONG` or `OTHER` (default) |
+
+`CANCELLED` implies both `cancelled_at` and `cancellation_reason`, and no other status may carry either -- a `CHECK` constraint, not a convention. A second cancellation is a `409`, cancelling somebody else's request is a `404`, and a request that already expired is a `409`.
+
+### Ride-request request and response
+
+`POST /api/ride-requests` accepts **only** `fareQuoteId`, and requires the `Idempotency-Key` header. Everything else a client might expect to send -- `passengerId`, `status`, `fare`, `currency`, `distanceMeters`, `durationSeconds`, `pricingCode`, `pricingVersion`, `requestFingerprint` -- is an unsupported body field and a `400`, because all of it is derived server-side from the authenticated passenger and the quote. There is no field anywhere that names a passenger.
+
+`201 Created` for a new request, `200` when a retry replayed one:
+
+```json
+{
+  "id": "0f8b2a1e-9f31-4a0e-9f3c-1e6f2b0d4c77",
+  "status": "WAITING",
+  "cancellable": true,
+  "pickup": { "code": "banani-road-11", "name": "Banani Road 11" },
+  "destination": { "code": "mohakhali-bus-terminal", "name": "Mohakhali Bus Terminal" },
+  "acceptedQuote": {
+    "fareQuoteId": "cc1116ae-0a82-4d4c-9d06-92d8084c26e4",
+    "fare": "130.63",
+    "currency": "BDT",
+    "pricingCode": "dhaka-solo",
+    "pricingVersion": 1,
+    "distanceMeters": 2214,
+    "durationSeconds": 569
+  },
+  "requestedAt": "2026-09-24T02:41:30.000Z",
+  "searchExpiresAt": "2026-09-24T02:51:30.000Z",
+  "cancelledAt": null,
+  "cancellationReason": null
+}
+```
+
+`cancellable` is derived from the status rather than stored, so it cannot disagree with it. `fare` is an exact decimal string, formatted at the quote's own rounding scale. The response never contains the fingerprint, the idempotency key, the passenger profile, the route snapshot, the quote's breakdown or any rate card.
+
+| Status | When |
+| ------ | ---- |
+| `201` | A request was created |
+| `200` | A retry returned the request that already existed |
+| `400` | Missing/malformed `fareQuoteId`, missing or malformed `Idempotency-Key`, unsupported body field, unknown `status` filter, out-of-bounds `limit`/`offset` |
+| `401` | No valid session |
+| `403` | Authenticated, but not a passenger (or a passenger with no profile) |
+| `404` | Unknown, expired-away, or somebody else's quote or request |
+| `409` | Already used quote, expired quote, deactivated endpoint, second active request, key reused for a different request, cancellation from a status that cannot be cancelled |
+| `500` | An unexpected failure -- always a stable message, never raw SQL |
+
+### Passenger history
+
+`GET /api/ride-requests/my` returns the caller's own requests, newest first, with a `pagination` block. `?status=` filters by any of the six statuses, `?limit=` (1-100, default 20) and `?offset=` page through them. The passenger filter is part of every query, so no page can contain somebody else's request, and an unknown query parameter is a `400` rather than being ignored.
+
+```json
+{
+  "data": [ { "id": "...", "status": "CANCELLED", "cancellable": false, "cancellationReason": "WAIT_TOO_LONG", "...": "..." } ],
+  "pagination": { "limit": 20, "offset": 0, "returned": 1, "total": 1, "hasMore": false }
+}
+```
+
+Ordering is `requested_at DESC, id DESC`: two requests created in the same millisecond still have one stable order.
+
+### Authorization
+
+Every ride-request endpoint requires the `PASSENGER` role, and the passenger is taken from the authenticated record -- never from the request. A driver gets `403` (not `404`: the endpoint exists, they are simply not allowed to use it), an anonymous caller gets `401`, and another passenger's request is a `404` whether it exists or not.
+
+### Commands
+
+```bash
+npm run db:migrate                                  # applies 08-ride-requests.sql (idempotent)
+npm run ride-requests:expire --workspace server      # expire requests whose window has closed
+npm test                                             # unit + integration
+npm run test:unit --workspace server                 # lifecycle rules and serializer, no database
+npm run test:integration --workspace server          # the endpoints, the constraints, concurrency, expiry
+```
+
+### What is deliberately not here
+
+There is **no** pool, `PoolMember`, `PoolStop`, ride matching, driver acceptance or assignment, shared fare, pooling discount, seat reservation, payment, wallet, live tracking or notification -- and no endpoint that changes a status other than cancellation and expiry. `MATCHED`, `IN_PROGRESS` and `COMPLETED` are defined, enforced and tested at the database level so the next milestone needs no migration, but nothing in this API can move a request into them. The `MATCHED -> CANCELLED` and trip transitions are likewise reserved rather than implemented.
+
+One consequence worth stating plainly: because `ride_requests.fare_quote_id` is `ON DELETE RESTRICT`, deleting a passenger profile that still has requests is refused by the database. Nothing in the application deletes either, and a future erasure path has to delete requests before profiles.
 
 
 ## Tests
@@ -844,12 +1051,13 @@ npm run test:integration --workspace server
 
 Tests use Node's built-in runner (`node --test`) — no extra dependencies. The integration suites run against the real PostgreSQL database from `DATABASE_URL`, apply `server/db/*.sql` and the seed themselves, and clean up after themselves; the database must be reachable (`npm run db:up`). Constraint tests run inside rolled-back transactions.
 
-Coverage highlights: the PostGIS extension and the real spatial column types; the GiST spatial indexes; that coordinates are stored longitude-first; `ST_DWithin` proximity answering in metres with a distant point correctly excluded; the seed totals, per-zone point counts, correct zone membership and idempotency; the coordinate bounds; and -- for the graph -- no isolated vertex, one weakly connected component, every zone linked to another, edge endpoints aligned with their vertices, edge distance matching `ST_Length`, and the direction / duration / fare-weight invariants. It also asserts that the superseded `/api/transport/*` endpoints are gone, and that `/api/location/*` still exposes no routing of its own. Routing and pricing are covered by their own suites -- see [Routing](#routing) and [Fare quotes](#fare-quotes) for the lists.
+Coverage highlights: the PostGIS extension and the real spatial column types; the GiST spatial indexes; that coordinates are stored longitude-first; `ST_DWithin` proximity answering in metres with a distant point correctly excluded; the seed totals, per-zone point counts, correct zone membership and idempotency; the coordinate bounds; and -- for the graph -- no isolated vertex, one weakly connected component, every zone linked to another, edge endpoints aligned with their vertices, edge distance matching `ST_Length`, and the direction / duration / fare-weight invariants. It also asserts that the superseded `/api/transport/*` endpoints are gone, and that `/api/location/*` still exposes no routing of its own. Routing, pricing and ride requests are covered by their own suites -- see [Routing](#routing), [Fare quotes](#fare-quotes) and [Ride requests](#ride-requests) for the lists.
 
 ## Next steps
 
-- Decide how schema changes are reviewed now that Prisma is in place: keep the idempotent `server/db/*.sql` files as the source of truth (the current setup, and what preserves the `CHECK` constraints and GiST indexes Prisma cannot model), or move fully to Prisma Migrate and express those another way.
-- Build the next milestone on top of fare quoting: **ride requests**. That is where a quote gets accepted, where ownership and idempotency become meaningful, and where the stored `FareQuote` (rather than a recomputation) is what a request points at. Pooling, shared fares and payments come after that.
+- Decide how schema changes are reviewed now that Prisma is in place: keep the idempotent `server/db/*.sql` files as the source of truth (the current setup, and what preserves the `CHECK` constraints, the partial unique index and the GiST indexes Prisma cannot model), or move fully to Prisma Migrate and express those another way.
+- Build the next milestone on top of ride requests: **pooling and matching**. A group of waiting requests becomes a `RidePool`, its members and its ordered stops, and `WAITING -> MATCHED -> IN_PROGRESS -> COMPLETED` becomes reachable. The status enum, the transition table, the events and the one-active-request rule are already in place for it, so that milestone adds tables and operations rather than reworking this one.
+- Run the expiration sweep on a schedule. `npm run ride-requests:expire --workspace server` is the operation; nothing calls it yet, so a request currently expires when someone runs it.
 - Consider time-dependent profiles *within* a journey (the current router picks one profile from the departure instant and applies it to the whole route), which needs per-second costs and a time-dependent router.
 - Authenticate the client: send the auth cookie from the Next.js app, then tighten `GET /api/users`, which is still public so the demo page keeps rendering. `POST /api/routes/estimate` already requires a session, so the client needs to carry the cookie before it can call it.
 - Add email verification and password reset. Sign-up currently accepts any address a caller supplies, so nobody proves they own the email they register with.

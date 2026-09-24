@@ -33,8 +33,11 @@ const toIsoString = (value) => new Date(value).toISOString();
  * policy: the quote records the rounding rule it was produced under, and that is
  * the rule that reproduces its numbers. Anything unexpected falls back to two
  * decimals rather than throwing -- a quote that exists should still be returnable.
+ *
+ * Exported because anything that holds a copy of a quote's amount -- a ride
+ * request's accepted fare, for instance -- has to present it at the same scale.
  */
-const readRoundingScale = (quote) => {
+export const quoteRoundingScale = (quote) => {
   const scale = quote?.fareBreakdown?.rounding?.scale;
   return Number.isInteger(scale) && scale >= 0 && scale <= MAX_ROUNDING_SCALE
     ? scale
@@ -42,7 +45,7 @@ const readRoundingScale = (quote) => {
 };
 
 export const toFareQuoteDto = ({ quote, origin, destination }) => {
-  const scale = readRoundingScale(quote);
+  const scale = quoteRoundingScale(quote);
 
   return {
     quoteId: quote.id,

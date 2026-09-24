@@ -227,12 +227,22 @@ const toFareBreakdown = (fare) => ({
  *
  * Returns the persisted quote together with the endpoints the route ran between,
  * which the serializer needs and the quote itself only stores as foreign keys.
+ *
+ * `passengerProfileId` is the owner of the quote. It comes from the
+ * authenticated user (see `requirePassengerProfileId`), never from the request,
+ * and it is what a ride request later checks before accepting the quote. A quote
+ * without an owner can never be accepted -- the migration leaves legacy rows
+ * NULL on purpose, so that "unowned" stays distinguishable from "mine".
  */
 export const createSoloFareQuote = async ({
+  passengerProfileId,
   originServicePointCode,
   destinationServicePointCode,
   departureAt,
 }) => {
+  if (typeof passengerProfileId !== 'string' || passengerProfileId === '') {
+    throw new ApiError(403, 'A fare quote must be created for an authenticated passenger');
+  }
   // 1-2. Input validation and pathfinding belong to the routing service: the
   // same codes, the same identity checks, the same 404/409/422 semantics, and
   // one implementation of the shortest-path search.
@@ -290,6 +300,7 @@ export const createSoloFareQuote = async ({
   const quote = await guarded('storing the quote', () =>
     prisma.fareQuote.create({
       data: {
+        passengerProfileId,
         originServicePointId,
         destinationServicePointId,
         departureAt: route.departureAt,

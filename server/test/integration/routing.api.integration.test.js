@@ -1054,36 +1054,57 @@ describe('route estimate errors', () => {
 });
 
 describe('phase boundary', () => {
-  it('exposes no fare, quote, ride, pool or matching endpoint', async () => {
+  it('exposes no pooling, matching, driver-acceptance or payment endpoint', async () => {
     for (const path of [
       '/routes',
       '/routes/quote',
       '/routes/fare',
       '/routes/price',
-      '/ride-requests',
-      '/rides',
       '/pools',
       '/pool-members',
       '/matches',
       '/drivers',
+      '/payments',
+      '/wallets',
     ]) {
-      const { status } = await api.request(path);
+      const { status } = await api.request(path, { headers: { cookie: authCookie } });
       assert.strictEqual(status, 404, `${path} must not exist in this phase`);
     }
   });
 
-  it('introduces no ride, pool, matching or payment table', async () => {
+  it('keeps the ride-request endpoints to the two shapes the milestone defined', async () => {
+    // The ride-request milestone arrived after this one. It adds a passenger
+    // collection (POST /ride-requests), the passenger's own history
+    // (GET /ride-requests/my) and one request by id -- and nothing else. Reading
+    // the collection, or addressing a request without a passenger session, is
+    // still a 404.
+    for (const path of ['/ride-requests', '/rides', '/ride-requests/my/events']) {
+      const response = await api.request(path, { headers: { cookie: authCookie } });
+      assert.strictEqual(response.status, 404, path);
+    }
+
+    // `/my` exists but still requires a session.
+    const unauthenticated = await api.request('/ride-requests/my');
+    assert.strictEqual(unauthenticated.status, 401);
+  });
+
+  it('introduces no pool, matching, seat or payment table', async () => {
     // The routing milestone also asserted that *pricing* was absent. The fare
-    // milestone lifted that half deliberately, and the pricing tables it adds are
-    // pinned by the suite below and by fare.policy.integration.test.js. What must
-    // still hold is that nothing pooled, matched, requested or paid exists.
+    // milestone lifted that half deliberately, the ride-request milestone added
+    // the two tables below, and the pricing tables it adds are pinned by the
+    // suite below. What must still hold is that nothing pooled, matched, seated,
+    // assigned or paid exists.
     const { rows } = await pool.query(
       `SELECT table_name FROM information_schema.tables
         WHERE table_schema = 'public'
-          AND table_name ~ '(ride|pool|payment|wallet|match|seat_reservation|driver_assignment)'`,
+          AND table_name ~ '(ride|pool|payment|wallet|match|seat_reservation|driver_assignment)'
+        ORDER BY table_name`,
     );
 
-    assert.deepStrictEqual(rows, [], 'no riding, pooling or payment table should exist yet');
+    assert.deepStrictEqual(
+      rows.map((row) => row.table_name),
+      ['ride_events', 'ride_requests'],
+    );
   });
 
   it('has exactly the two pricing tables the fare milestone added', async () => {

@@ -124,6 +124,109 @@ export const requireIsoTimestamp = (value, field = 'timestamp') => {
 export const optionalIsoTimestamp = (value, field = 'timestamp') =>
   value === undefined ? null : requireIsoTimestamp(value, field);
 
+// The same shape user.service.js has always used to avoid a database round-trip
+// (and a cast error) for an id that cannot possibly exist.
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Validates a UUID and returns it lower-cased.
+ *
+ * Checked in the application rather than left to PostgreSQL's `uuid` cast, so a
+ * malformed id is a clear 400 instead of a driver-level "malformed identifier".
+ */
+export const requireUuid = (value, field = 'id') => {
+  if (value === undefined || value === null) throw new ApiError(400, `${field} is required`);
+  if (typeof value !== 'string') throw new ApiError(400, `${field} must be a string`);
+
+  const uuid = value.trim();
+  if (!UUID_PATTERN.test(uuid)) throw new ApiError(400, `${field} must be a UUID`);
+
+  return uuid.toLowerCase();
+};
+
+/**
+ * Idempotency keys are opaque client tokens -- but they are stored, compared and
+ * part of a unique constraint, so their shape is pinned rather than trusted.
+ *
+ * The character set is deliberately narrow (unreserved URL-ish characters) and
+ * the length bounded, so a key cannot be used to smuggle kilobytes into the
+ * database or to hide a value that a log or a header dump would misrepresent.
+ */
+const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]+$/;
+export const MIN_IDEMPOTENCY_KEY_LENGTH = 8;
+export const MAX_IDEMPOTENCY_KEY_LENGTH = 128;
+
+export const requireIdempotencyKey = (value, field = 'Idempotency-Key') => {
+  if (value === undefined || value === null) {
+    throw new ApiError(400, `${field} header is required`);
+  }
+  if (typeof value !== 'string') throw new ApiError(400, `${field} must be a single value`);
+
+  const key = value.trim();
+  if (key === '') throw new ApiError(400, `${field} must not be empty`);
+  if (key.length < MIN_IDEMPOTENCY_KEY_LENGTH) {
+    throw new ApiError(400, `${field} must be at least ${MIN_IDEMPOTENCY_KEY_LENGTH} characters`);
+  }
+  if (key.length > MAX_IDEMPOTENCY_KEY_LENGTH) {
+    throw new ApiError(400, `${field} must be at most ${MAX_IDEMPOTENCY_KEY_LENGTH} characters`);
+  }
+  if (!IDEMPOTENCY_KEY_PATTERN.test(key)) {
+    throw new ApiError(
+      400,
+      `${field} may only contain letters, digits, ".", "_", ":" and "-"`,
+    );
+  }
+
+  return key;
+};
+
+/**
+ * Validates a value against a closed set and returns it upper-cased, so a client
+ * can send `waiting` and be understood without the database ever seeing a value
+ * it does not have an enum label for.
+ */
+export const requireEnumValue = (value, allowed, field = 'value') => {
+  if (value === undefined || value === null) throw new ApiError(400, `${field} is required`);
+  if (typeof value !== 'string') throw new ApiError(400, `${field} must be a single value`);
+
+  const normalized = value.trim().toUpperCase();
+  if (normalized === '') throw new ApiError(400, `${field} must not be empty`);
+  if (!allowed.includes(normalized)) {
+    throw new ApiError(400, `${field} must be one of: ${allowed.join(', ')}`);
+  }
+
+  return normalized;
+};
+
+/** Same as requireEnumValue, but an absent value is allowed and returned as null. */
+export const optionalEnumValue = (value, allowed, field = 'value') =>
+  value === undefined || value === null ? null : requireEnumValue(value, allowed, field);
+
+/**
+ * A bounded, non-negative integer, for pagination. Falls back to `fallback` when
+ * the parameter is absent and rejects anything outside `[min, max]`.
+ */
+export const requireBoundedInteger = (
+  value,
+  field,
+  { fallback, min = 0, max = Number.MAX_SAFE_INTEGER } = {},
+) => {
+  if (value === undefined || value === null || value === '') {
+    if (fallback === undefined) throw new ApiError(400, `${field} is required`);
+    return fallback;
+  }
+
+  const parsed = typeof value === 'number' ? value : Number.parseInt(String(value), 10);
+  if (!Number.isInteger(parsed) || String(parsed) !== String(value).trim()) {
+    throw new ApiError(400, `${field} must be an integer`);
+  }
+  if (parsed < min || parsed > max) {
+    throw new ApiError(400, `${field} must be between ${min} and ${max}`);
+  }
+
+  return parsed;
+};
+
 // Deliberately permissive: the only authoritative checks on an address are that
 // it is a single token and that it round-trips, not a regex arms race.
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;

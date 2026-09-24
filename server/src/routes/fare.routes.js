@@ -1,7 +1,8 @@
+import { Role } from '@prisma/client';
 import { Router } from 'express';
 
 import * as fare from '../controllers/fare.controller.js';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
 
 // Mounted at /api/fare-quotes.
 const router = Router();
@@ -9,18 +10,19 @@ const router = Router();
 /**
  * Solo fare quote.
  *
- * Authentication is required, matching `POST /api/routes/estimate`: a quote is
- * served to a known account, and `requireAuth` is the existing guard rather than
- * anything new. Any active role may ask for a quote.
+ * Authentication is required, and so is the PASSENGER role: a quote is now a
+ * passenger-facing calculation that the passenger *owns*, because a ride request
+ * accepts one and ownership is what stops a quote being used by somebody else.
+ * `requireAuth` + `requireRole` are the existing guards rather than anything
+ * new, and the passenger profile is taken from the authenticated user -- no
+ * request field names a passenger.
  *
- * The quote is deliberately **not** attached to the authenticated user. This
- * phase has no passenger ownership and no RideRequest; the caller is
- * authenticated but not recorded. When ride requests arrive, the request -- not
- * the quote -- is what will reference a passenger.
+ * `POST /api/routes/estimate` stays open to any authenticated role: estimating a
+ * route is not a commitment and belongs to nobody.
  *
- * The guard is mounted on this route rather than on the router, so an unknown
+ * The guards are mounted on this route rather than on the router, so an unknown
  * path under /api/fare-quotes still answers 404 rather than 401.
  */
-router.post('/', requireAuth, fare.createFareQuote);
+router.post('/', requireAuth, requireRole(Role.PASSENGER), fare.createFareQuote);
 
 export default router;

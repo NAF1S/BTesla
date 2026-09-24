@@ -203,6 +203,17 @@ describe('authentication', () => {
     const response = await quoteAs(request(), authCookie);
     assert.strictEqual(response.status, 201);
   });
+
+  it('refuses a driver, because a quote is now a passenger?s committed request', async () => {
+    // Ownership arrived with ride requests: a quote is accepted by exactly the
+    // passenger who owns it, so quoting is a passenger operation. A driver is
+    // told no rather than served a quote nobody could use.
+    const driverCookie = await login('jashim@example.com');
+    const response = await quoteAs(request(), driverCookie);
+
+    assert.strictEqual(response.status, 403);
+    assert.match(response.body.error.message, /do not have access/i);
+  });
 });
 
 describe('POST /api/fare-quotes', () => {
@@ -755,42 +766,78 @@ describe('fare quote errors', () => {
 });
 
 describe('phase boundary', () => {
-  it('exposes no ride-request, pool, shared-fare, payment or matching endpoint', async () => {
+  it('exposes no pooling, shared-fare, payment or matching endpoint', async () => {
     for (const path of [
-      '/ride-requests',
       '/rides',
       '/pools',
       '/pool-members',
       '/matches',
       '/payments',
       '/wallets',
+      '/share',
+      '/discounts',
       '/fare-quotes/quote-id',
       '/fare-quotes/quote-id/accept',
       '/fare/quotes',
     ]) {
-      const { status } = await api.request(path);
+      const { status } = await api.request(path, { headers: { cookie: authCookie } });
       assert.strictEqual(status, 404, `${path} must not exist in this phase`);
     }
+
+    // The ride-request milestone added POST /ride-requests. The collection is
+    // still not readable, and `/rides` -- the shared-ride shape -- still does not
+    // exist at all.
+    const collection = await api.request('/ride-requests', { headers: { cookie: authCookie } });
+    assert.strictEqual(collection.status, 404);
   });
 
-  it('introduces no ride-request, pool, shared-fare or payment table', async () => {
+  it('introduces no pool, shared-fare, seat or payment table', async () => {
     const { rows } = await pool.query(
       `SELECT table_name FROM information_schema.tables
         WHERE table_schema = 'public'
-          AND table_name ~ '(ride|pool|payment|wallet|shared|match|seat|driver_assignment)'`,
+          AND table_name ~ '(ride|pool|payment|wallet|shared|match|seat|driver_assignment)'
+        ORDER BY table_name`,
     );
 
-    assert.deepStrictEqual(rows, [], 'no pooling, ride-request or payment table should exist yet');
+    assert.deepStrictEqual(
+      rows.map((row) => row.table_name),
+      ['ride_events', 'ride_requests'],
+      'only the two ride-request tables may exist beyond pricing; nothing pooled or paid',
+    );
   });
 
-  it('stores no passenger or user on a quote', async () => {
+  it('owns a quote by exactly one passenger, and by nobody else', async () => {
+    // Quotes became passenger-owned in the ride-request milestone: a request
+    // accepts one, and ownership is what stops a quote being used by somebody
+    // else. The ownership is a single column, and it is the only identity a quote
+    // carries -- no driver, no vehicle, no account.
     const { rows } = await pool.query(
       `SELECT column_name FROM information_schema.columns
         WHERE table_schema = 'public' AND table_name = 'fare_quotes'
-          AND column_name ~ '(user|passenger|driver|account|customer)'`,
+          AND column_name ~ '(user|passenger|driver|account|customer|vehicle)'
+        ORDER BY column_name`,
     );
 
-    assert.deepStrictEqual(rows, [], 'quotes are not owned by anybody in this phase');
+    assert.deepStrictEqual(
+      rows.map((row) => row.column_name),
+      ['passenger_profile_id'],
+    );
+
+    // And the column is populated by the endpoint that creates a quote.
+    const body = await quoteOk(request());
+    const stored = await storedQuote(body.quoteId);
+    assert.ok(stored.passengerProfileId, 'a quote must belong to the passenger who asked for it');
+  });
+
+  it('returns the quote without saying who owns it', async () => {
+    const body = await quoteOk(request());
+
+    // The passenger knows who they are; the response carries no identifier that
+    // could name them, or anybody else.
+    const serialized = JSON.stringify(body);
+    for (const forbidden of ['passengerProfileId', 'passenger_profile_id', 'passengerId', 'userId']) {
+      assert.ok(!serialized.includes(forbidden), `the quote must not mention ${forbidden}`);
+    }
   });
 
   it('leaves route estimation working, pricing-free', async () => {

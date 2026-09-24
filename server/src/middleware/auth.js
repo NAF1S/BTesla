@@ -1,3 +1,5 @@
+import { Role } from '@prisma/client';
+
 import { ApiError } from '../utils/ApiError.js';
 import { readAuthCookie } from '../utils/cookies.js';
 import { verifyAuthToken } from '../utils/token.js';
@@ -48,3 +50,29 @@ export const requireRole =
 
 /** Convenience accessor for the user attached by requireAuth. */
 export const currentUser = (req) => req.user;
+
+/**
+ * The authenticated passenger's own PassengerProfile id.
+ *
+ * This is the only way a request may learn *which* passenger is acting: the
+ * value comes from the database record `requireAuth` loaded, never from a body,
+ * a query parameter or a token claim. Nothing downstream accepts a passenger id
+ * from a client, so there is no parameter to tamper with.
+ *
+ * A non-passenger, or a passenger without a profile, is refused here even though
+ * `requireRole` normally rejects them earlier -- a service must be safe to call
+ * directly, not only through one route.
+ */
+export const requirePassengerProfileId = (user) => {
+  if (!user) throw new ApiError(401, UNAUTHENTICATED);
+  if (user.role !== Role.PASSENGER) {
+    throw new ApiError(403, 'Only a passenger can manage ride requests');
+  }
+
+  const passengerProfileId = user.passengerProfile?.id;
+  if (!passengerProfileId) {
+    throw new ApiError(403, 'A passenger profile is required to request a ride');
+  }
+
+  return passengerProfileId;
+};
