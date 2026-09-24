@@ -111,12 +111,16 @@ describe('PostGIS', () => {
     assert.match(rows[0].extversion, /^3\./);
   });
 
-  it('has not pulled in pgRouting, which is deferred', async () => {
+  it('has pgRouting installed alongside it, from the routing milestone', async () => {
+    // This assertion used to pin the opposite -- that pathfinding was deferred.
+    // The routing milestone lifted that boundary; the location tables themselves
+    // are unchanged, and the routing suite covers the new extension's behaviour.
     const { rows } = await pool.query(
-      `SELECT count(*)::int AS installed FROM pg_extension WHERE extname IN ('pgrouting', 'pgrouting_routing')`,
+      `SELECT extversion FROM pg_extension WHERE extname = 'pgrouting'`,
     );
 
-    assert.strictEqual(rows[0].installed, 0);
+    assert.ok(rows[0], 'the pgrouting extension must be installed');
+    assert.match(rows[0].extversion, /^3\./);
   });
 });
 

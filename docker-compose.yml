@@ -1,9 +1,18 @@
 services:
   db:
-    # PostGIS build of the same PostgreSQL major version, so the existing
-    # teslab-pgdata volume keeps working. The plain postgres image has no
-    # PostGIS shared library, so `CREATE EXTENSION postgis` would fail on it.
-    image: postgis/postgis:17-3.5
+    # Built from docker/db/Dockerfile, which starts from the PostGIS 17-3.5 image
+    # of the same PostgreSQL major version -- so the existing teslab-pgdata
+    # volume keeps working -- and adds the `postgresql-17-pgrouting` package.
+    #
+    # The plain `postgres` image has no PostGIS shared library, so
+    # `CREATE EXTENSION postgis` would fail on it; the upstream
+    # `postgis/postgis` image has no pgRouting, so `CREATE EXTENSION pgrouting`
+    # would fail on that one. This image has both.
+    #
+    # Rebuild after a Dockerfile change with: docker compose up -d --build db
+    build:
+      context: ./docker/db
+    image: teslab/postgis-pgrouting:17-3.5
     container_name: teslab-db
     restart: unless-stopped
     environment:

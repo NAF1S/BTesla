@@ -63,10 +63,16 @@ model ServiceZone {
 /// passenger-facing places people get in and out of, while vertices are what a
 /// future router walks between. In this seed they are one-to-one, but the
 /// separation is what will later let several points share one junction.
+///
+/// `graphNodeId` exists because pgRouting needs integer identifiers and this
+/// table is keyed on a UUID. It is written once by the seeder (ranked from
+/// `code` in byte order) and an immutability trigger rejects any later change,
+/// because a returned route refers to edges by these numbers.
 model RoutingVertex {
   id            String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   code          String         @unique
   location      Unsupported("geometry")
+  graphNodeId   BigInt         @unique(map: "routing_vertices_graph_node_id_unique") @default(autoincrement()) @map("graph_node_id")
   active        Boolean        @default(true)
   createdAt     DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt     DateTime       @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
@@ -114,9 +120,14 @@ model ServicePoint {
 /// `distanceMeters` is derived from the geometry with
 /// ST_Length(geometry::geography); a CHECK constraint keeps the two in step.
 /// Nothing here stores money: `fareWeight` is a relative weight, not a fare.
+///
+/// `graphEdgeId` is what pgRouting takes as the edge `id` and reports back as
+/// `edge`, so it is how a returned path is mapped to rows of this table. Like
+/// `RoutingVertex.graphNodeId` it is written once and immutable.
 model RoutingEdge {
   id                             String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   code                           String        @unique
+  graphEdgeId                    BigInt        @unique(map: "routing_edges_graph_edge_id_unique") @default(autoincrement()) @map("graph_edge_id")
   sourceVertexId                 String        @map("source_vertex_id") @db.Uuid
   targetVertexId                 String        @map("target_vertex_id") @db.Uuid
   geometry                       Unsupported("geometry")

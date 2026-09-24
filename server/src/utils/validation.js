@@ -59,6 +59,71 @@ export const assertBodyKeys = (body, allowedKeys) => {
   }
 };
 
+/**
+ * An ISO 8601 date-time that names an unambiguous instant: the date, the time to
+ * at least the minute, and an explicit UTC designator or numeric offset.
+ *
+ * Seconds and fractional seconds are optional; a bare date ("2026-09-24") and a
+ * local date-time with no offset ("2026-09-24T08:41") are both rejected. A local
+ * time with no offset cannot be turned into an instant without guessing which
+ * zone the sender meant, and guessing is how a rush-hour route gets estimated
+ * with normal costs.
+ *
+ * Every numeric field is range-checked here rather than left to `new Date()`,
+ * which is much more forgiving than ISO 8601: it rolls 24:00:00 into the next
+ * day, accepts an offset of +24:00 in some engines, and turns 30 February into
+ * 2 March. Hours are therefore 00-23, minutes and seconds 00-59, and the
+ * calendar date is checked separately below.
+ */
+const ISO_8601_INSTANT =
+  /^(\d{4})-(\d{2})-(\d{2})T([01]\d|2[0-3]):([0-5]\d)(:([0-5]\d)(\.\d{1,9})?)?(Z|[+-]([01]\d|2[0-3]):([0-5]\d))$/;
+
+/** True when the year, month and day exist as a real calendar date. */
+const isRealCalendarDate = (year, month, day) => {
+  const date = new Date(Date.UTC(year, month - 1, day));
+
+  return (
+    date.getUTCFullYear() === year &&
+    date.getUTCMonth() === month - 1 &&
+    date.getUTCDate() === day
+  );
+};
+
+/**
+ * Validates an ISO 8601 timestamp and returns the instant it denotes as a Date.
+ *
+ * The Date is always the same instant the client sent, whatever offset it used:
+ * only the traffic-profile lookup is timezone-aware, and that happens elsewhere.
+ */
+export const requireIsoTimestamp = (value, field = 'timestamp') => {
+  if (value === undefined || value === null) throw new ApiError(400, `${field} is required`);
+  if (typeof value !== 'string') {
+    throw new ApiError(400, `${field} must be an ISO 8601 timestamp string`);
+  }
+
+  const text = value.trim();
+  const match = ISO_8601_INSTANT.exec(text);
+  if (!match) {
+    throw new ApiError(
+      400,
+      `${field} must be an ISO 8601 timestamp with an explicit offset, e.g. 2026-09-24T08:41:00+06:00`,
+    );
+  }
+
+  if (!isRealCalendarDate(Number(match[1]), Number(match[2]), Number(match[3]))) {
+    throw new ApiError(400, `${field} is not a valid timestamp`);
+  }
+
+  const instant = new Date(text);
+  if (Number.isNaN(instant.getTime())) throw new ApiError(400, `${field} is not a valid timestamp`);
+
+  return instant;
+};
+
+/** Same as requireIsoTimestamp, but an absent field is allowed and returns null. */
+export const optionalIsoTimestamp = (value, field = 'timestamp') =>
+  value === undefined ? null : requireIsoTimestamp(value, field);
+
 // Deliberately permissive: the only authoritative checks on an address are that
 // it is a single token and that it round-trips, not a regex arms race.
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;

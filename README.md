@@ -23,7 +23,8 @@ TeslaB/
 │   │   ├── 02-seed.sql
 │   │   ├── 04-auth.sql                    # roles, profiles, vehicles
 │   │   ├── 04-drop-transport-network.sql  # forward migration removing the old location model
-│   │   └── 05-postgis-location.sql        # PostGIS zones, points and routing graph
+│   │   ├── 05-postgis-location.sql        # PostGIS zones, points and routing graph
+│   │   └── 06-pgrouting-routing.sql       # pgRouting + the integer graph identifiers
 │   ├── prisma/
 │   │   └── schema.prisma   # Prisma view of the SQL schema (hand-mapped)
 │   ├── prisma7.config.ts   # Prisma CLI config (reuses src/config/env.js)
@@ -32,16 +33,19 @@ TeslaB/
 │   │   ├── app.js          # Express app: middleware, routes, error handling
 │   │   ├── config/env.js   # Environment configuration
 │   │   ├── db/             # Prisma client, health probe, migration runner, seeder
-│   │   │   └── seeds/      # location + routing graph + demo accounts, idempotent upserts
-│   │   ├── routes/         # Route definitions (index, health, auth, users, location)
+│   │   │   ├── seeds/      # location + routing graph + demo accounts, idempotent upserts
+│   │   │   └── seeds/graph-ids.js  # deterministic pgRouting identifiers (shared rule)
+│   │   ├── routes/         # Route definitions (index, health, auth, users, location, routes)
 │   │   ├── controllers/    # Request handlers
-│   │   ├── services/       # Business logic / queries
+│   │   ├── services/       # Business logic / queries (location, routing)
 │   │   ├── serializers/    # Record -> response DTO mappers
 │   │   ├── middleware/     # notFound, errorHandler, auth (requireAuth, requireRole)
-│   │   └── utils/          # ApiError, validation, geo, password, token, cookies
+│   │   └── utils/          # ApiError, validation, geo, time, password, token, cookies
 │   ├── test/               # node --test suites (unit + integration)
 │   └── .env.example
-├── docker-compose.yml      # PostgreSQL 17 + PostGIS 3.5 (database "TeslaB")
+├── docker/
+│   └── db/Dockerfile       # PostgreSQL 17 + PostGIS 3.5 + pgRouting
+├── docker-compose.yml      # builds docker/db/Dockerfile, database "TeslaB"
 ├── .env.example            # Optional compose overrides
 ├── package.json            # npm workspaces + dev/build/db scripts
 └── .gitignore
@@ -51,10 +55,10 @@ TeslaB/
 
 ```bash
 npm install                        # installs workspace deps (client + server)
-npm run db:up                      # start PostgreSQL 17 + PostGIS 3.5 (docker compose)
+npm run db:up                      # build + start PostgreSQL 17 + PostGIS 3.5 + pgRouting
 cp client/.env.local.example client/.env.local
 cp server/.env.example server/.env
-npm run db:migrate                 # apply server/db/*.sql (creates the PostGIS extension)
+npm run db:migrate                 # apply server/db/*.sql (creates the postgis + pgrouting extensions)
 npm run db:seed                    # apply the demo zones, points and routing graph
 npm run dev                        # starts Express (:4000) and Next.js (:3000) together
 ```
@@ -96,18 +100,34 @@ PostgreSQL 17 runs via `docker-compose.yml`:
 
 > **Why port 55432?** This machine already has a local PostgreSQL service on `5432` and another container on `5433`. Override with `POSTGRES_PORT` in a root `.env` (see `.env.example`) and update `DATABASE_URL` in `server/.env` to match.
 
-### PostGIS prerequisite
+### PostGIS and pgRouting prerequisites
 
-The database image is **`postgis/postgis:17-3.5`**, not plain `postgres`. PostGIS is required because the location foundation stores real spatial types (`geography(Point, 4326)` and `geometry(LineString, 4326)`); the plain image has no PostGIS shared library, so `CREATE EXTENSION postgis` would fail on it.
+The database image is built from `docker/db/Dockerfile`, which starts from **`postgis/postgis:17-3.5`** and adds the **`postgresql-17-pgrouting`** package. PostGIS is required because the location foundation stores real spatial types (`geography(Point, 4326)` and `geometry(LineString, 4326)`); pgRouting is required because the route endpoint hands the graph to `pgr_dijkstra`. Neither the plain `postgres` image (no PostGIS) nor the upstream `postgis/postgis` image (no pgRouting) can run this project as-is.
 
 ```bash
-npm run db:up        # pull + start the PostGIS container
-npm run db:migrate   # 05-postgis-location.sql runs CREATE EXTENSION IF NOT EXISTS postgis
+npm run db:up        # build docker/db/Dockerfile and start the container
+npm run db:migrate   # 05-postgis-location.sql: CREATE EXTENSION postgis
+                     # 06-pgrouting-routing.sql: CREATE EXTENSION pgrouting
 ```
 
-- **Already had the old container running?** Recreate it so the new image is picked up: `docker compose up -d --force-recreate db`. The `teslab-pgdata` volume is PostgreSQL 17 either way, so existing data survives.
-- **Privileges.** Enabling PostGIS needs a role that may create extensions. The compose database runs as the superuser `postgres`, so this works out of the box; on a managed PostgreSQL service the extension is usually enabled from the provider's console instead, and the migration statement then becomes a no-op.
-- **pgRouting is deliberately not installed.** This phase stores a graph; pathfinding is a later phase.
+- **Rebuilding after a Dockerfile change.** `docker compose up -d --build db` (which `npm run db:up` performs) rebuilds the image when needed and recreates the container. The `teslab-pgdata` volume is PostgreSQL 17 either way, so existing data survives and nothing needs migrating.
+- **Our image, not the upstream one.** `docker compose ps` should show `teslab/postgis-pgrouting:17-3.5`. If it still shows `postgis/postgis:17-3.5`, the container predates this milestone -- recreate it: `docker compose up -d --force-recreate db`. Without pgRouting, the migration fails with `could not open extension control file`.
+- **Privileges.** `CREATE EXTENSION` needs a role allowed to create extensions. The compose database runs as the superuser `postgres`, so this works out of the box; on a managed PostgreSQL service the extension is usually enabled from the provider's console (or by a superuser) instead, and the migration statement then becomes a no-op.
+- **Building needs network access** to `apt.postgresql.org`, which is where the pgRouting package comes from.
+
+Verify both extensions are present:
+
+```sql
+SELECT extname
+FROM pg_extension
+WHERE extname IN ('postgis', 'pgrouting');
+```
+
+```bash
+npm run db:psql   # then paste the query
+```
+
+Expected: two rows, `postgis` and `pgrouting` (this project is built against PostGIS 3.5 and pgRouting 3.8).
 
 ### ORM (Prisma)
 
@@ -184,8 +204,9 @@ Base URL: `http://localhost:4000/api`
 | `GET`  | `/location/zones`          | List the 15 active service zones                                                      |
 | `GET`  | `/location/points`         | List active service points, optional `?zoneCode=`                                   |
 | `GET`  | `/location/points/:code`   | Get one service point by code                                                         |
+| `POST` | `/routes/estimate`         | Estimate a route between two service points -- see [Routing](#routing)              |
 
-The location endpoints are read-only and return DTOs (`server/src/serializers/location.serializer.js`) instead of raw rows, so database column names, routing vertices and audit timestamps never leak into responses. They are the **only** location endpoints: there is deliberately no route, distance, ETA, quote, fare, ride or matching endpoint in this phase.
+The location endpoints are read-only and return DTOs (`server/src/serializers/location.serializer.js`) instead of raw rows, so database column names, routing vertices and audit timestamps never leak into responses. `/location` is only ever about places: there is deliberately no route, distance, ETA, quote or fare endpoint under it, and none should be added. Route estimation lives at `/routes/estimate` instead.
 
 Codes are stable machine-readable values (lower-case letters, digits, `-` and `_`). Input is trimmed and lower-cased, so `?zoneCode=BANANI` works.
 
@@ -205,8 +226,7 @@ Status codes are consistent across the location endpoints:
 | `401`  | Credentials rejected, or no valid authentication (auth endpoints)        |
 | `403`  | Authenticated, but not permitted for this role                           |
 | `404`  | Unknown zone or point code                                               |
-| `409`  | The record exists but is inactive (also used for database conflicts)    |
-
+| `409`  | The record exists but is inactive (also used for database conflicts)    || `422`  | The request is well-formed but has no answer (an unreachable destination) |
 `/health` reports `"ok"` when the database is reachable and `"degraded"` when it is not, and never fails the request:
 
 ```json
@@ -398,7 +418,7 @@ One `CHECK` enforces both cases, and self-loop edges are rejected. The seed sets
 
 The seed validates before it commits and rolls the whole transaction back if anything is wrong, in this order: zones → vertices → points → edges → coordinate bounds → edge geometry and endpoints → graph connectivity.
 
-Connectivity is checked with a recursive CTE: no isolated vertex, every zone touches another zone, and all vertices form one weakly connected component. That is a data-integrity check, **not** pathfinding.
+Connectivity is checked with a recursive CTE: no isolated vertex, every zone touches another zone, and all vertices form one weakly connected component. That is a data-integrity check, **not** pathfinding -- the router is a separate concern, see [Routing](#routing).
 
 To verify the stored graph yourself:
 
@@ -408,7 +428,177 @@ npm run test:integration --workspace server
 
 ### What is deliberately deferred
 
-This phase stores and validates a graph. It does **not** implement pgRouting, Dijkstra/A*, a routing service, route quotes, distance or ETA APIs, fare calculation, ride requests, ride events, pools, pool membership, matching, driver assignment or seat reservation. Pathfinding and every routing API are a later phase.
+This phase stores and validates a graph, and -- since the routing milestone -- calculates routes over it. It does **not** implement fare calculation or pricing, ride requests, ride events, passenger ownership, request idempotency, pools, pool membership, ride matching, seat reservation, driver assignment or live traffic. See [Routing](#routing) for what the route endpoint does and does not do.
+
+## Routing
+
+Point-to-point route estimation between two seeded service points, using **pgRouting**'s `pgr_dijkstra` over the stored graph.
+
+```bash
+docker compose up -d --build db                      # image with PostGIS + pgRouting
+npm run db:migrate                                   # 06-pgrouting-routing.sql
+npm run db:seed                                      # the graph the router walks
+curl -s -X POST http://localhost:4000/api/routes/estimate \
+  -H 'Content-Type: application/json' \
+  -d '{"originServicePointCode":"banani-road-11","destinationServicePointCode":"mohakhali-bus-terminal","departureAt":"2026-09-24T08:41:00+06:00"}'
+```
+
+### Migration
+
+`server/db/06-pgrouting-routing.sql` is a **forward migration**: it is applied by `npm run db:migrate` on top of the existing files and does not rewrite any of them. It:
+
+1. runs `CREATE EXTENSION IF NOT EXISTS pgrouting`;
+2. adds `routing_vertices.graph_node_id` and `routing_edges.graph_edge_id` (see below);
+3. backfills them for a graph that was already seeded;
+4. adds the uniqueness, positivity and immutability enforced on them.
+
+### Database and container requirements
+
+PostgreSQL 17 with **both** PostGIS 3.5 and pgRouting 3.8. The container is built from `docker/db/Dockerfile`; see [PostGIS and pgRouting prerequisites](#postgis-and-pgrouting-prerequisites) for the verification query and the privileges `CREATE EXTENSION` needs. A plain `postgres` image cannot run this project: the migration fails without the extension control file.
+
+### Identifier strategy
+
+pgRouting requires **integer** graph identifiers. This project keys its tables on UUIDs, so each vertex and edge carries an additional immutable identifier *alongside* its UUID primary key:
+
+| Column | Type | Purpose |
+| ------ | ---- | ------- |
+| `routing_vertices.graph_node_id` | `bigint`, unique, non-null | `source` / `target` in pgRouting's edge query |
+| `routing_edges.graph_edge_id` | `bigint`, unique, non-null | `id` in that query, and the value pgRouting returns in its `edge` column |
+
+- **Nothing was replaced.** The UUID `id` remains the primary key and the target of every foreign key; `service_points.routing_vertex_id` still points at a UUID. The integers are internal and are never returned by the API -- a client refers to an edge by its stable `code`.
+- **The values are deterministic.** Both the migration and the seeder rank codes ascending in byte order (`COLLATE "C"` in SQL, `Array#sort` in `server/src/db/seeds/graph-ids.js`). Because the rule is derived from the codes rather than from insertion order, a database built from scratch and one migrated from the location phase end up with **identical** identifiers. Two unit tests and an integration test pin that agreement.
+- **They are immutable.** `prevent_graph_identifier_change()` rejects any `UPDATE` of either column. A route result is a list of edge identifiers, so an identifier that could be reassigned would silently repoint an existing route.
+- **They are assigned automatically if you do not name one.** A sequence supplies the next value for a hand-written insert (a fixture, say), and both the migration and the seeder keep that sequence above the highest identifier in use.
+
+### Endpoint
+
+`POST /api/routes/estimate`
+
+| Field | Required | Notes |
+| ----- | -------- | ----- |
+| `originServicePointCode` | yes | A `service_points.code`; trimmed and lower-cased |
+| `destinationServicePointCode` | yes | A different `service_points.code` |
+| `departureAt` | no | ISO 8601 **with an explicit offset**; defaults to now |
+
+Request:
+
+```json
+{
+  "originServicePointCode": "banani-road-11",
+  "destinationServicePointCode": "mohakhali-bus-terminal",
+  "departureAt": "2026-09-24T08:41:00+06:00"
+}
+```
+
+Response `200`:
+
+```json
+{
+  "origin": { "code": "banani-road-11", "name": "Banani Road 11" },
+  "destination": { "code": "mohakhali-bus-terminal", "name": "Mohakhali Bus Terminal" },
+  "departureAt": "2026-09-24T02:41:00.000Z",
+  "estimatedArrivalAt": "2026-09-24T02:50:29.000Z",
+  "trafficProfile": "RUSH_HOUR",
+  "distanceMeters": 2214,
+  "distanceKilometers": 2.214,
+  "durationSeconds": 569,
+  "durationMinutes": 9,
+  "geometry": {
+    "type": "LineString",
+    "coordinates": [[90.4043, 23.7937], [90.4006, 23.774]]
+  },
+  "legs": [
+    {
+      "sequence": 1,
+      "edgeCode": "edge-mohakhali-bus-terminal-to-banani-road-11",
+      "direction": "BACKWARD",
+      "distanceMeters": 2214,
+      "durationSeconds": 569
+    }
+  ]
+}
+```
+
+That is a real response from the seeded demo graph, not an illustration. Every field is built by `server/src/serializers/route.serializer.js`, which is a whitelist -- no graph identifier, no audit timestamp and **no fare field** can leak into it.
+
+Notes on the numbers:
+
+- `distanceMeters` is the **sum of the traversed edges' measured distances**, rounded per edge. It is network distance along the graph, never a straight-line distance.
+- `distanceKilometers` is the same number in kilometres, rounded to the metre; `durationMinutes` is `durationSeconds` rounded to a whole minute.
+- `estimatedArrivalAt` is exactly `departureAt + durationSeconds`. Both timestamps are UTC ISO 8601.
+- `legs` are in travel order (`sequence` 1, 2, ...), one per traversed edge, and `direction` says whether that edge was followed along its stored `source → target` (`FORWARD`) or against it (`BACKWARD`).
+- `geometry` is a single GeoJSON `LineString` in travel order, in `[longitude, latitude]` (the GeoJSON convention, which happens to match PostGIS's). Edges traversed backwards have their geometry reversed, so the line reads as the journey was made. The legs are joined in path order rather than by asking PostGIS to merge an unordered set, which is why a route with backward legs is still one `LineString`.
+
+### Traffic profiles
+
+An edge carries a normal duration and a rush-hour duration. The endpoint picks **one** profile for the whole route:
+
+| Profile | When | Cost used |
+| ------- | ---- | --------- |
+| `NORMAL` | outside the rush-hour windows | `normal_duration_seconds` forward, `reverse_normal_duration_seconds` backward |
+| `RUSH_HOUR` | inside them | `rush_hour_duration_seconds` forward, `reverse_rush_hour_duration_seconds` backward |
+
+- The windows are **configurable** with `RUSH_HOUR_WINDOWS` (see `server/.env.example`). The default is `07:30-10:30,16:30-20:00`.
+- A window is **half-open**: the start minute is rush hour, the end minute is not. With the default, 07:29 is normal, 07:30 and 10:29 are rush hour, and 10:30 is normal again.
+- A window whose end is not after its start **wraps past midnight**, so `22:00-02:00` works.
+- A malformed value stops the process at start-up instead of quietly estimating every route with the wrong costs.
+- **A client cannot choose a profile.** Sending `trafficProfile` in the body is a `400`, not a silent override; the profile is derived on the server from the departure instant.
+
+#### Asia/Dhaka
+
+- `departureAt` is an instant; the response always returns UTC. Asia/Dhaka is used for exactly one thing: deciding whether *that instant* is rush hour locally, via `Intl.DateTimeFormat` (not a hard-coded `+06:00`), so a zone rule change cannot silently produce wrong answers.
+- Because the decision is made on the instant, `2026-09-24T08:41:00+06:00` and `2026-09-24T02:41:00Z` produce byte-identical responses.
+- A timestamp **without an offset** (`2026-09-24T08:41`) is a `400`: it does not name an instant, and guessing the zone is how a rush-hour route gets estimated with normal costs.
+- **Known limitation.** The profile is chosen once, from the departure instant, and applies to the whole journey. A trip that departs at 10:29 is estimated entirely with rush-hour costs even though it crosses 10:30, and time-dependent profile changes *during* a journey are not supported. Supporting them needs per-second cost functions and a time-dependent router.
+
+### Directed and one-way edges
+
+- An edge always permits travel `source → target`. `bidirectional = true` adds the return leg.
+- For a one-way edge the edge query returns `reverse_cost = -1`, which is how pgRouting is told the edge is *not traversable* in reverse -- it is not merely expensive. The seed contains four one-way edges, and `farmgate → khamarbari` is the interesting one: it makes Khamarbari and Indira Road reachable but with no way back out, so `khamarbari → banani-road-11` is a legitimate **`422`**, not an error.
+- A detour is preferred to an illegal reversal. `shapla-chattar → sadarghat` is one-way; the reverse journey (`sadarghat → shapla-chattar`) therefore routes the long way round via `jatrabari-intersection` instead of using the direct edge backwards. Two integration tests pin this: the returned route never contains the one-way edge traversed backwards, and enabling the reverse leg temporarily makes the router switch to the direct edge.
+- Routing uses **duration** as cost. Distance and `fare_weight` are never used as a cost, and `fare_weight` is never used for anything at all in this milestone.
+
+### Errors
+
+| Status | When |
+| ------ | ---- |
+| `400` | Missing origin/destination, malformed code, malformed or offset-less `departureAt`, identical origin and destination, unsupported body field |
+| `404` | Either service point code is unknown |
+| `409` | Either service point is inactive, or its routing vertex is |
+| `422` | Both points are valid and active, but no route exists (the graph is only weakly connected) |
+| `500` | The graph or pgRouting failed -- always a stable `Route calculation failed` message |
+
+```json
+{ "error": { "message": "Service point \"nowhere\" was not found" } }
+```
+
+No raw SQL, driver message or stack trace is ever returned: internal failures are logged server-side and replaced with one fixed message.
+
+### Security
+
+- The two ServicePoint codes are validated against the project's code format and **bound as parameters**; they are never concatenated into SQL.
+- pgRouting takes its edge set as SQL *text*, which is the obvious injection surface here. Nothing is interpolated into it: `server/src/services/routing.service.js` holds two complete, fixed, application-controlled edge queries -- one per profile -- and picks between them. Even the profile name never reaches the SQL, which is why a client cannot influence it.
+- Graph identifiers are never accepted from a client. The identifiers passed to `pgr_dijkstra` come from the database (via the service points) and from pgRouting's own output, and are re-validated as positive integers.
+- The endpoint is **public**, like the location reads it builds on: it reports what the stored graph already says and writes nothing. When ride requests arrive in a later milestone they will be authenticated, and this endpoint can be gated with the existing `requireAuth` middleware without changing its contract. No new authentication system was built.
+- The routing queries run with a PostgreSQL `statement_timeout` (default 5 s, `ROUTING_STATEMENT_TIMEOUT_MS`) scoped to a short transaction, so a runaway query cannot hold a connection indefinitely.
+
+### Performance
+
+The demo graph is tiny, but the shape is what a larger one would need: only **active** edges (and vertices) are considered; the path's edges are loaded in **one** query and put back into path order using the sequence pgRouting returned, so there is never a query per leg; and the unique index on each graph identifier is what that lookup uses, while `source_vertex_id`, `target_vertex_id` and `active` keep their indexes from `05-postgis-location.sql`. No caching is added: nothing has been measured yet.
+
+### Approximate demo data
+
+**Every coordinate, distance and duration in this graph is approximate demo data, not verified navigation data.** Edges are straight two-point lines between neighbourhood-level coordinates, and durations are derived from those lengths at demo speeds (24 km/h normal, 14 km/h rush hour). The route the endpoint returns is therefore a plausible-looking answer over a hand-written toy graph -- not a road-following route, and not a travel-time promise. There are no maps, no geocoding and no external routing or live-traffic APIs anywhere in this milestone.
+
+### Routing tests
+
+```bash
+npm test                                   # everything (unit + integration)
+npm run test:unit --workspace server        # no database needed
+npm run test:integration --workspace server # needs `npm run db:up`
+```
+
+The routing coverage is deliberately explicit about the parts that are easy to get quietly wrong: that pgRouting is installed and callable; the identifier strategy (UUID keys kept, integers added, the seeder's rule matching the database's, immutability enforced); Banani Road 11 → Mohakhali Bus Terminal; legs in path order and consecutive legs connected at a shared node; forward traversal using the forward duration and backward traversal using the reverse duration; a one-way edge refusing reverse traversal, and the detour that replaces it; network distance and duration equalling the sum over traversed edges only; rush-hour versus normal costs, both from fixed instants rather than the clock; arrival = departure + duration; geometry in path order, reversed for backward legs; every documented error case; and that no fare, request, pool or matching table or endpoint appeared.
 
 ## Tests
 
@@ -420,13 +610,15 @@ npm run test:integration --workspace server
 
 Tests use Node's built-in runner (`node --test`) — no extra dependencies. The integration suites run against the real PostgreSQL database from `DATABASE_URL`, apply `server/db/*.sql` and the seed themselves, and clean up after themselves; the database must be reachable (`npm run db:up`). Constraint tests run inside rolled-back transactions.
 
-Coverage highlights: the PostGIS extension and the real spatial column types; the GiST spatial indexes; that coordinates are stored longitude-first; `ST_DWithin` proximity answering in metres with a distant point correctly excluded; the seed totals, per-zone point counts, correct zone membership and idempotency; the coordinate bounds; and -- for the graph -- no isolated vertex, one weakly connected component, every zone linked to another, edge endpoints aligned with their vertices, edge distance matching `ST_Length`, and the direction / duration / fare-weight invariants. It also asserts that the superseded `/api/transport/*` endpoints are gone and that no routing, quote, fare or ride endpoint has appeared.
+Coverage highlights: the PostGIS extension and the real spatial column types; the GiST spatial indexes; that coordinates are stored longitude-first; `ST_DWithin` proximity answering in metres with a distant point correctly excluded; the seed totals, per-zone point counts, correct zone membership and idempotency; the coordinate bounds; and -- for the graph -- no isolated vertex, one weakly connected component, every zone linked to another, edge endpoints aligned with their vertices, edge distance matching `ST_Length`, and the direction / duration / fare-weight invariants. It also asserts that the superseded `/api/transport/*` endpoints are gone, and that `/api/location/*` still exposes no routing of its own. Routing is covered by its own suites -- see [Routing](#routing) for the list.
 
 ## Next steps
 
 - Decide how schema changes are reviewed now that Prisma is in place: keep the idempotent `server/db/*.sql` files as the source of truth (the current setup, and what preserves the `CHECK` constraints and GiST indexes Prisma cannot model), or move fully to Prisma Migrate and express those another way.
+- Build the next milestone on top of route estimation: **fare calculation and ride requests**. Route estimation deliberately stops at distance, duration and geometry -- it has no notion of price, of a passenger, or of someone owning a request.
+- Decide whether a route estimate should be authenticated. It is public for now, matching the location reads, because it writes nothing; the first write endpoint is the point at which to gate it with `requireAuth`.
+- Consider time-dependent profiles *within* a journey (the current router picks one profile from the departure instant and applies it to the whole route), which needs per-second costs and a time-dependent router.
 - Authenticate the client: send the auth cookie from the Next.js app, then tighten `GET /api/users`, which is still public so the demo page keeps rendering.
-- Build the routing phase on top of the stored graph: pgRouting (or an in-process algorithm), route quotes, distance/ETA and fare calculation. None of that exists yet -- the graph is stored and validated only.
 - Add email verification and password reset. Sign-up currently accepts any address a caller supplies, so nobody proves they own the email they register with.
 - Rate-limit `POST /api/auth/login` and `POST /api/auth/register`. No limiter is installed yet, so password guessing and bulk sign-ups are unthrottled.
 - JWT logout cannot revoke a token before it expires. Add a token denylist (or move to opaque server-side sessions) if immediate revocation becomes a requirement.

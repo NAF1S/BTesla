@@ -7,6 +7,7 @@ import {
   toLineStringWkt,
 } from '../../utils/geo.js';
 import { DEMO_SPEED_KMH, LOCATION_EDGES, LOCATION_ZONES } from './location.data.js';
+import { assignGraphEdgeIds, assignGraphNodeIds } from './graph-ids.js';
 
 /**
  * Idempotent, deterministic seeder for the PostGIS location foundation and the
@@ -26,6 +27,11 @@ import { DEMO_SPEED_KMH, LOCATION_EDGES, LOCATION_ZONES } from './location.data.
  *
  * Nothing spatial is hand-built: points and lines go through utils/geo.js, which
  * is the single place longitude-before-latitude is applied.
+ *
+ * The integer graph identifiers pgRouting needs are assigned here, once, from
+ * the codes themselves (see ./graph-ids.js) and are never rewritten: a route
+ * result is a list of edge identifiers, so reassigning one would repoint a route
+ * that already exists. The database enforces the same rule with a trigger.
  */
 
 const CODE_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -162,16 +168,24 @@ const upsertZone = async (tx, zone) => {
   return rows[0].id;
 };
 
-const upsertVertex = async (tx, point) => {
+/**
+ * Upserts one vertex.
+ *
+ * graph_node_id is inserted but deliberately left out of the UPDATE list: the
+ * identifier is written once and is immutable from then on, which is what keeps
+ * it stable across seed runs (and what the immutability trigger enforces).
+ */
+const upsertVertex = async (tx, point, graphNodeId) => {
   const rows = await tx.$queryRawUnsafe(
-    `INSERT INTO routing_vertices (code, location, active)
-     VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 4326), true)
+    `INSERT INTO routing_vertices (code, location, graph_node_id, active)
+     VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 4326), $4, true)
      ON CONFLICT (code) DO UPDATE
        SET location = EXCLUDED.location
      RETURNING id`,
     vertexCode(point.code),
     point.longitude,
     point.latitude,
+    graphNodeId,
   );
   return rows[0].id;
 };
@@ -206,8 +220,11 @@ const upsertPoint = async (tx, point, zoneId, routingVertexId) => {
  *
  * Reverse durations are populated only for a bidirectional edge, which is what
  * the routing_edges_reverse_durations_consistent constraint requires.
+ *
+ * graph_edge_id is inserted but never updated: it is the value pgr_dijkstra
+ * reports back as `edge`, so it identifies an edge for the lifetime of a route.
  */
-const upsertEdge = async (tx, edge, pointCoordinates, vertexIds) => {
+const upsertEdge = async (tx, edge, pointCoordinates, vertexIds, graphEdgeId) => {
   const wkt = toLineStringWkt([pointCoordinates.get(edge.from), pointCoordinates.get(edge.to)]);
   const bidirectional = edge.bidirectional ?? true;
 
@@ -219,7 +236,7 @@ const upsertEdge = async (tx, edge, pointCoordinates, vertexIds) => {
        code, source_vertex_id, target_vertex_id, geometry,
        distance_meters, normal_duration_seconds, rush_hour_duration_seconds,
        fare_weight, reverse_normal_duration_seconds, reverse_rush_hour_duration_seconds,
-       bidirectional, active, metadata
+       bidirectional, active, metadata, graph_edge_id
      )
      SELECT
        $1, $2, $3, line.g,
@@ -229,7 +246,7 @@ const upsertEdge = async (tx, edge, pointCoordinates, vertexIds) => {
        $7,
        CASE WHEN $8 THEN GREATEST(1, round(ST_Length(line.g::geography) / ($5::numeric / 3.6)))::int END,
        CASE WHEN $8 THEN GREATEST(1, round(ST_Length(line.g::geography) / ($6::numeric / 3.6)))::int END,
-       $8, true, $9::jsonb
+       $8, true, $9::jsonb, $10
      FROM line
      ON CONFLICT (code) DO UPDATE SET
        source_vertex_id = EXCLUDED.source_vertex_id,
@@ -253,6 +270,7 @@ const upsertEdge = async (tx, edge, pointCoordinates, vertexIds) => {
     edge.fareWeight ?? 1,
     bidirectional,
     edge.metadata ? JSON.stringify(edge.metadata) : null,
+    graphEdgeId,
   );
 
   return rows[0].id;
@@ -387,10 +405,17 @@ export const seedLocationNetwork = async (tx) => {
   const zoneIds = new Map();
   for (const zone of LOCATION_ZONES) zoneIds.set(zone.code, await upsertZone(tx, zone));
 
-  // 2. Vertices, before any point can reference one.
+  // 2. Vertices, before any point can reference one. The integer graph
+  // identifiers are derived from the codes, in the same order
+  // 06-pgrouting-routing.sql uses to backfill a pre-existing graph.
+  const graphNodeIds = assignGraphNodeIds(allSeedPoints().map((point) => vertexCode(point.code)));
+  const graphEdgeIds = assignGraphEdgeIds(
+    LOCATION_EDGES.map((edge) => edgeCode(edge.from, edge.to)),
+  );
+
   const vertexIds = new Map();
   for (const point of allSeedPoints()) {
-    vertexIds.set(point.code, await upsertVertex(tx, point));
+    vertexIds.set(point.code, await upsertVertex(tx, point, graphNodeIds.get(vertexCode(point.code))));
   }
 
   // 3. Points, connected to their vertex.
@@ -411,9 +436,29 @@ export const seedLocationNetwork = async (tx) => {
   );
   let edgeCount = 0;
   for (const edge of LOCATION_EDGES) {
-    await upsertEdge(tx, edge, pointCoordinates, vertexIds);
+    const code = edgeCode(edge.from, edge.to);
+    await upsertEdge(
+      tx,
+      edge,
+      pointCoordinates,
+      vertexIds,
+      graphEdgeIds.get(code),
+    );
     edgeCount += 1;
   }
+
+  // Keep each identifier sequence above what was just written, so an insert that
+  // does not name a graph identifier of its own (a fixture, a hand-written row)
+  // cannot be handed one that is already taken. The migration does the same for
+  // a graph that was already seeded.
+  await tx.$queryRawUnsafe(
+    `SELECT setval('routing_vertices_graph_node_id_seq',
+                   (SELECT max(graph_node_id) FROM routing_vertices))`,
+  );
+  await tx.$queryRawUnsafe(
+    `SELECT setval('routing_edges_graph_edge_id_seq',
+                   (SELECT max(graph_edge_id) FROM routing_edges))`,
+  );
 
   // 5-7. Validation. A throw here rolls the whole transaction back.
   await assertStoredCoordinatesWithinBounds(tx);

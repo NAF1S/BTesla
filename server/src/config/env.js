@@ -1,5 +1,10 @@
 import 'dotenv/config';
 
+import {
+  DEFAULT_RUSH_HOUR_WINDOWS,
+  parseRushHourWindows,
+} from '../utils/time.js';
+
 const toNumber = (value, fallback) => {
   const parsed = Number.parseInt(value ?? '', 10);
   return Number.isNaN(parsed) ? fallback : parsed;
@@ -53,6 +58,22 @@ export const env = {
   // --- Demo seed (development only) -------------------------------------
   demoSeedPassword: process.env.DEMO_SEED_PASSWORD ?? 'DemoPass123!',
   allowDemoSeed: toBoolean(process.env.ALLOW_DEMO_SEED, false),
+
+  // --- Routing ----------------------------------------------------------
+  routing: {
+    /**
+     * Asia/Dhaka rush-hour windows, e.g. "07:30-10:30,16:30-20:00". Half-open:
+     * the start minute is rush hour, the end minute is not. Invalid values throw
+     * here, at process start, so a typo cannot silently mis-price every route.
+     */
+    rushHourWindows: parseRushHourWindows(
+      process.env.RUSH_HOUR_WINDOWS || DEFAULT_RUSH_HOUR_WINDOWS,
+    ),
+    /** PostgreSQL statement_timeout applied to the routing queries. */
+    statementTimeoutMs: toNumber(process.env.ROUTING_STATEMENT_TIMEOUT_MS, 5_000),
+    /** Prisma's own ceiling for the routing transaction, above the statement timeout. */
+    queryTimeoutMs: toNumber(process.env.ROUTING_QUERY_TIMEOUT_MS, 10_000),
+  },
 };
 
 /**
