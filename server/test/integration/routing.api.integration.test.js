@@ -63,12 +63,38 @@ const RESPONSE_KEYS = [
 
 let api;
 
-const estimate = (body) =>
-  api.request('/routes/estimate', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+/** The cookie /auth/login issued, replayed on every estimate below. */
+let authCookie = null;
+
+/** A JSON POST, optionally carrying a session cookie. */
+const jsonPost = (body, cookie) => ({
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    ...(cookie ? { cookie } : {}),
+  },
+  body: JSON.stringify(body),
+});
+
+/** Signs in and returns the cookie the API issued, ready to replay. */
+const login = async (email) => {
+  const response = await api.request(
+    '/auth/login',
+    jsonPost({ email, password: env.demoSeedPassword }, null),
+  );
+  assert.strictEqual(
+    response.status,
+    200,
+    `the routing suite could not sign in as ${email}: ${JSON.stringify(response.body)}`,
+  );
+  return response.setCookie.split(';')[0];
+};
+
+/** An estimate sent with the given cookie (or none, when it is falsey). */
+const estimateAs = (body, cookie) => api.request('/routes/estimate', jsonPost(body, cookie));
+
+/** An estimate sent as the signed-in demo passenger. */
+const estimate = (body) => estimateAs(body, authCookie);
 
 const estimateOk = async (body) => {
   const response = await estimate(body);
@@ -201,11 +227,90 @@ const SLOW_DOWN_REVERSE_LEG = `UPDATE routing_edges
 before(async () => {
   await prepareDatabase();
   api = await startApiServer();
+
+  // The endpoint is authenticated now, so the suite signs in once as a seeded
+  // demo account and replays that cookie. It is only ever read, never changed:
+  // the demo cast itself is left alone.
+  authCookie = await login('nusrat@example.com');
 });
 
 after(async () => {
   await api?.close();
   await closePool();
+});
+
+describe('authentication', () => {
+  const request = {
+    originServicePointCode: ORIGIN,
+    destinationServicePointCode: DESTINATION,
+    departureAt: NORMAL_DEPARTURE,
+  };
+
+  it('rejects an unauthenticated estimate with 401', async () => {
+    const response = await estimateAs(request, null);
+
+    assert.strictEqual(response.status, 401);
+    assert.match(response.body.error.message, /Authentication required/);
+  });
+
+  it('rejects an estimate carrying a malformed, tampered or unrelated cookie', async () => {
+    for (const cookie of [
+      'teslab_auth=not-a-token',
+      `teslab_auth=${'x'.repeat(80)}`,
+      // A real token whose signature has been edited.
+      `${authCookie.slice(0, -1)}${authCookie.endsWith('a') ? 'b' : 'a'}`,
+      'some_other_cookie=1',
+    ]) {
+      const response = await estimateAs(request, cookie);
+      assert.strictEqual(response.status, 401, `expected 401 for cookie "${cookie}"`);
+      assert.match(response.body.error.message, /Authentication required/);
+    }
+  });
+
+  it('answers an authenticated passenger', async () => {
+    const response = await estimateAs(request, authCookie);
+
+    assert.strictEqual(response.status, 200);
+    assert.deepStrictEqual(Object.keys(response.body).sort(), RESPONSE_KEYS);
+  });
+
+  it('answers an authenticated driver too, because no role is required', async () => {
+    const driverCookie = await login('jashim@example.com');
+    const response = await estimateAs(request, driverCookie);
+
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(response.body.origin.code, ORIGIN);
+  });
+
+  it('rejects an account deactivated after the token was issued', async () => {
+    // The token is still valid, so a 401 here proves the guard re-reads the user
+    // from the database rather than trusting the token.
+    const email = 'nusrat@example.com';
+    await pool.query(`UPDATE users SET active = false WHERE email = $1`, [email]);
+
+    try {
+      const response = await estimateAs(request, authCookie);
+
+      assert.strictEqual(response.status, 401);
+      assert.match(response.body.error.message, /Authentication required/);
+    } finally {
+      // The seeder restores this too (it upserts the demo cast as active), but
+      // the session has to be usable again for the rest of the suite.
+      await pool.query(`UPDATE users SET active = true WHERE email = $1`, [email]);
+    }
+  });
+
+  it('authenticates before it looks at the request, so a bad body is not a 400 for a stranger', async () => {
+    const response = await estimateAs({}, null);
+
+    assert.strictEqual(response.status, 401);
+  });
+
+  it('does not reveal whether a hidden path exists to an unauthenticated caller', async () => {
+    const response = await api.request('/routes/quote', jsonPost({}, null));
+
+    assert.strictEqual(response.status, 404);
+  });
 });
 
 describe('pgRouting installation', () => {

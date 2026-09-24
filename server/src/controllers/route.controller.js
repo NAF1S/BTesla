@@ -5,12 +5,18 @@ import { assertBodyKeys, optionalIsoTimestamp, requireCode } from '../utils/vali
 /**
  * Route estimate endpoint.
  *
+ * Requires authentication (see routes/route.routes.js). The caller's identity is
+ * not needed to answer the question -- the graph is public knowledge and nothing
+ * is written -- so `req.user` is not read here; the guard is an access-control
+ * boundary, not an input to the calculation.
+ *
  * The endpoint is a pure read of the stored graph: it calculates a path, its
  * distance and its duration, and writes nothing. There is no fare, no ride
  * request, no pool and no matching here, and none should be added in this phase.
  *
  * Status-code convention, shared with the location endpoints:
  *   400 - malformed request (bad code, bad timestamp, origin === destination)
+ *   401 - no valid authentication
  *   404 - unknown ServicePoint code
  *   409 - the point exists but is inactive, or its routing vertex is
  *   422 - no route exists between two valid, active points

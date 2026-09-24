@@ -204,7 +204,7 @@ Base URL: `http://localhost:4000/api`
 | `GET`  | `/location/zones`          | List the 15 active service zones                                                      |
 | `GET`  | `/location/points`         | List active service points, optional `?zoneCode=`                                   |
 | `GET`  | `/location/points/:code`   | Get one service point by code                                                         |
-| `POST` | `/routes/estimate`         | Estimate a route between two service points -- see [Routing](#routing)              |
+| `POST` | `/routes/estimate`         | Estimate a route between two service points (**requires authentication**) -- see [Routing](#routing) |
 
 The location endpoints are read-only and return DTOs (`server/src/serializers/location.serializer.js`) instead of raw rows, so database column names, routing vertices and audit timestamps never leak into responses. `/location` is only ever about places: there is deliberately no route, distance, ETA, quote or fare endpoint under it, and none should be added. Route estimation lives at `/routes/estimate` instead.
 
@@ -226,7 +226,8 @@ Status codes are consistent across the location endpoints:
 | `401`  | Credentials rejected, or no valid authentication (auth endpoints)        |
 | `403`  | Authenticated, but not permitted for this role                           |
 | `404`  | Unknown zone or point code                                               |
-| `409`  | The record exists but is inactive (also used for database conflicts)    || `422`  | The request is well-formed but has no answer (an unreachable destination) |
+| `409`  | The record exists but is inactive (also used for database conflicts)    |
+| `422`  | The request is well-formed but has no answer (an unreachable destination) |
 `/health` reports `"ok"` when the database is reachable and `"degraded"` when it is not, and never fails the request:
 
 ```json
@@ -359,7 +360,7 @@ Every rejected login returns the same `401` with the same message, so a caller c
 - `requireRole('ADMIN')` — role guard; must be mounted after `requireAuth`.
 - `currentUser(req)` — the authenticated user attached to the request.
 
-`POST /api/users` is gated with `requireRole(Role.ADMIN)`. That is both a real use of the guard and what stops a client from choosing `ADMIN` when creating an account. The read endpoints (`GET /api/users`) are still public so the Next.js demo page keeps working; tightening them is a follow-up once the client can send the cookie.
+`POST /api/users` is gated with `requireRole(Role.ADMIN)`. That is both a real use of the guard and what stops a client from choosing `ADMIN` when creating an account. `POST /api/routes/estimate` uses `requireAuth` on its own, because estimating a route needs a session but not a particular role. The read endpoints (`GET /api/users`, `GET /api/location/*`) are still public so the Next.js demo page keeps working; tightening them is a follow-up once the client can send the cookie.
 
 Authorization is always decided on the server from the database record. Hiding routes in the front end is not authorization.
 
@@ -438,7 +439,13 @@ Point-to-point route estimation between two seeded service points, using **pgRou
 docker compose up -d --build db                      # image with PostGIS + pgRouting
 npm run db:migrate                                   # 06-pgrouting-routing.sql
 npm run db:seed                                      # the graph the router walks
-curl -s -X POST http://localhost:4000/api/routes/estimate \
+
+# The endpoint requires a session, so sign in first and keep the cookie.
+curl -s -c cookies.txt -X POST http://localhost:4000/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"nusrat@example.com","password":"DemoPass123!"}'
+
+curl -s -b cookies.txt -X POST http://localhost:4000/api/routes/estimate \
   -H 'Content-Type: application/json' \
   -d '{"originServicePointCode":"banani-road-11","destinationServicePointCode":"mohakhali-bus-terminal","departureAt":"2026-09-24T08:41:00+06:00"}'
 ```
@@ -472,7 +479,14 @@ pgRouting requires **integer** graph identifiers. This project keys its tables o
 
 ### Endpoint
 
-`POST /api/routes/estimate`
+`POST /api/routes/estimate` — **requires authentication.**
+
+The existing `requireAuth` guard is mounted on this route, so the request must carry the same HttpOnly auth cookie `POST /auth/login` / `POST /auth/register` issued:
+
+- **No valid session is a `401`**, including a malformed, tampered or expired token, and an account that was deactivated or deleted after its token was issued. The guard re-loads the user from the database on every request, so the token alone is never enough.
+- **Any active role may call it.** A passenger planning a trip and a driver checking a pickup are equally entitled to estimate a route, so there is no `requireRole` here.
+- The caller's identity is **not an input to the calculation**: nothing is written, and the response is identical for every authenticated user.
+- It is the only endpoint in this milestone that requires a session. The location reads (`/location/*`) stay public, and no new authentication mechanism was built — this reuses `server/src/middleware/auth.js`.
 
 | Field | Required | Notes |
 | ----- | -------- | ----- |
@@ -563,6 +577,7 @@ An edge carries a normal duration and a rush-hour duration. The endpoint picks *
 | Status | When |
 | ------ | ---- |
 | `400` | Missing origin/destination, malformed code, malformed or offset-less `departureAt`, identical origin and destination, unsupported body field |
+| `401` | No valid session: no cookie, a malformed/tampered/expired token, or an account that is inactive or deleted |
 | `404` | Either service point code is unknown |
 | `409` | Either service point is inactive, or its routing vertex is |
 | `422` | Both points are valid and active, but no route exists (the graph is only weakly connected) |
@@ -579,7 +594,7 @@ No raw SQL, driver message or stack trace is ever returned: internal failures ar
 - The two ServicePoint codes are validated against the project's code format and **bound as parameters**; they are never concatenated into SQL.
 - pgRouting takes its edge set as SQL *text*, which is the obvious injection surface here. Nothing is interpolated into it: `server/src/services/routing.service.js` holds two complete, fixed, application-controlled edge queries -- one per profile -- and picks between them. Even the profile name never reaches the SQL, which is why a client cannot influence it.
 - Graph identifiers are never accepted from a client. The identifiers passed to `pgr_dijkstra` come from the database (via the service points) and from pgRouting's own output, and are re-validated as positive integers.
-- The endpoint is **public**, like the location reads it builds on: it reports what the stored graph already says and writes nothing. When ride requests arrive in a later milestone they will be authenticated, and this endpoint can be gated with the existing `requireAuth` middleware without changing its contract. No new authentication system was built.
+- The endpoint **requires authentication** via the existing `requireAuth` middleware, which re-loads the active user from the database rather than trusting the token. Any active role may call it. Authentication runs *before* the body is validated, so an anonymous caller cannot probe the request contract, and the guard is mounted on the route rather than on the router, so an unknown `/api/routes/*` path still answers `404` instead of revealing that something is behind a guard. No new authentication system was built.
 - The routing queries run with a PostgreSQL `statement_timeout` (default 5 s, `ROUTING_STATEMENT_TIMEOUT_MS`) scoped to a short transaction, so a runaway query cannot hold a connection indefinitely.
 
 ### Performance
@@ -598,7 +613,7 @@ npm run test:unit --workspace server        # no database needed
 npm run test:integration --workspace server # needs `npm run db:up`
 ```
 
-The routing coverage is deliberately explicit about the parts that are easy to get quietly wrong: that pgRouting is installed and callable; the identifier strategy (UUID keys kept, integers added, the seeder's rule matching the database's, immutability enforced); Banani Road 11 → Mohakhali Bus Terminal; legs in path order and consecutive legs connected at a shared node; forward traversal using the forward duration and backward traversal using the reverse duration; a one-way edge refusing reverse traversal, and the detour that replaces it; network distance and duration equalling the sum over traversed edges only; rush-hour versus normal costs, both from fixed instants rather than the clock; arrival = departure + duration; geometry in path order, reversed for backward legs; every documented error case; and that no fare, request, pool or matching table or endpoint appeared.
+The routing coverage is deliberately explicit about the parts that are easy to get quietly wrong: that pgRouting is installed and callable; that the endpoint requires a session (401 without a cookie, with a tampered one, and for an account deactivated after its token was issued) while any active role is answered; the identifier strategy (UUID keys kept, integers added, the seeder's rule matching the database's, immutability enforced); Banani Road 11 → Mohakhali Bus Terminal; legs in path order and consecutive legs connected at a shared node; forward traversal using the forward duration and backward traversal using the reverse duration; a one-way edge refusing reverse traversal, and the detour that replaces it; network distance and duration equalling the sum over traversed edges only; rush-hour versus normal costs, both from fixed instants rather than the clock; arrival = departure + duration; geometry in path order, reversed for backward legs; every documented error case; and that no fare, request, pool or matching table or endpoint appeared.
 
 ## Tests
 
@@ -616,9 +631,8 @@ Coverage highlights: the PostGIS extension and the real spatial column types; th
 
 - Decide how schema changes are reviewed now that Prisma is in place: keep the idempotent `server/db/*.sql` files as the source of truth (the current setup, and what preserves the `CHECK` constraints and GiST indexes Prisma cannot model), or move fully to Prisma Migrate and express those another way.
 - Build the next milestone on top of route estimation: **fare calculation and ride requests**. Route estimation deliberately stops at distance, duration and geometry -- it has no notion of price, of a passenger, or of someone owning a request.
-- Decide whether a route estimate should be authenticated. It is public for now, matching the location reads, because it writes nothing; the first write endpoint is the point at which to gate it with `requireAuth`.
 - Consider time-dependent profiles *within* a journey (the current router picks one profile from the departure instant and applies it to the whole route), which needs per-second costs and a time-dependent router.
-- Authenticate the client: send the auth cookie from the Next.js app, then tighten `GET /api/users`, which is still public so the demo page keeps rendering.
+- Authenticate the client: send the auth cookie from the Next.js app, then tighten `GET /api/users`, which is still public so the demo page keeps rendering. `POST /api/routes/estimate` already requires a session, so the client needs to carry the cookie before it can call it.
 - Add email verification and password reset. Sign-up currently accepts any address a caller supplies, so nobody proves they own the email they register with.
 - Rate-limit `POST /api/auth/login` and `POST /api/auth/register`. No limiter is installed yet, so password guessing and bulk sign-ups are unthrottled.
 - JWT logout cannot revoke a token before it expires. Add a token denylist (or move to opaque server-side sessions) if immediate revocation becomes a requirement.
