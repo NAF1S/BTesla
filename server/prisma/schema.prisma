@@ -44,13 +44,13 @@ datasource db {
 /// zone's own points rather than a surveyed boundary. Prisma cannot model
 /// spatial types, hence Unsupported.
 model ServiceZone {
-  id             String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  code           String         @unique
-  name           String         @unique
-  active         Boolean        @default(true)
+  id             String                   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code           String                   @unique
+  name           String                   @unique
+  active         Boolean                  @default(true)
   centerLocation Unsupported("geography") @map("center_location")
-  createdAt      DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt      DateTime       @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  createdAt      DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime                 @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
   servicePoints  ServicePoint[]
 
   @@index([active])
@@ -69,16 +69,16 @@ model ServiceZone {
 /// `code` in byte order) and an immutability trigger rejects any later change,
 /// because a returned route refers to edges by these numbers.
 model RoutingVertex {
-  id            String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  code          String         @unique
+  id            String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code          String                  @unique
   location      Unsupported("geometry")
-  graphNodeId   BigInt         @unique(map: "routing_vertices_graph_node_id_unique") @default(autoincrement()) @map("graph_node_id")
-  active        Boolean        @default(true)
-  createdAt     DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt     DateTime       @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  graphNodeId   BigInt                  @unique(map: "routing_vertices_graph_node_id_unique") @default(autoincrement()) @map("graph_node_id")
+  active        Boolean                 @default(true)
+  createdAt     DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime                @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
   servicePoints ServicePoint[]
-  outgoingEdges RoutingEdge[]  @relation("RoutingEdgeSource")
-  incomingEdges RoutingEdge[]  @relation("RoutingEdgeTarget")
+  outgoingEdges RoutingEdge[]           @relation("RoutingEdgeSource")
+  incomingEdges RoutingEdge[]           @relation("RoutingEdgeTarget")
 
   @@index([active])
   @@map("routing_vertices")
@@ -91,17 +91,19 @@ model RoutingVertex {
 /// twice; `code` is globally unique because it is both the seed key and the
 /// public identifier.
 model ServicePoint {
-  id              String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  zoneId          String        @map("zone_id") @db.Uuid
-  routingVertexId String        @map("routing_vertex_id") @db.Uuid
-  code            String        @unique
-  name            String
-  location        Unsupported("geography")
-  active          Boolean       @default(true)
-  createdAt       DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt       DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-  zone            ServiceZone   @relation(fields: [zoneId], references: [id], onDelete: Restrict, onUpdate: NoAction)
-  routingVertex   RoutingVertex @relation(fields: [routingVertexId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  id                String                   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  zoneId            String                   @map("zone_id") @db.Uuid
+  routingVertexId   String                   @map("routing_vertex_id") @db.Uuid
+  code              String                   @unique
+  name              String
+  location          Unsupported("geography")
+  active            Boolean                  @default(true)
+  createdAt         DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime                 @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  zone              ServiceZone              @relation(fields: [zoneId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  routingVertex     RoutingVertex            @relation(fields: [routingVertexId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  originQuotes      FareQuote[]              @relation("FareQuoteOrigin")
+  destinationQuotes FareQuote[]              @relation("FareQuoteDestination")
 
   @@unique([zoneId, name], map: "service_points_zone_name_unique")
   @@index([zoneId])
@@ -125,30 +127,120 @@ model ServicePoint {
 /// `edge`, so it is how a returned path is mapped to rows of this table. Like
 /// `RoutingVertex.graphNodeId` it is written once and immutable.
 model RoutingEdge {
-  id                             String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  code                           String        @unique
-  graphEdgeId                    BigInt        @unique(map: "routing_edges_graph_edge_id_unique") @default(autoincrement()) @map("graph_edge_id")
-  sourceVertexId                 String        @map("source_vertex_id") @db.Uuid
-  targetVertexId                 String        @map("target_vertex_id") @db.Uuid
+  id                             String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code                           String                  @unique
+  graphEdgeId                    BigInt                  @unique(map: "routing_edges_graph_edge_id_unique") @default(autoincrement()) @map("graph_edge_id")
+  sourceVertexId                 String                  @map("source_vertex_id") @db.Uuid
+  targetVertexId                 String                  @map("target_vertex_id") @db.Uuid
   geometry                       Unsupported("geometry")
-  distanceMeters                 Decimal       @map("distance_meters") @db.Decimal(12, 2)
-  normalDurationSeconds          Int           @map("normal_duration_seconds")
-  rushHourDurationSeconds        Int           @map("rush_hour_duration_seconds")
-  fareWeight                     Decimal       @default(1) @map("fare_weight") @db.Decimal(6, 3)
-  reverseNormalDurationSeconds   Int?          @map("reverse_normal_duration_seconds")
-  reverseRushHourDurationSeconds Int?          @map("reverse_rush_hour_duration_seconds")
-  bidirectional                  Boolean       @default(false)
-  active                         Boolean       @default(true)
+  distanceMeters                 Decimal                 @map("distance_meters") @db.Decimal(12, 2)
+  normalDurationSeconds          Int                     @map("normal_duration_seconds")
+  rushHourDurationSeconds        Int                     @map("rush_hour_duration_seconds")
+  fareWeight                     Decimal                 @default(1) @map("fare_weight") @db.Decimal(6, 3)
+  reverseNormalDurationSeconds   Int?                    @map("reverse_normal_duration_seconds")
+  reverseRushHourDurationSeconds Int?                    @map("reverse_rush_hour_duration_seconds")
+  bidirectional                  Boolean                 @default(false)
+  active                         Boolean                 @default(true)
   metadata                       Json?
-  createdAt                      DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt                      DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-  sourceVertex                   RoutingVertex @relation("RoutingEdgeSource", fields: [sourceVertexId], references: [id], onDelete: Restrict, onUpdate: NoAction)
-  targetVertex                   RoutingVertex @relation("RoutingEdgeTarget", fields: [targetVertexId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  createdAt                      DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                      DateTime                @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  sourceVertex                   RoutingVertex           @relation("RoutingEdgeSource", fields: [sourceVertexId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  targetVertex                   RoutingVertex           @relation("RoutingEdgeTarget", fields: [targetVertexId], references: [id], onDelete: Restrict, onUpdate: NoAction)
 
   @@index([sourceVertexId])
   @@index([targetVertexId])
   @@index([active])
   @@map("routing_edges")
+}
+
+// ---------------------------------------------------------------------------
+// Solo-fare pricing
+// ---------------------------------------------------------------------------
+
+/// One version of one solo-fare pricing policy (server/db/07-fare-pricing.sql).
+///
+/// Every money field is `Decimal` -- decimal.js -- because binary floating point
+/// cannot hold 0.10 exactly and a fare must be reproducible. Nothing here is
+/// per-ride state: this table is configuration, and it is the only place a rate
+/// may come from.
+///
+/// `(code, version)` is the identity of a policy. A version that quotes already
+/// reference cannot have its calculation inputs changed (a database trigger
+/// refuses it); the next price is a new version.
+model FarePolicy {
+  id                      String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code                    String
+  version                 Int
+  name                    String
+  currency                String      @default("BDT")
+  baseFare                Decimal     @map("base_fare") @db.Decimal(12, 4)
+  perKilometerRate        Decimal     @map("per_kilometer_rate") @db.Decimal(12, 4)
+  perMinuteRate           Decimal     @map("per_minute_rate") @db.Decimal(12, 4)
+  minimumFare             Decimal     @map("minimum_fare") @db.Decimal(12, 4)
+  normalTrafficMultiplier Decimal     @default(1.0000) @map("normal_traffic_multiplier") @db.Decimal(6, 4)
+  rushHourMultiplier      Decimal     @map("rush_hour_multiplier") @db.Decimal(6, 4)
+  quoteTtlSeconds         Int         @map("quote_ttl_seconds")
+  roundingScale           Int         @default(2) @map("rounding_scale") @db.SmallInt
+  active                  Boolean     @default(true)
+  effectiveFrom           DateTime    @map("effective_from") @db.Timestamptz(6)
+  effectiveTo             DateTime?   @map("effective_to") @db.Timestamptz(6)
+  createdAt               DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt               DateTime    @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  quotes                  FareQuote[]
+
+  @@unique([code, version], map: "fare_policies_code_version_unique")
+  @@index([code, active, effectiveFrom])
+  @@map("fare_policies")
+}
+
+/// One quoted price: immutable, expiring, and explainable after the fact.
+///
+/// The columns are the inputs and the outputs of the fare formula, and three
+/// CHECK constraints keep the stored arithmetic self-consistent (subtotal,
+/// total, and whether the minimum fare actually won), so a quote cannot be
+/// written with a breakdown that does not add up.
+///
+/// `trafficMultiplier` is the profile's multiplier as applied -- it is stored,
+/// and the total is `subtotal + trafficAdjustment`, so the multiplier can never
+/// be applied twice without the row failing `fare_quotes_total_consistent`.
+///
+/// There is no passenger or RideRequest relationship in this phase; a later
+/// milestone adds the request that accepts a quote.
+model FareQuote {
+  id                        String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  originServicePointId      String         @map("origin_service_point_id") @db.Uuid
+  destinationServicePointId String         @map("destination_service_point_id") @db.Uuid
+  departureAt               DateTime       @map("departure_at") @db.Timestamptz(6)
+  estimatedArrivalAt        DateTime       @map("estimated_arrival_at") @db.Timestamptz(6)
+  trafficProfile            TrafficProfile @map("traffic_profile")
+  distanceMeters            Int            @map("distance_meters")
+  durationSeconds           Int            @map("duration_seconds")
+  farePolicyId              String         @map("fare_policy_id") @db.Uuid
+  pricingCode               String         @map("pricing_code")
+  pricingVersion            Int            @map("pricing_version")
+  currency                  String
+  baseFare                  Decimal        @map("base_fare") @db.Decimal(14, 6)
+  distanceFare              Decimal        @map("distance_fare") @db.Decimal(14, 6)
+  timeFare                  Decimal        @map("time_fare") @db.Decimal(14, 6)
+  preTrafficSubtotal        Decimal        @map("pre_traffic_subtotal") @db.Decimal(14, 6)
+  trafficMultiplier         Decimal        @map("traffic_multiplier") @db.Decimal(14, 6)
+  trafficAdjustment         Decimal        @map("traffic_adjustment") @db.Decimal(14, 6)
+  minimumFare               Decimal        @map("minimum_fare") @db.Decimal(14, 6)
+  minimumFareApplied        Boolean        @map("minimum_fare_applied")
+  finalFare                 Decimal        @map("final_fare") @db.Decimal(14, 6)
+  routeSnapshot             Json           @map("route_snapshot")
+  fareBreakdown             Json           @map("fare_breakdown")
+  expiresAt                 DateTime       @map("expires_at") @db.Timestamptz(6)
+  createdAt                 DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  originServicePoint        ServicePoint   @relation("FareQuoteOrigin", fields: [originServicePointId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  destinationServicePoint   ServicePoint   @relation("FareQuoteDestination", fields: [destinationServicePointId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  farePolicy                FarePolicy     @relation(fields: [farePolicyId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@index([expiresAt])
+  @@index([farePolicyId])
+  @@index([createdAt])
+  @@index([originServicePointId, destinationServicePointId], map: "fare_quotes_endpoints_idx")
+  @@map("fare_quotes")
 }
 
 /// This model contains an expression index which requires additional setup for migrations. Visit https://pris.ly/d/expression-indexes for more info.
@@ -228,4 +320,14 @@ enum DriverStatus {
   ON_RIDE
 
   @@map("driver_status")
+}
+
+/// Maps onto the `traffic_profile` PostgreSQL enum type created by
+/// server/db/07-fare-pricing.sql. The application's own constants live in
+/// src/utils/time.js (TRAFFIC_PROFILE) and are the same two values.
+enum TrafficProfile {
+  NORMAL
+  RUSH_HOUR
+
+  @@map("traffic_profile")
 }

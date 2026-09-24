@@ -74,6 +74,19 @@ export const env = {
     /** Prisma's own ceiling for the routing transaction, above the statement timeout. */
     queryTimeoutMs: toNumber(process.env.ROUTING_QUERY_TIMEOUT_MS, 10_000),
   },
+
+  // --- Fare pricing -----------------------------------------------------
+  fare: {
+    /**
+     * The pricing policy code quotes are calculated with, e.g. "dhaka-solo".
+     *
+     * The code is chosen here, by configuration, and never by a client: a request
+     * cannot select a policy and therefore cannot select a price. The version is
+     * not configurable at all -- it is whichever version of this code is
+     * effective at the journey's departure instant.
+     */
+    pricingCode: process.env.FARE_PRICING_CODE ?? 'dhaka-solo',
+  },
 };
 
 /**

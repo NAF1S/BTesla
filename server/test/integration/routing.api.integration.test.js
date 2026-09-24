@@ -1072,14 +1072,31 @@ describe('phase boundary', () => {
     }
   });
 
-  it('introduces no fare, request, pool or matching table', async () => {
+  it('introduces no ride, pool, matching or payment table', async () => {
+    // The routing milestone also asserted that *pricing* was absent. The fare
+    // milestone lifted that half deliberately, and the pricing tables it adds are
+    // pinned by the suite below and by fare.policy.integration.test.js. What must
+    // still hold is that nothing pooled, matched, requested or paid exists.
     const { rows } = await pool.query(
       `SELECT table_name FROM information_schema.tables
         WHERE table_schema = 'public'
-          AND table_name ~ '(fare|price|quote|ride|pool|match|seat_reservation|driver_assignment)'`,
+          AND table_name ~ '(ride|pool|payment|wallet|match|seat_reservation|driver_assignment)'`,
     );
 
-    assert.deepStrictEqual(rows, [], 'no pricing or pooling table should exist yet');
+    assert.deepStrictEqual(rows, [], 'no riding, pooling or payment table should exist yet');
+  });
+
+  it('has exactly the two pricing tables the fare milestone added', async () => {
+    const { rows } = await pool.query(
+      `SELECT table_name FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name ~ '(fare|pricing|price|quote)'
+        ORDER BY table_name`,
+    );
+
+    assert.deepStrictEqual(
+      rows.map((row) => row.table_name),
+      ['fare_policies', 'fare_quotes'],
+    );
   });
 
   it('leaves the location endpoints untouched', async () => {

@@ -24,7 +24,8 @@ TeslaB/
 │   │   ├── 04-auth.sql                    # roles, profiles, vehicles
 │   │   ├── 04-drop-transport-network.sql  # forward migration removing the old location model
 │   │   ├── 05-postgis-location.sql        # PostGIS zones, points and routing graph
-│   │   └── 06-pgrouting-routing.sql       # pgRouting + the integer graph identifiers
+│   │   ├── 06-pgrouting-routing.sql       # pgRouting + the integer graph identifiers
+│   │   └── 07-fare-pricing.sql            # versioned fare policies + immutable quotes
 │   ├── prisma/
 │   │   └── schema.prisma   # Prisma view of the SQL schema (hand-mapped)
 │   ├── prisma7.config.ts   # Prisma CLI config (reuses src/config/env.js)
@@ -33,11 +34,11 @@ TeslaB/
 │   │   ├── app.js          # Express app: middleware, routes, error handling
 │   │   ├── config/env.js   # Environment configuration
 │   │   ├── db/             # Prisma client, health probe, migration runner, seeder
-│   │   │   ├── seeds/      # location + routing graph + demo accounts, idempotent upserts
+│   │   │   ├── seeds/      # location + routing graph + pricing + demo accounts, idempotent
 │   │   │   └── seeds/graph-ids.js  # deterministic pgRouting identifiers (shared rule)
-│   │   ├── routes/         # Route definitions (index, health, auth, users, location, routes)
+│   │   ├── routes/         # Route definitions (index, health, auth, users, location, routes, fare-quotes)
 │   │   ├── controllers/    # Request handlers
-│   │   ├── services/       # Business logic / queries (location, routing)
+│   │   ├── services/       # Business logic / queries (location, routing, fare)
 │   │   ├── serializers/    # Record -> response DTO mappers
 │   │   ├── middleware/     # notFound, errorHandler, auth (requireAuth, requireRole)
 │   │   └── utils/          # ApiError, validation, geo, time, password, token, cookies
@@ -205,6 +206,7 @@ Base URL: `http://localhost:4000/api`
 | `GET`  | `/location/points`         | List active service points, optional `?zoneCode=`                                   |
 | `GET`  | `/location/points/:code`   | Get one service point by code                                                         |
 | `POST` | `/routes/estimate`         | Estimate a route between two service points (**requires authentication**) -- see [Routing](#routing) |
+| `POST` | `/fare-quotes`             | Quote a solo fare in BDT (**requires authentication**) -- see [Fare quotes](#fare-quotes) |
 
 The location endpoints are read-only and return DTOs (`server/src/serializers/location.serializer.js`) instead of raw rows, so database column names, routing vertices and audit timestamps never leak into responses. `/location` is only ever about places: there is deliberately no route, distance, ETA, quote or fare endpoint under it, and none should be added. Route estimation lives at `/routes/estimate` instead.
 
@@ -228,6 +230,8 @@ Status codes are consistent across the location endpoints:
 | `404`  | Unknown zone or point code                                               |
 | `409`  | The record exists but is inactive (also used for database conflicts)    |
 | `422`  | The request is well-formed but has no answer (an unreachable destination) |
+
+Both write-less calculation endpoints are authenticated, and neither is wrapped in a `data` envelope: a route estimate and a fare quote are the answer, not a list of answers. The location endpoints are the only ones that return `{ "data": [...] }`.
 `/health` reports `"ok"` when the database is reachable and `"degraded"` when it is not, and never fails the request:
 
 ```json
@@ -405,7 +409,7 @@ In this seed they are one-to-one, which keeps the graph easy to reason about; th
 | `distanceMeters` | Measured from the geometry with `ST_Length(geometry::geography)`. Never hand-written, and a `CHECK` keeps the two in step, so an edge cannot claim a length its shape does not have. |
 | `normalDurationSeconds` | Derived from the measured distance at `DEMO_SPEED_KMH.normal` (a demo 24 km/h). |
 | `rushHourDurationSeconds` | Same, at the demo 14 km/h. A `CHECK` enforces `rush_hour >= normal`, so rush hour can never come out faster. |
-| `fareWeight` | A relative weight for a later phase. **It is not a fare, and no money is stored on an edge.** Defaults to 1; the seed includes 1.5 and 0.75 examples. |
+| `fareWeight` | A relative weight that scales the per-kilometre part of an edge's fare -- one edge, in both directions. **It is not a fare, and no money is stored on an edge.** Defaults to 1; the seed includes 1.5 and 0.75 examples. See [Edge fare weight](#edge-fare-weight). |
 
 Direction rules:
 
@@ -429,7 +433,7 @@ npm run test:integration --workspace server
 
 ### What is deliberately deferred
 
-This phase stores and validates a graph, and -- since the routing milestone -- calculates routes over it. It does **not** implement fare calculation or pricing, ride requests, ride events, passenger ownership, request idempotency, pools, pool membership, ride matching, seat reservation, driver assignment or live traffic. See [Routing](#routing) for what the route endpoint does and does not do.
+This phase stores and validates a graph, and the milestones since calculate routes over it and price them. What is deliberately **not** implemented is everything after a price: ride requests, ride events, passenger ownership, request idempotency, pools, pool membership, shared or discounted fares, ride matching, seat reservation, driver assignment, payments, wallets, demand-based surge pricing and live traffic. See [Routing](#routing) and [Fare quotes](#fare-quotes).
 
 ## Routing
 
@@ -570,7 +574,7 @@ An edge carries a normal duration and a rush-hour duration. The endpoint picks *
 - An edge always permits travel `source → target`. `bidirectional = true` adds the return leg.
 - For a one-way edge the edge query returns `reverse_cost = -1`, which is how pgRouting is told the edge is *not traversable* in reverse -- it is not merely expensive. The seed contains four one-way edges, and `farmgate → khamarbari` is the interesting one: it makes Khamarbari and Indira Road reachable but with no way back out, so `khamarbari → banani-road-11` is a legitimate **`422`**, not an error.
 - A detour is preferred to an illegal reversal. `shapla-chattar → sadarghat` is one-way; the reverse journey (`sadarghat → shapla-chattar`) therefore routes the long way round via `jatrabari-intersection` instead of using the direct edge backwards. Two integration tests pin this: the returned route never contains the one-way edge traversed backwards, and enabling the reverse leg temporarily makes the router switch to the direct edge.
-- Routing uses **duration** as cost. Distance and `fare_weight` are never used as a cost, and `fare_weight` is never used for anything at all in this milestone.
+- Routing uses **duration** as cost. Distance and `fare_weight` are never used as a routing cost: the path is chosen on duration alone, which is exactly why a fare weight can change a price without changing a route. Pricing itself belongs to [Fare quotes](#fare-quotes), and the route responses carry no fare field.
 
 ### Errors
 
@@ -615,6 +619,221 @@ npm run test:integration --workspace server # needs `npm run db:up`
 
 The routing coverage is deliberately explicit about the parts that are easy to get quietly wrong: that pgRouting is installed and callable; that the endpoint requires a session (401 without a cookie, with a tampered one, and for an account deactivated after its token was issued) while any active role is answered; the identifier strategy (UUID keys kept, integers added, the seeder's rule matching the database's, immutability enforced); Banani Road 11 → Mohakhali Bus Terminal; legs in path order and consecutive legs connected at a shared node; forward traversal using the forward duration and backward traversal using the reverse duration; a one-way edge refusing reverse traversal, and the detour that replaces it; network distance and duration equalling the sum over traversed edges only; rush-hour versus normal costs, both from fixed instants rather than the clock; arrival = departure + duration; geometry in path order, reversed for backward legs; every documented error case; and that no fare, request, pool or matching table or endpoint appeared.
 
+## Fare quotes
+
+Solo fare quoting: **how much** the journey from [Routing](#routing) costs, in **BDT**, under a **versioned** pricing policy, stored as an **immutable** quote.
+
+```bash
+docker compose up -d --build db                # PostGIS + pgRouting image
+npm run db:migrate                             # 07-fare-pricing.sql
+npm run db:seed                                # the demo policy (dhaka-solo v1)
+
+# Authenticated, like route estimation: sign in first.
+curl -s -c cookies.txt -X POST http://localhost:4000/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"nusrat@example.com","password":"DemoPass123!"}'
+
+curl -s -b cookies.txt -X POST http://localhost:4000/api/fare-quotes \
+  -H 'Content-Type: application/json' \
+  -d '{"originServicePointCode":"banani-road-11","destinationServicePointCode":"mohakhali-bus-terminal","departureAt":"2026-09-24T08:41:00+06:00"}'
+```
+
+### Money: exact decimals, never floats
+
+- **Storage** is PostgreSQL `numeric` everywhere (`fare_policies` at `numeric(12,4)`, `fare_quotes` at `numeric(14,6)`). There is no `float`/`double precision` column anywhere near a price, because binary floating point cannot represent `0.10` and a fare built from it is a fare nobody can reproduce.
+- **Arithmetic** is decimal.js, reached through `Prisma.Decimal`, which the project already depends on via Prisma -- no new dependency was added. Every value is a `Decimal` or a decimal *string*; a JavaScript `number` is **refused** by the calculator rather than converted, because by the time a price is a `number` the precision is already gone.
+- **Transport** is decimal **strings**: `"166.28"`, `"1.10"`, `"2.214"`. `JSON.parse` of a bare `166.28` produces a float, so returning numbers would undo the exactness at the last step. A client that needs to add or compare these should parse them as decimals.
+- The seed file writes money as strings too (`baseFare: '40.00'`), so what the seed says is literally what the database stores.
+
+### The fare formula
+
+```text
+edgeDistanceKilometers = edgeDistanceMeters / 1000
+edgeDistanceCharge     = edgeDistanceKilometers × perKilometerRate × edgeFareWeight   [rounded]
+
+distanceFare           = sum(edgeDistanceCharge)
+timeFare               = (durationSeconds / 60) × perMinuteRate                       [rounded]
+preTrafficSubtotal     = baseFare + distanceFare + timeFare
+trafficMultiplier      = RUSH_HOUR ? rushHourMultiplier : normalTrafficMultiplier
+trafficAdjustment      = preTrafficSubtotal × (trafficMultiplier - 1)                 [rounded]
+finalFare              = max(minimumFare, preTrafficSubtotal + trafficAdjustment)
+```
+
+Every input comes from the server: the legs, distance and duration from the routing service, the policy from the database. A client cannot send a distance, a duration, a fare weight, a traffic profile or a policy version -- each of those is a `400` (see [the request](#fare-quote-request)).
+
+### Rounding
+
+Rounding is **HALF_UP to the policy's `roundingScale`** (2 decimals by default), and it happens at exactly two kinds of boundary, both marked `[rounded]` above:
+
+1. when a money figure is produced -- each edge's distance charge, the time fare, and the traffic adjustment;
+2. when a configured **amount** enters the calculation -- `baseFare` and `minimumFare` are expressed at `roundingScale`.
+
+Nothing else is rounded and nothing is rounded twice. **Rates are not rounded**: a rate is a price per unit, not an amount, so it keeps its configured precision. The result is the property that makes a quote checkable -- every figure is an amount at `roundingScale`, so *the displayed components always add up to the displayed total*, and the database enforces it (`fare_quotes_subtotal_consistent`, `fare_quotes_total_consistent`).
+
+Note that `durationMinutes` is a **presentation** value (2 decimals). The time fare is calculated from the exact duration, so `569 s` costs `569/60 × 2.00 = 18.9666… → 18.97`, not `9.48 × 2.00 = 18.96`.
+
+### Fare-policy fields
+
+| Field | Meaning |
+| ----- | ------- |
+| `code`, `version` | The identity of a policy version. Unique together. `dhaka-solo` v1 is the seeded demo policy. |
+| `name` | Human label. |
+| `currency` | `BDT`, and only BDT: a database constraint and the calculator both refuse anything else. |
+| `baseFare` | Flat charge for any journey. Added once. |
+| `perKilometerRate` | BDT per network kilometre, applied per edge. |
+| `perMinuteRate` | BDT per routed minute. |
+| `minimumFare` | Floor for the final fare. |
+| `normalTrafficMultiplier` | Traffic multiplier outside the rush-hour windows. `1.0000` in the seed, so off-peak is the baseline. |
+| `rushHourMultiplier` | Traffic multiplier inside them. `1.1000` in the seed. |
+| `quoteTtlSeconds` | How long a quote stays usable: `expiresAt = createdAt + quoteTtlSeconds`. |
+| `roundingScale` | Decimal places every money figure is rounded to, `0`-`6`. |
+| `active` | Whether the version may be selected at all. |
+| `effectiveFrom` / `effectiveTo` | The window the version prices. Half-open: `effectiveTo` is nullable for an open-ended policy. |
+
+All monetary rates must be non-negative, multipliers must be positive, the TTL must be positive, the scale must be 0-6, and the window must end after it starts -- each enforced by a `CHECK` constraint, not by a code path remembering to check.
+
+### Pricing versioning
+
+- A policy is identified by **`(code, version)`**. `dhaka-solo` v1 and v2 are different prices, not a correction to one price.
+- **The version is chosen by the server**, from configuration (`FARE_PRICING_CODE`, default `dhaka-solo`) and the departure instant -- never from the request. The one documented rule is: *the highest version of the configured code that is `active` and whose window contains `departureAt`* (`effectiveFrom <= departureAt`, and `effectiveTo` is null or `> departureAt`). Departure, not creation, because the price that applies is the one for the journey being quoted.
+- The window is **half-open**, so the usual upgrade is: give v2 a later `effectiveFrom` and set v1's `effectiveTo` to the same instant. There is then no gap and no overlap at the handover.
+- **A version that has been quoted is frozen.** A trigger refuses any `UPDATE` of `code`, `version`, `currency`, the four amounts, either multiplier or `roundingScale` on a policy that quotes reference. Changing a live price means inserting the next version. Operational fields -- `name`, `active`, `effectiveFrom/To`, `quoteTtlSeconds` -- stay editable, because retiring or renaming a version changes no historical number.
+- **The seeder never rewrites history.** It creates a version that does not exist, updates one that no quote references (so iterating on demo rates before anybody is quoted works), and leaves a quoted version completely alone.
+- A departure instant with **no** effective policy, or with **more than one** (an overlapping configuration), is a server-side configuration failure: a controlled `500`, never a fallback rate. There is deliberately no default rate to substitute.
+
+### Edge fare weight
+
+`routing_edges.fare_weight` (seeded at 1.0, with 1.5 and 0.75 examples) multiplies the **distance charge** of the edge it belongs to. It is not an amount and not a rate: it scales the per-kilometre component of that one edge.
+
+- It affects the **distance fare only** -- never the time fare, never the base fare, never the minimum fare.
+- It **cannot change which route is taken**. The router optimises duration; fare weight is read after the path is chosen. An integration test sets a weight to 999 and asserts the route is byte-identical while the fare rises.
+- A missing, zero, negative or non-finite weight is a **graph-data error**: a controlled `500`, never a silent default of 1.0, because quietly pricing an unweighted edge is how a fare becomes wrong without anyone noticing.
+- One weight applies to the edge in both directions; directional weights are not implemented.
+
+### Traffic multipliers
+
+The route's traffic profile (`NORMAL` or `RUSH_HOUR`, decided server-side from the departure instant in Asia/Dhaka -- see [Traffic profiles](#traffic-profiles)) selects the multiplier, and it is applied **exactly once**, as a recorded adjustment on top of the subtotal:
+
+```text
+trafficAdjustment = round(preTrafficSubtotal × (multiplier - 1))
+finalFare         = max(minimumFare, preTrafficSubtotal + trafficAdjustment)
+```
+
+It is never applied to the subtotal a second time and never to an already-adjusted total. `quoteTtlSeconds` is not a multiplier, and there is no demand-based surge pricing: the only traffic adjustment is this one.
+
+### Minimum fare
+
+`finalFare = max(minimumFare, adjustedSubtotal)`. The floor is applied **last**, after the traffic multiplier, and the quote records both the floor that applied and whether it actually won:
+
+- `minimumFareApplied` is `true` only when the floor was *above* the calculated fare. A fare exactly equal to the minimum is the calculated fare, not a floor being imposed.
+- The components are still stored when the floor applies, so the quote still explains what the journey actually cost to compute.
+
+### Quote expiration
+
+- `expiresAt = createdAt + quoteTtlSeconds`, both timestamps derived from one instant, so the difference is exactly the TTL (`300 s` in the seed) with no drift between two clocks.
+- **Expiry does not delete anything.** An expired quote stays stored: it is evidence of what was offered, and a later `RideRequest` will need to point at it. Nothing in this phase prunes quotes, and the table has an index on `expires_at` for a future sweep.
+- Expiry is a deadline a consumer must respect. `isQuoteExpired(quote, at)` in `server/src/services/fare.calculator.js` is the one definition, and a quote is expired **at** its expiry instant.
+
+### FareQuote: immutable and auditable
+
+A quote is written once and never updated -- a trigger refuses any `UPDATE`, and no service function exists that could try. It records:
+
+- the two service points (as foreign keys), the departure and estimated arrival instants, the traffic profile, the distance and duration the fare was calculated over;
+- the **exact policy version** used, by id and by `pricingCode`/`pricingVersion`, plus the currency;
+- every component of the formula: `baseFare`, `distanceFare`, `timeFare`, `preTrafficSubtotal`, `trafficMultiplier`, `trafficAdjustment`, `minimumFare`, `minimumFareApplied`, `finalFare`;
+- a **`routeSnapshot`**: the ordered legs with their edge code, traversal direction, distance, selected duration, fare weight and the distance charge that weight produced, plus the merged geometry and the endpoints. This is the audit trail, stored rather than recomputed later against a graph that may since have changed;
+- a **`fareBreakdown`**: the components, the rates that produced them, the quantities they were applied to, and the rounding rule (`{ scale, mode }`).
+
+Because the breakdown is stored with the quote, a quote stays reproducible after its policy is superseded -- and the stored arithmetic is self-checking: three `CHECK` constraints refuse a row whose subtotal, total or minimum-fare flag does not agree with its own numbers.
+
+### Fare-quote request
+
+`POST /api/fare-quotes` — **requires authentication**, like `/routes/estimate`. Any active role may ask. The caller's identity is not part of the quote and is **not stored**: this phase has no passenger ownership, and a later `RideRequest` -- not the quote -- is what will reference a passenger.
+
+| Field | Required | Notes |
+| ----- | -------- | ----- |
+| `originServicePointCode` | yes | A `service_points.code`; trimmed and lower-cased |
+| `destinationServicePointCode` | yes | A different `service_points.code` |
+| `departureAt` | no | ISO 8601 **with an explicit offset**; defaults to now. Decides both the traffic profile and which policy version applies |
+
+Sending anything else -- `distanceMeters`, `durationSeconds`, `finalFare`, `pricingVersion`, `pricingCode`, `trafficMultiplier`, `currency` -- is a `400`, not a silently ignored field.
+
+### Fare-quote response
+
+`201 Created`: a quote is a stored resource with an id, like a created account.
+
+```json
+{
+  "quoteId": "cc1116ae-0a82-4d4c-9d06-92d8084c26e4",
+  "origin": { "code": "banani-road-11", "name": "Banani Road 11" },
+  "destination": { "code": "mohakhali-bus-terminal", "name": "Mohakhali Bus Terminal" },
+  "departureAt": "2026-09-24T02:41:00.000Z",
+  "estimatedArrivalAt": "2026-09-24T02:50:29.000Z",
+  "trafficProfile": "RUSH_HOUR",
+  "route": {
+    "distanceMeters": 2214,
+    "distanceKilometers": "2.214",
+    "durationSeconds": 569,
+    "durationMinutes": "9.48"
+  },
+  "fare": {
+    "currency": "BDT",
+    "pricingCode": "dhaka-solo",
+    "pricingVersion": 1,
+    "baseFare": "40.00",
+    "distanceFare": "59.78",
+    "timeFare": "18.97",
+    "preTrafficSubtotal": "118.75",
+    "trafficMultiplier": "1.10",
+    "trafficAdjustment": "11.88",
+    "minimumFareApplied": false,
+    "finalFare": "130.63"
+  },
+  "expiresAt": "2026-09-24T02:46:00.000Z"
+}
+```
+
+That is a real response from the seeded demo graph. Check it by hand: the traversed edge is 2214 m and weighted 1.5, so `2.214 × 18.00 × 1.5 = 59.778 → 59.78`; the rush-hour duration is 569 s, so `569/60 × 2.00 = 18.9666… → 18.97`; the subtotal is `40.00 + 59.78 + 18.97 = 118.75`; the peak adjustment is `118.75 × 0.10 = 11.875 → 11.88`; and the final fare is `118.75 + 11.88 = 130.63`. The same journey at 12:00 costs `110.85`, because the duration drops to 332 s and the multiplier is `1.00`.
+
+Error responses use the project's standard shape:
+
+```json
+{ "error": { "message": "Unsupported body field(s): finalFare. Supported: originServicePointCode, destinationServicePointCode, departureAt" } }
+```
+
+| Status | When |
+| ------ | ---- |
+| `201` | A quote was created and stored |
+| `400` | Missing origin/destination, malformed code, malformed or offset-less `departureAt`, identical endpoints, unsupported body field |
+| `401` | No valid session |
+| `404` | Either service point code is unknown |
+| `409` | Either service point is inactive, or its routing vertex is |
+| `422` | No route exists between two valid, active points |
+| `500` | The routing algorithm, the policy configuration, the fare calculation or the quote write failed -- always a stable message, never raw SQL or a pricing dump |
+
+### Commands
+
+```bash
+npm run db:migrate                 # applies 07-fare-pricing.sql (idempotent)
+npm run db:seed                    # seeds the demo policy; safe to re-run
+npm test                           # unit + integration
+npm run test:unit --workspace server        # calculator and serializer, no database
+npm run test:integration --workspace server # endpoint, policy data, quotes (needs the database)
+```
+
+The fare tests are explicit about the parts that are easy to get quietly wrong: that the policy seed is idempotent and creates no duplicate version; that `(code, version)` is unique; that a quoted version cannot be re-priced, renamed rates aside; that the correct version is selected for an instant, and that a missing or overlapping configuration is a controlled failure; that money is exact decimal and that a JavaScript `number` is refused; that the base fare is included once; that the per-kilometre fare uses network edge distances and the per-minute fare the routed duration; that fare weight scales the distance fare and cannot change the route; that the multiplier is applied once; that the minimum fare is enforced and recorded; that rounding is deterministic and happens at the documented boundaries; that a stored quote references its policy version and carries an auditable snapshot whose charges add up; that it cannot be modified or reached by any update path; that expiry is exactly the TTL and never deletes; that invalid weights, missing policies and unreachable routes are controlled errors; and that a client cannot influence any of it.
+
+### Demo pricing disclaimer
+
+**Every rate in `server/src/db/seeds/fare.data.js` is invented demo configuration, not official transport pricing.** The values (`40.00` base, `18.00`/km, `2.00`/min, `80.00` minimum, `1.10` peak multiplier) exist to make the pricing pipeline demonstrable and testable. They are not Dhaka taxi, rickshaw, ride-share or regulatory rates, and nothing here should be quoted to anybody as a real price. The seeder also refuses to run in production unless `ALLOW_DEMO_SEED=true`, exactly like the demo accounts.
+
+### What is deliberately not here
+
+Fare quoting stops at a price. There is **no** ride request, ride event, passenger ownership, request idempotency, pool, pool member, shared fare, pooling discount, ride matching, seat reservation, driver assignment, payment, wallet or demand-based surge pricing -- and no external pricing or routing API. The fare is a **solo** fare: one journey, one passenger, one price.
+
+A quote is not attached to a user in this phase. The next milestone adds the `RideRequest` that accepts one, which is when ownership and idempotency become meaningful, and which is why quotes are stored rather than recomputed.
+
+
 ## Tests
 
 ```bash
@@ -625,12 +844,12 @@ npm run test:integration --workspace server
 
 Tests use Node's built-in runner (`node --test`) — no extra dependencies. The integration suites run against the real PostgreSQL database from `DATABASE_URL`, apply `server/db/*.sql` and the seed themselves, and clean up after themselves; the database must be reachable (`npm run db:up`). Constraint tests run inside rolled-back transactions.
 
-Coverage highlights: the PostGIS extension and the real spatial column types; the GiST spatial indexes; that coordinates are stored longitude-first; `ST_DWithin` proximity answering in metres with a distant point correctly excluded; the seed totals, per-zone point counts, correct zone membership and idempotency; the coordinate bounds; and -- for the graph -- no isolated vertex, one weakly connected component, every zone linked to another, edge endpoints aligned with their vertices, edge distance matching `ST_Length`, and the direction / duration / fare-weight invariants. It also asserts that the superseded `/api/transport/*` endpoints are gone, and that `/api/location/*` still exposes no routing of its own. Routing is covered by its own suites -- see [Routing](#routing) for the list.
+Coverage highlights: the PostGIS extension and the real spatial column types; the GiST spatial indexes; that coordinates are stored longitude-first; `ST_DWithin` proximity answering in metres with a distant point correctly excluded; the seed totals, per-zone point counts, correct zone membership and idempotency; the coordinate bounds; and -- for the graph -- no isolated vertex, one weakly connected component, every zone linked to another, edge endpoints aligned with their vertices, edge distance matching `ST_Length`, and the direction / duration / fare-weight invariants. It also asserts that the superseded `/api/transport/*` endpoints are gone, and that `/api/location/*` still exposes no routing of its own. Routing and pricing are covered by their own suites -- see [Routing](#routing) and [Fare quotes](#fare-quotes) for the lists.
 
 ## Next steps
 
 - Decide how schema changes are reviewed now that Prisma is in place: keep the idempotent `server/db/*.sql` files as the source of truth (the current setup, and what preserves the `CHECK` constraints and GiST indexes Prisma cannot model), or move fully to Prisma Migrate and express those another way.
-- Build the next milestone on top of route estimation: **fare calculation and ride requests**. Route estimation deliberately stops at distance, duration and geometry -- it has no notion of price, of a passenger, or of someone owning a request.
+- Build the next milestone on top of fare quoting: **ride requests**. That is where a quote gets accepted, where ownership and idempotency become meaningful, and where the stored `FareQuote` (rather than a recomputation) is what a request points at. Pooling, shared fares and payments come after that.
 - Consider time-dependent profiles *within* a journey (the current router picks one profile from the departure instant and applies it to the whole route), which needs per-second costs and a time-dependent router.
 - Authenticate the client: send the auth cookie from the Next.js app, then tighten `GET /api/users`, which is still public so the demo page keeps rendering. `POST /api/routes/estimate` already requires a session, so the client needs to carry the cookie before it can call it.
 - Add email verification and password reset. Sign-up currently accepts any address a caller supplies, so nobody proves they own the email they register with.

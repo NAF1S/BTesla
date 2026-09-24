@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { applyMigrations } from '../../src/db/migrations.js';
 import { disconnect, prisma } from '../../src/db/prisma.js';
 import { seedDemoAccounts } from '../../src/db/seeds/auth.seed.js';
+import { seedFarePolicies } from '../../src/db/seeds/fare.seed.js';
 import { seedLocationNetwork } from '../../src/db/seeds/location.seed.js';
 
 /**
@@ -61,6 +62,10 @@ export const runSeed = () =>
 export const runAuthSeed = () =>
   prisma.$transaction((tx) => seedDemoAccounts(tx), TRANSACTION_OPTIONS);
 
+/** Runs the fare-policy seeder in its own transaction and returns its summary. */
+export const runPricingSeed = () =>
+  prisma.$transaction((tx) => seedFarePolicies(tx), TRANSACTION_OPTIONS);
+
 /**
  * Applies server/db/*.sql (idempotent) and both seeds, so tests run against a
  * database that already holds the demo accounts, the service zones, the points
@@ -69,6 +74,7 @@ export const runAuthSeed = () =>
 export const prepareDatabase = async () => {
   await applyMigrations();
   await runAuthSeed();
+  await runPricingSeed();
   return runSeed();
 };
 
