@@ -4,6 +4,7 @@ import { env } from '../config/env.js';
 import { prisma } from '../db/prisma.js';
 import { requirePassengerProfileId } from '../middleware/auth.js';
 import { ApiError } from '../utils/ApiError.js';
+import { OFFER_STATUS } from './dispatch.rules.js';
 import {
   ACTIVE_RIDE_REQUEST_STATUSES,
   canTransition,
@@ -34,10 +35,11 @@ import {
  * same transition table, so a status change that somehow bypassed this module
  * would be refused rather than recorded silently.
  *
- * Implemented here: WAITING -> CANCELLED, WAITING -> EXPIRED.
- * Reserved (allowed by the database, unreachable from the API): WAITING ->
- * MATCHED, MATCHED -> IN_PROGRESS, MATCHED -> CANCELLED, IN_PROGRESS ->
- * COMPLETED. Matching and the trip itself belong to later milestones.
+ * Implemented here: WAITING -> MATCHED (by an accepted dispatch offer, in
+ * offer.service.js), WAITING -> CANCELLED and WAITING -> EXPIRED.
+ * Reserved (allowed by the database, unreachable from the API): MATCHED ->
+ * IN_PROGRESS, MATCHED -> CANCELLED, IN_PROGRESS -> COMPLETED. The trip itself
+ * belongs to a later milestone.
  *
  * ---------------------------------------------------------------------------
  * WHY THE CONSTRAINTS, NOT THE CHECKS, DECIDE RACES
@@ -69,7 +71,7 @@ const RIDE_REQUEST_INCLUDE = {
 };
 
 /** The scalar row every lifecycle step works with. No relations, by design. */
-const RIDE_REQUEST_SCALARS = {
+export const RIDE_REQUEST_SCALARS = {
   id: true,
   passengerProfileId: true,
   fareQuoteId: true,
@@ -128,7 +130,7 @@ const lockFareQuote = async (tx, fareQuoteId) => {
 };
 
 /** Locks one ride request for the rest of the transaction. */
-const lockRideRequest = async (tx, rideRequestId) => {
+export const lockRideRequest = async (tx, rideRequestId) => {
   await tx.$queryRawUnsafe(
     `SELECT id FROM ride_requests WHERE id = $1::uuid FOR UPDATE`,
     rideRequestId,
@@ -148,13 +150,53 @@ const nextEventSequence = async (tx, rideRequestId) => {
 };
 
 /**
+ * Appends one event to a request's history.
+ *
+ * Exported because the dispatch milestone writes to the same timeline: an offer,
+ * a refusal, an expiry and a match are all things that happened to the
+ * passenger's request, and they belong in the same ordered list as
+ * RIDE_REQUESTED. The caller must already hold the request's row lock -- that is
+ * what makes the sequence number race-free.
+ */
+export const appendRideEvent = async (
+  tx,
+  {
+    rideRequestId,
+    eventType,
+    actorType,
+    actorUserId = null,
+    previousStatus = null,
+    newStatus,
+    metadata = {},
+    now,
+  },
+) =>
+  tx.rideEvent.create({
+    data: {
+      rideRequestId,
+      sequence: await nextEventSequence(tx, rideRequestId),
+      eventType,
+      actorType,
+      actorUserId,
+      previousStatus,
+      newStatus,
+      metadata,
+      createdAt: now,
+    },
+  });
+
+/**
  * The one place a status changes.
  *
  * Writes the new status and appends the event that records it, inside the
  * caller's transaction, so "the status changed" and "history says why" are the
  * same commit -- there is no window in which one exists without the other.
+ *
+ * Exported because the dispatch milestone moves a request into MATCHED, and a
+ * second writer of `status` would be a second place for the transition table to
+ * be wrong.
  */
-const applyTransition = async (
+export const applyRideRequestTransition = async (
   tx,
   {
     request,
@@ -518,7 +560,7 @@ export const cancelRideRequest = async ({
       );
     }
 
-    const updated = await applyTransition(tx, {
+    const updated = await applyRideRequestTransition(tx, {
       request,
       toStatus: RIDE_REQUEST_STATUS.CANCELLED,
       eventType: RIDE_EVENT_TYPE.RIDE_CANCELLED,
@@ -529,6 +571,35 @@ export const cancelRideRequest = async ({
       cancelledAt: now,
       cancellationReason: reason,
     });
+
+    // Any driver still holding an offer for this ride is released in the same
+    // transaction, under the request's lock. Acceptance takes the same lock
+    // first, so it either wins outright or sees CANCELLED -- never both, and
+    // never a pool for a cancelled ride. The driver stays AVAILABLE: a refusal
+    // to be dispatched is a dispatcher decision, not a fault of theirs.
+    const openOffers = await tx.dispatchOffer.findMany({
+      where: { rideRequestId, status: OFFER_STATUS.PENDING },
+      select: { id: true, driverProfileId: true },
+    });
+
+    if (openOffers.length > 0) {
+      await tx.dispatchOffer.updateMany({
+        where: { id: { in: openOffers.map((offer) => offer.id) } },
+        data: { status: OFFER_STATUS.CANCELLED, respondedAt: now },
+      });
+
+      for (const offer of openOffers) {
+        await appendRideEvent(tx, {
+          rideRequestId,
+          eventType: RIDE_EVENT_TYPE.DRIVER_OFFER_CANCELLED,
+          actorType: RIDE_ACTOR_TYPE.SYSTEM,
+          previousStatus: RIDE_REQUEST_STATUS.WAITING,
+          newStatus: RIDE_REQUEST_STATUS.CANCELLED,
+          metadata: { offerId: offer.id },
+          now,
+        });
+      }
+    }
 
     return updated.id;
   });
@@ -557,7 +628,7 @@ const expireOne = async (rideRequestId, now) => {
       if (!request || request.status !== RIDE_REQUEST_STATUS.WAITING) return null;
       if (request.searchExpiresAt.getTime() > now.getTime()) return null;
 
-      return applyTransition(tx, {
+      return applyRideRequestTransition(tx, {
         request,
         toStatus: RIDE_REQUEST_STATUS.EXPIRED,
         eventType: RIDE_EVENT_TYPE.RIDE_EXPIRED,

@@ -1,5 +1,6 @@
 import { env } from '../config/env.js';
 import { currentUser } from '../middleware/auth.js';
+import * as dispatch from '../services/dispatch.service.js';
 import * as rides from '../services/ride-request.service.js';
 import * as dto from '../serializers/ride-request.serializer.js';
 import { CANCELLATION_REASONS, DEFAULT_CANCELLATION_REASON, RIDE_REQUEST_STATUSES } from '../services/ride.status.js';
@@ -58,6 +59,20 @@ export const createRideRequest = async (req, res) => {
     fareQuoteId,
     idempotencyKey,
   });
+
+  // Dispatch runs *after* the creation transaction has committed, so the
+  // passenger's response never waits on a routing search, and nothing that
+  // happens here can roll the request back: a request with no offer is still a
+  // valid request, and `npm run dispatch:sweep` -- or the next driver's refusal --
+  // will offer it. It is awaited rather than fired and forgotten so the caller
+  // learns whether the ride was offered, and so a test does not have to race it.
+  if (!replay) {
+    try {
+      await dispatch.dispatchWaitingRequest({ rideRequestId: request.id });
+    } catch (err) {
+      console.error(`[dispatch] could not offer ride request ${request.id}:`, err.message);
+    }
+  }
 
   // A retry returns the request the first call created; nothing new was made, so
   // it is a 200 rather than a second 201.

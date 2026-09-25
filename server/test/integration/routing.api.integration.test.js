@@ -1088,23 +1088,28 @@ describe('phase boundary', () => {
     assert.strictEqual(unauthenticated.status, 401);
   });
 
-  it('introduces no pool, matching, seat or payment table', async () => {
+  it('introduces no shared, seated or payment table', async () => {
     // The routing milestone also asserted that *pricing* was absent. The fare
     // milestone lifted that half deliberately, the ride-request milestone added
-    // the two tables below, and the pricing tables it adds are pinned by the
-    // suite below. What must still hold is that nothing pooled, matched, seated,
-    // assigned or paid exists.
+    // the ride tables, and the dispatch milestone added the pool tables. What
+    // must still hold is that nothing *shared*, seated, assigned or paid exists:
+    // every ride in this project is still one passenger, one request, one pool.
     const { rows } = await pool.query(
       `SELECT table_name FROM information_schema.tables
         WHERE table_schema = 'public'
-          AND table_name ~ '(ride|pool|payment|wallet|match|seat_reservation|driver_assignment)'
+          AND table_name ~ '(ride|pool|dispatch|payment|wallet|match|seat_reservation|driver_assignment|shared)'
         ORDER BY table_name`,
     );
 
-    assert.deepStrictEqual(
-      rows.map((row) => row.table_name),
-      ['ride_events', 'ride_requests'],
-    );
+    assert.deepStrictEqual(rows.map((row) => row.table_name), [
+      'dispatch_offers',
+      'pool_events',
+      'pool_members',
+      'pool_stops',
+      'ride_events',
+      'ride_pools',
+      'ride_requests',
+    ]);
   });
 
   it('has exactly the two pricing tables the fare milestone added', async () => {

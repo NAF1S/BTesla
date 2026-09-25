@@ -103,6 +103,54 @@ export const env = {
     /** Largest page a client may ask for, so a history read cannot be unbounded. */
     historyMaxPageSize: toNumber(process.env.RIDE_REQUEST_MAX_PAGE_SIZE, 100),
   },
+
+  // --- Dispatch and pools -----------------------------------------------
+  dispatch: {
+    /**
+     * How long a driver has to answer an offer. Deliberately short: an offer
+     * holds the passenger's request and the driver's single pending slot, so a
+     * long one strands both. 30 seconds keeps the demo flow snappy and the tests
+     * deterministic (they inject a clock rather than waiting).
+     */
+    offerTtlSeconds: toNumber(process.env.DISPATCH_OFFER_TTL_SECONDS, 30),
+    /**
+     * Stage 1 of the driver search: the PostGIS radius that decides who is worth
+     * routing. `maxRadiusMeters` is the ceiling a widened search may use.
+     */
+    shortlistRadiusMeters: toNumber(process.env.DISPATCH_SHORTLIST_RADIUS_METERS, 3000),
+    maxRadiusMeters: toNumber(process.env.DISPATCH_MAX_RADIUS_METERS, 8000),
+    /**
+     * Stage 2: a candidate whose routed approach is slower than this is not
+     * offered the ride, however close they looked on a map.
+     */
+    maxApproachDurationSeconds: toNumber(process.env.DISPATCH_MAX_APPROACH_SECONDS, 900),
+    /**
+     * How old `last_seen_at` may be before a driver stops being eligible. A
+     * driver who has not reported in is not somewhere we can promise.
+     */
+    locationFreshnessSeconds: toNumber(process.env.DISPATCH_LOCATION_FRESHNESS_SECONDS, 300),
+    /** Ceiling for the offer and acceptance transactions. */
+    transactionTimeoutMs: toNumber(process.env.DISPATCH_TRANSACTION_TIMEOUT_MS, 15_000),
+    /** Most candidates to route in one dispatch, so a search stays bounded. */
+    maxCandidates: toNumber(process.env.DISPATCH_MAX_CANDIDATES, 20),
+    /** Default page size for a driver's own offer list. */
+    listPageSize: toNumber(process.env.DISPATCH_OFFER_PAGE_SIZE, 20),
+    /** Windows the fairness terms are counted over. */
+    rejectionWindowSeconds: toNumber(process.env.DISPATCH_REJECTION_WINDOW_SECONDS, 900),
+    workloadWindowSeconds: toNumber(process.env.DISPATCH_WORKLOAD_WINDOW_SECONDS, 3600),
+    /**
+     * Scoring weights, all in seconds (see dispatch.rules.js). They are
+     * configuration rather than constants so dispatch can be tuned without
+     * touching the ranking logic -- and a test can set them to zero to isolate
+     * proximity.
+     */
+    scoring: {
+      rejectionPenaltySeconds: toNumber(process.env.DISPATCH_REJECTION_PENALTY_SECONDS, 60),
+      workloadPenaltySeconds: toNumber(process.env.DISPATCH_WORKLOAD_PENALTY_SECONDS, 30),
+      idleCreditPerMinuteSeconds: toNumber(process.env.DISPATCH_IDLE_CREDIT_PER_MINUTE_SECONDS, 5),
+      idleCreditMaxSeconds: toNumber(process.env.DISPATCH_IDLE_CREDIT_MAX_SECONDS, 180),
+    },
+  },
 };
 
 /**

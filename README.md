@@ -33,16 +33,16 @@ TeslaB/
 │   ├── src/
 │   │   ├── index.js        # HTTP server bootstrap + graceful shutdown
 │   │   ├── app.js          # Express app: middleware, routes, error handling
-│   │   ├── commands/       # Operational scripts (expire-ride-requests)
+│   │   ├── commands/       # Operational scripts (expire-ride-requests, dispatch-sweep)
 │   │   ├── config/env.js   # Environment configuration
 │   │   ├── db/             # Prisma client, health probe, migration runner, seeder
 │   │   │   ├── seeds/      # location + routing graph + pricing + demo accounts, idempotent
 │   │   │   └── seeds/graph-ids.js  # deterministic pgRouting identifiers (shared rule)
-│   │   ├── routes/         # Route definitions (index, health, auth, users, location, routes, fare-quotes, ride-requests)
+│   │   ├── routes/         # Route definitions (index, health, auth, users, location, routes, fare-quotes, ride-requests, drivers)
 │   │   ├── controllers/    # Request handlers
-│   │   ├── services/       # Business logic / queries (location, routing, fare, ride-request, ride.status)
+│   │   ├── services/       # Business logic / queries (location, routing, fare, ride-request, ride.status, driver, dispatch, offer, pool)
 │   │   ├── serializers/    # Record -> response DTO mappers
-│   │   ├── middleware/     # notFound, errorHandler, auth (requireAuth, requireRole, requirePassengerProfileId)
+│   │   ├── middleware/     # notFound, errorHandler, auth (requireAuth, requireRole, requirePassengerProfileId, requireDriverProfileId)
 │   │   └── utils/          # ApiError, validation, geo, time, password, token, cookies
 │   ├── test/               # node --test suites (unit + integration)
 │   └── .env.example
@@ -87,6 +87,7 @@ The container runs `server/db/*.sql` automatically the first time its volume is 
 | `npm run db:migrate` | Apply `server/db/*.sql` to the database      |
 | `npm run db:seed`    | Apply the location + routing graph + demo account seed (idempotent) |
 | `npm run ride-requests:expire --workspace server` | Expire ride requests whose search window has closed (the operation a scheduler would run) |
+| `npm run dispatch:sweep --workspace server` | Expire overdue dispatch offers and re-offer waiting requests (the dispatch scheduler) |
 | `npm run db:psql`    | Open a psql shell in the container              |
 | `npm run db:logs`    | Follow the Postgres logs                        |
 | `npm test`           | API unit + integration tests (needs the database) |
@@ -154,7 +155,7 @@ npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prism
 An empty migration is the ideal result. Three things will show up as intended differences, and none is drift to "fix":
 
 1. the GiST spatial indexes, which Prisma cannot express on an `Unsupported` column, so it always proposes dropping them;
-2. `ride_requests_passenger_requested_at_idx`, which is declared `(passenger_profile_id, requested_at DESC)` -- Prisma can express the columns but not the sort direction, so it proposes recreating the same index without `DESC`. The index Prisma cannot see at all is `one_active_ride_request_per_passenger`, the partial unique index behind the one-active-request rule: Prisma does not model `WHERE` clauses on indexes, which is the second reason migrations stay hand-written;
+2. `ride_requests_passenger_requested_at_idx`, `dispatch_offers_request_idx` and `dispatch_offers_driver_offered_at_idx`, which are declared with a `DESC` sort (a passenger's history, and a request's or driver's offers, are read newest first). Prisma can express the columns but not the sort direction, so it proposes recreating each index without `DESC`. The indexes Prisma cannot see at all are the four **partial unique** ones -- `one_active_ride_request_per_passenger`, `one_pending_initial_offer_per_request`, `one_pending_initial_offer_per_driver` and `one_active_pool_per_driver` -- because Prisma does not model `WHERE` clauses on indexes. Those four are what decide this project's races, which is the second reason migrations stay hand-written;
 3. any leftover object from a database that predates the current migration files -- for example a table created by a migration that has since been removed. The database in this workspace has some of these from an earlier, abandoned branch; `npm run db:reset` gives a clean database built only from the files in `server/db`.
 
 Like `pg_typeof()`, a few PostgreSQL internals cannot be read through Prisma raw queries; cast them (`pg_typeof(x)::text`) when you need them.
@@ -215,6 +216,15 @@ Base URL: `http://localhost:4000/api`
 | `GET`  | `/ride-requests/my`        | The caller's own ride requests, newest first, paged (**PASSENGER only**) |
 | `GET`  | `/ride-requests/:id`       | One of the caller's own ride requests (**PASSENGER only**) |
 | `POST` | `/ride-requests/:id/cancel`| Cancel a request that is still waiting (**PASSENGER only**) |
+| `GET`  | `/drivers/me/availability` | The driver's own availability (**DRIVER only**) -- see [Driver dispatch and pools](#driver-dispatch-and-pools) |
+| `POST` | `/drivers/me/online`       | Go online at a service point (**DRIVER only**) |
+| `POST` | `/drivers/me/offline`      | Go offline (**DRIVER only**) |
+| `PUT`  | `/drivers/me/current-service-point` | Move to another service point (**DRIVER only**) |
+| `GET`  | `/drivers/me/offers`       | The driver's own dispatch offers (**DRIVER only**) |
+| `GET`  | `/drivers/me/offers/:offerId` | One of the driver's own offers (**DRIVER only**) |
+| `POST` | `/drivers/me/offers/:offerId/accept` | Accept an offer; creates the pool (**DRIVER only**) |
+| `POST` | `/drivers/me/offers/:offerId/reject` | Refuse an offer (**DRIVER only**) |
+| `GET`  | `/drivers/me/pool`         | The pool the driver is committed to (**DRIVER only**) |
 
 The location endpoints are read-only and return DTOs (`server/src/serializers/location.serializer.js`) instead of raw rows, so database column names, routing vertices and audit timestamps never leak into responses. `/location` is only ever about places: there is deliberately no route, distance, ETA, quote or fare endpoint under it, and none should be added. Route estimation lives at `/routes/estimate` instead.
 
@@ -441,7 +451,7 @@ npm run test:integration --workspace server
 
 ### What is deliberately deferred
 
-This phase stores and validates a graph, and the milestones since calculate routes over it and price them. What is deliberately **not** implemented is everything after a price: ride requests, ride events, passenger ownership, request idempotency, pools, pool membership, shared or discounted fares, ride matching, seat reservation, driver assignment, payments, wallets, demand-based surge pricing and live traffic. See [Routing](#routing) and [Fare quotes](#fare-quotes).
+This phase stores and validates a graph, and the milestones since calculate routes over it, price them, take ride requests and dispatch them to a driver. What is deliberately **not** implemented is everything after a match: adding a second passenger to an existing pool, shared or discounted fares, detours and route insertion, trip operations (arrival, pickup, drop-off, completion), live GPS, payments, wallets, notifications and demand-based surge pricing. See [Routing](#routing), [Fare quotes](#fare-quotes), [Ride requests](#ride-requests) and [Driver dispatch and pools](#driver-dispatch-and-pools).
 
 ## Routing
 
@@ -837,7 +847,7 @@ The fare tests are explicit about the parts that are easy to get quietly wrong: 
 
 ### What is deliberately not here
 
-Fare quoting stops at a price. There is **no** ride request, ride event, pool, pool member, shared fare, pooling discount, ride matching, seat reservation, driver assignment, payment, wallet or demand-based surge pricing -- and no external pricing or routing API. The fare is a **solo** fare: one journey, one passenger, one price.
+Fare quoting stops at a price. There is **no** shared fare, pooling discount, seat reservation, payment, wallet, demand-based surge pricing or external pricing API -- and no external routing API. The fare is a **solo** fare: one journey, one passenger, one price. A pool carries one member in the current milestone, so "shared" has no meaning yet, and nothing in this section prices one.
 
 A quote **is** owned by the passenger who asked for it -- ownership arrived with the ride-request milestone, which is what stops one passenger accepting another passenger's quote. The ride request that accepts it is the next section.
 
@@ -886,7 +896,7 @@ stateDiagram-v2
     EXPIRED --> [*]
 ```
 
-**Implemented in this milestone:** `WAITING -> CANCELLED` and `WAITING -> EXPIRED`. **Reserved:** the matching and trip transitions. The database trigger already allows every transition in the diagram, so the matching milestone needs no migration -- but nothing in the API can reach a reserved one, and `IMPLEMENTED_TRANSITIONS` in `server/src/services/ride.status.js` is what says so. Terminal statuses are terminal: they have no outgoing transition at all, reserved or otherwise.
+**Implemented in this milestone:** `WAITING -> CANCELLED`, `WAITING -> EXPIRED` and `WAITING -> MATCHED`, which a driver accepting a dispatch offer performs (see [Driver dispatch and pools](#driver-dispatch-and-pools)). **Reserved:** the trip transitions. The database trigger already allows every transition in the diagram, so the trip milestone needs no migration -- but nothing in the API can reach a reserved one, and `IMPLEMENTED_TRANSITIONS` in `server/src/services/ride.status.js` is what says so. Terminal statuses are terminal: they have no outgoing transition at all, reserved or otherwise.
 
 The rules live in one place, `server/src/services/ride.status.js`, with no database access, and three things share them: the service, the `enforce_ride_request_update()` trigger in `08-ride-requests.sql`, and the tests.
 
@@ -903,7 +913,7 @@ Every lifecycle step appends a `ride_events` row in the same transaction as the 
 | Column | Meaning |
 | ------ | ------- |
 | `sequence` | 1, 2, 3... per request, unique per request, taken under the request's row lock |
-| `event_type` | `RIDE_REQUESTED`, `RIDE_CANCELLED`, `RIDE_EXPIRED`, plus reserved matching/trip events |
+| `event_type` | `RIDE_REQUESTED`, `RIDE_CANCELLED`, `RIDE_EXPIRED`, `DRIVER_OFFERED`, `DRIVER_REJECTED`, `DRIVER_OFFER_EXPIRED`, `DRIVER_OFFER_CANCELLED`, `DRIVER_ACCEPTED`, `PASSENGER_MATCHED` (the match), plus reserved trip events |
 | `actor_type` / `actor_user_id` | `PASSENGER`, `SYSTEM` or `ADMIN`; null for a `SYSTEM` event, and `SET NULL` if the account is later deleted |
 | `previous_status` / `new_status` | What the request moved from and to -- null `previous_status` for creation |
 | `metadata` | A JSON object: the quote id on creation, the reason on cancellation, the deadline on expiry. Never a person, a token or client free text |
@@ -957,7 +967,7 @@ npm run ride-requests:expire --workspace server
 
 ### Cancelling
 
-`POST /api/ride-requests/:id/cancel` cancels a **WAITING** request only -- cancelling a matched ride means releasing a pool, which is the matching milestone's problem. The body is optional:
+`POST /api/ride-requests/:id/cancel` cancels a **WAITING** request only -- cancelling a matched ride means releasing a pool, which needs the trip milestone. The body is optional:
 
 | Field | Required | Notes |
 | ----- | -------- | ----- |
@@ -1036,9 +1046,246 @@ npm run test:integration --workspace server          # the endpoints, the constr
 
 ### What is deliberately not here
 
-There is **no** pool, `PoolMember`, `PoolStop`, ride matching, driver acceptance or assignment, shared fare, pooling discount, seat reservation, payment, wallet, live tracking or notification -- and no endpoint that changes a status other than cancellation and expiry. `MATCHED`, `IN_PROGRESS` and `COMPLETED` are defined, enforced and tested at the database level so the next milestone needs no migration, but nothing in this API can move a request into them. The `MATCHED -> CANCELLED` and trip transitions are likewise reserved rather than implemented.
+There is **no** shared fare, pooling discount, seat reservation, payment, wallet, live tracking or notification -- and no endpoint that changes a status other than cancellation and expiry, apart from the match a driver's acceptance performs. `IN_PROGRESS` and `COMPLETED` are defined, enforced and tested at the database level so the trip milestone needs no migration, but nothing in this API can move a request into them, and the `MATCHED -> CANCELLED` and trip transitions are reserved rather than implemented.
 
-One consequence worth stating plainly: because `ride_requests.fare_quote_id` is `ON DELETE RESTRICT`, deleting a passenger profile that still has requests is refused by the database. Nothing in the application deletes either, and a future erasure path has to delete requests before profiles.
+A `WAITING` request with a pending dispatch offer is cancelled together with that offer, in one transaction -- see [Passenger cancellation](#passenger-cancellation).
+
+One consequence worth stating plainly: because `ride_requests.fare_quote_id` is `ON DELETE RESTRICT`, deleting a passenger profile that still has requests is refused by the database. Nothing in the application deletes either, and a future erasure path has to delete requests before profiles. A matched request is `RESTRICT`ed by its pool member in the same way.
+
+
+## Driver dispatch and pools
+
+A waiting ride request is offered to one driver at a time, and the driver who accepts it gets a pool.
+
+```
+Passenger creates a WAITING RideRequest
+  -> the dispatcher shortlists nearby AVAILABLE drivers (PostGIS)
+  -> and routes each one to the pickup (pgRouting)
+  -> the best candidate gets a DispatchOffer that expires
+  -> the driver accepts  ->  RidePool + PoolMember + 2 PoolStops, request MATCHED, driver RESERVED
+  -> or refuses        ->  the request stays WAITING and the next driver is offered it
+  -> or never answers  ->  the offer expires and the next driver is offered it
+```
+
+```bash
+# The driver reports where they are and goes online.
+curl -i -X POST http://localhost:4000/api/drivers/me/online \
+  -H 'Content-Type: application/json' -b driver-cookies.txt \
+  -d '{"currentServicePointCode":"banani-kakoli"}'
+
+# What they can see and answer.
+curl -s -b driver-cookies.txt http://localhost:4000/api/drivers/me/offers
+curl -i -X POST http://localhost:4000/api/drivers/me/offers/<offerId>/accept -b driver-cookies.txt
+curl -i -X POST http://localhost:4000/api/drivers/me/offers/<offerId>/reject \
+  -H 'Content-Type: application/json' -b driver-cookies.txt -d '{"reason":"TOO_FAR"}'
+
+# The dispatcher, for a scheduler to run.
+npm run dispatch:sweep --workspace server
+```
+
+### Driver availability
+
+One field is authoritative: `driver_profiles.status`. It already existed as `OFFLINE | AVAILABLE | ON_RIDE`; this milestone adds `RESERVED` rather than a second, competing availability column.
+
+| Status | Meaning | Dispatched to? |
+| ------ | ------- | -------------- |
+| `OFFLINE` | Not accepting offers | no |
+| `AVAILABLE` | May receive an initial ride offer | **yes** |
+| `RESERVED` | Accepted a pool; the trip has not started | no |
+| `ON_RIDE` | Operating a trip (a later milestone) | no |
+
+Alongside it, `driver_profiles` records the dispatcher's inputs: `current_service_point_id` (nullable while offline), `available_since`, `last_seen_at`, and `active_vehicle_id`.
+
+| Endpoint | What it does |
+| -------- | ------------ |
+| `GET /api/drivers/me/availability` | The driver's own state, plus the vehicles they may choose from |
+| `POST /api/drivers/me/online` | `{ currentServicePointCode, vehicleId? }` - becomes `AVAILABLE` at that point |
+| `POST /api/drivers/me/offline` | Becomes `OFFLINE`; idempotent |
+| `PUT /api/drivers/me/current-service-point` | `{ currentServicePointCode }` - moves, and refreshes `last_seen_at` |
+| `GET /api/drivers/me/offers` | The driver's own offers (pending by default, `?status=ALL` for history) |
+| `GET /api/drivers/me/offers/:offerId` | One offer, if it is theirs |
+| `POST /api/drivers/me/offers/:offerId/accept` | Accept, and create the pool |
+| `POST /api/drivers/me/offers/:offerId/reject` | `{ reason? }` from `TOO_FAR`, `UNAVAILABLE`, `VEHICLE_ISSUE`, `OTHER` |
+| `GET /api/drivers/me/pool` | The pool they are committed to, or null |
+
+Going online requires all four of: an active driver profile, an active vehicle **with positive capacity**, an active service point, and a status that may become available. A driver with several usable vehicles must say which one (`vehicleId`), and one is never picked for them; if they went online before, the vehicle they used is reused. A vehicle belonging to somebody else is a `404`.
+
+Going offline is idempotent, because a retried "go offline" that already succeeded is not an error. A `RESERVED` or `ON_RIDE` driver cannot go offline or move through these endpoints at all -- they are committed to a passenger, and releasing that is an operator decision, not a device one.
+
+A database `CHECK` (`driver_profiles_available_has_location`) makes `AVAILABLE` impossible without a point and an `available_since`, so a half-available driver cannot exist.
+
+### The current ServicePoint model
+
+For this MVP the driver reports which **seeded service point** they are nearest. There is no continuous GPS, no coordinate column on the driver, and no interpolation: the dispatcher needs to know which place to route from, and a service point is a place the router already knows.
+
+`last_seen_at` is refreshed when a driver goes online, moves, reads their offers, or answers one -- the moments we learn they are still there. A location older than `DISPATCH_LOCATION_FRESHNESS_SECONDS` (default 300 s) makes the driver **ineligible**, because a location we cannot trust is not one we can promise a passenger.
+
+### Driver relevance
+
+A driver is a candidate only when **all** of these hold. The first group is answered in SQL, in one query, so the candidate list *is* the eligible list; the last one needs the router and is stage 2.
+
+- the user is an active `DRIVER` with an active `DriverProfile`;
+- availability is `AVAILABLE`;
+- `current_service_point_id` is set and that point is active;
+- `last_seen_at` is inside the freshness window;
+- `active_vehicle_id` is set, and that vehicle is active with capacity > 0;
+- the driver has no active `RidePool` (`FORMING`, `DRIVER_EN_ROUTE`, `ARRIVED`, `IN_PROGRESS`);
+- the driver has no other `PENDING` initial offer;
+- the driver has not already had this request and failed to take it -- a refusal **or** an unanswered offer that expired;
+- the shortlist radius reaches them, and the routed approach is inside the maximum.
+
+### Two-stage search
+
+**Stage 1 - spatial shortlist.** `ST_DWithin(driver_point.location, pickup.location, radius)` on the geography columns, with `DISPATCH_SHORTLIST_RADIUS_METERS` (default 3000 m) and a ceiling of `DISPATCH_MAX_RADIUS_METERS` (8000 m) for a widened search. At most `DISPATCH_MAX_CANDIDATES` (20) drivers are shortlisted, nearest first. The GiST index on `service_points.location` is the access path.
+
+**Stage 2 - routing validation.** Every shortlisted driver is routed from their current point to the pickup. A driver the router cannot reach is dropped -- and so is one whose `approachDurationSeconds` exceeds `DISPATCH_MAX_APPROACH_SECONDS` (default 900 s). A driver already standing at the pickup is the shortest possible approach: distance and duration are `0`, and the offer says so.
+
+The seeded graph shows why both stages are needed. Gulshan 2 Circle is 1068 m from the Banani Road 11 pickup in a straight line but **3120 m and 802 s** by road; Banani Kakoli is 445 m / 114 s; Mirpur-10 is 3911 m straight-line and 7097 m / 1825 s by road. Proximity decides who is worth routing; the router decides who is near.
+
+### Scoring and tie-breaking
+
+The offer goes to the single best candidate, ranked by a deterministic score in **seconds**:
+
+```text
+score = approachDurationSeconds
+      + rejectionPenaltySeconds    x refusals in the last rejectionWindow
+      + workloadPenaltySeconds     x acceptances in the last workloadWindow
+      - min(idleCreditMaxSeconds, floor(idleSeconds / 60) x idleCreditPerMinuteSeconds)
+      (never below 0)
+```
+
+It reads as "this many seconds away, adjusted for how this driver has behaved and how long they have been waiting". Every weight is configuration (`DISPATCH_*` in `.env.example`), all in seconds, so dispatch can be tuned without touching the ranking logic -- and a test can zero the penalties to isolate proximity. The idle credit is **capped** so a driver idle for a week cannot outrank one who is two minutes away: fairness nudges the choice, it does not override proximity. The straight-line distance the shortlist used is deliberately not in the score.
+
+Ties break, in order: **lowest score**, then **longest idle** (earliest `available_since`), then **driver profile id**. The third key is what makes dispatch reproducible -- the same situation always produces the same offer -- and it is unit-tested on the same set in both orders.
+
+Candidate scores are stored on the offer (`score`) so a decision can be explained afterwards, and are **never** returned to the driver.
+
+### Sequential offers
+
+One request is offered to **one** driver at a time. Two partial unique indexes make that a database fact rather than a service convention:
+
+```sql
+CREATE UNIQUE INDEX one_pending_initial_offer_per_request
+  ON dispatch_offers (ride_request_id)  WHERE status = 'PENDING' AND offer_type = 'INITIAL_RIDE';
+CREATE UNIQUE INDEX one_pending_initial_offer_per_driver
+  ON dispatch_offers (driver_profile_id) WHERE status = 'PENDING' AND offer_type = 'INITIAL_RIDE';
+```
+
+The first is why a request cannot be shopped to several drivers at once; the second is why one driver cannot be considering two passengers. `ADD_PASSENGER` exists as an offer type so the pooling milestone does not have to alter an enum in use, but this milestone creates `INITIAL_RIDE` offers and nothing else.
+
+### Dispatch triggering
+
+After `POST /api/ride-requests` commits, the controller calls `dispatchWaitingRequest` **outside** that transaction and swallows any failure: a request with no offer is still a valid request, and dispatch never gets to fail a passenger's ride. Awaiting it (rather than firing and forgetting) means the caller learns whether the ride was offered, and a test does not have to race it.
+
+Dispatch is **idempotent**: a request that is not `WAITING`, already has a pending offer, already has a pool member, or whose search window has closed is *skipped*, not failed. Running it three times, or twice at once, produces one offer and one controlled skip.
+
+Nothing keeps a promise that dispatch always runs, so `npm run dispatch:sweep --workspace server` is the operation that makes dispatch *eventually* correct as well as immediately correct: it expires overdue offers, re-offers the requests that lost one, and picks up requests that are waiting with nobody looking at them. Both sweeps are safe to run concurrently.
+
+### Offer expiration
+
+An offer lives for `DISPATCH_OFFER_TTL_SECONDS` (default **30**), stored as `expires_at = offered_at + ttl` on the row; a `CHECK` refuses a window that is not positive. There is no timer in the API process -- expiry is an operation, and `now` is injectable, which is what makes it testable without waiting.
+
+Expiring an offer, in one transaction: lock the ride request, lock the offer, re-check that it is still `PENDING` and past its deadline, move it to `EXPIRED` with a `responded_at`, and append a `DRIVER_OFFER_EXPIRED` event. After the commit the request is offered to the next best driver. Answering an offer that has already expired is a `409`, and the answer *records the expiry* rather than pretending the driver refused -- two different facts, and the passenger's timeline should say which happened.
+
+### Rejecting
+
+A refusal ends the offer and nothing else. In one transaction: confirm it is this driver's `PENDING`, unexpired offer, set `REJECTED` with `respondedAt` and the normalised reason, and append a `DRIVER_REJECTED` event. It must **not** cancel the request, move it off `WAITING`, create a pool or reserve the driver -- and the tests assert each of those. After the commit the request goes to the next eligible driver.
+
+`CANCELLED` never carries a reason and `REJECTED` always does (`dispatch_offers_response_consistent`), so a refusal with no reason is refused by the database, not quietly stored.
+
+### The pool
+
+| Table | What it holds |
+| ----- | ------------- |
+| `ride_pools` | One driver, one vehicle, one active trip. `status`, `capacitySnapshot`, `plannedRouteGeometry`, `plannedDistanceMeters`, `plannedDurationSeconds`, `version`, and the lifecycle timestamps |
+| `pool_members` | One passenger. `rideRequestId` is **UNIQUE**: a request can join at most one pool. No contact data is copied |
+| `pool_stops` | The ordered plan. `sequence` unique per pool, `(member, stop_type)` unique: exactly one pickup and one drop-off per member |
+| `pool_events` | Append-only history, numbered per pool, like `ride_events` |
+
+```mermaid
+erDiagram
+    RidePool ||--o{ PoolMember : "has"
+    RidePool ||--o{ PoolStop : "orders"
+    RidePool ||--o{ PoolEvent : "records"
+    PoolMember ||--|| RideRequest : "is the same journey as"
+    PoolMember ||--o{ PoolStop : "has"
+    ServicePoint ||--o{ PoolStop : "is where"
+    DriverProfile ||--o{ RidePool : "drives"
+    Vehicle ||--o{ RidePool : "is driven"
+```
+
+Pool statuses are `FORMING | DRIVER_EN_ROUTE | ARRIVED | IN_PROGRESS | COMPLETED | CANCELLED`; this milestone creates only `FORMING`. A fourth partial unique index covers all four active statuses, so the trip milestones inherit the one-pool-per-driver rule without another migration:
+
+```sql
+CREATE UNIQUE INDEX one_active_pool_per_driver
+  ON ride_pools (driver_profile_id)
+  WHERE status IN ('FORMING', 'DRIVER_EN_ROUTE', 'ARRIVED', 'IN_PROGRESS');
+```
+
+`capacitySnapshot` is a **copy** of the accepted vehicle's capacity, so a later capacity change cannot rewrite the pool that was planned with it. The plan comes from the quote the passenger accepted -- `planned_route_geometry` is the stored `routeSnapshot.geometry`, written through parameterised SQL because Prisma has no PostGIS types. `version` is there so a later milestone can add optimistic concurrency without a migration.
+
+A trigger (`enforce_pool_stop_consistency`) refuses a stop that is not the request's own pickup or destination, a stop whose member belongs to another pool or request, and a drop-off placed before its pickup -- none of which a `CHECK` can express, because each reads other rows.
+
+### The acceptance transaction
+
+Acceptance is the largest write in the project, and it is **one transaction**: a half-matched ride cannot exist. In order:
+
+1. lock the ride request, then the offer (that lock order is load-bearing -- see below);
+2. confirm the offer is this driver's, `PENDING` and unexpired, expiring it and reporting `409` if it is not;
+3. confirm the request is still `WAITING` and has no pool member;
+4. lock the driver profile, and confirm they are still `AVAILABLE`, their point is still active, and it is still **the point the approach was measured from**;
+5. lock the vehicle, and confirm it is active with capacity, and still the vehicle that was offered;
+6. confirm the driver has no other active pool;
+7. create the pool (`FORMING`, capacity copied by snapshot) and write the planned route geometry;
+8. create the member (`ASSIGNED`) and the two stops -- sequence 1 the pickup at the request's pickup point, sequence 2 the drop-off at its destination, with planned arrivals derived from the approach and the passenger's own journey;
+9. move the request `WAITING -> MATCHED` (through the one function allowed to change a ride request's status) and append `PASSENGER_MATCHED`;
+10. move the driver to `RESERVED` and clear `available_since`;
+11. mark the offer `ACCEPTED` with `respondedAt` and `ridePoolId`;
+12. append `DRIVER_ACCEPTED` and the three pool events, then commit.
+
+The route is **not** recomputed. Re-routing inside the transaction would add a pgRouting call to the critical section, and the passenger already agreed to the journey in the quote the request froze -- so acceptance verifies the driver has not moved away from the point the approach came from, and otherwise reuses it.
+
+### Concurrency protections
+
+Application checks alone cannot decide a race, so every rule that two writers could break is also a constraint. The services check too, for good error messages.
+
+| Race | What settles it |
+| ---- | --------------- |
+| Two drivers accepting one request | the request's row lock plus `pool_members.ride_request_id` UNIQUE |
+| One driver accepting two offers | `driver_profiles` row lock plus `one_active_pool_per_driver` |
+| One driver offered two rides | `one_pending_initial_offer_per_driver` |
+| One request offered twice | `one_pending_initial_offer_per_request` |
+| Accepting after expiry | the offer is re-read under its lock and the deadline re-checked |
+| Acceptance vs passenger cancellation | the ride request's row lock, taken **first** by both |
+| Acceptance vs vehicle deactivation | the vehicle's row lock, re-read before the pool is written |
+| Duplicate members, stop sequences | `UNIQUE (ride_request_id)`, `UNIQUE (ride_pool_id, sequence)`, `UNIQUE (pool_member_id, stop_type)` |
+| Answering a refused offer | a terminal offer is final (trigger) |
+
+**The lock order is the design.** Every path that touches both a ride request and its offers takes the *ride request's* lock first and the offer's second. Acceptance and cancellation both want the same two rows, so they must want them in the same order; whoever gets the request first decides the outcome, and the other one sees it. Without that rule, `accept` (offer then request) and `cancel` (request then offer) would deadlock.
+
+The concurrency tests assert an invariant rather than a winner: after a cancellation racing an acceptance, the request is either `MATCHED` with exactly one pool, member and two stops, or `CANCELLED` with none of them -- and whichever it is, no offer is left `PENDING` for a driver to act on.
+
+### Passenger cancellation
+
+Cancelling a `WAITING` request with a pending offer cancels the offer **in the same transaction**, under the request's row lock, and appends `DRIVER_OFFER_CANCELLED`. The driver stays `AVAILABLE`: a ride that went away is not their fault. Because acceptance takes the same lock first, it either wins outright or sees `CANCELLED` -- never both, and never a pool for a cancelled ride.
+
+### Commands
+
+```bash
+npm run db:migrate                                 # applies 09-driver-dispatch.sql (idempotent)
+npm run dispatch:sweep --workspace server           # expire offers, re-offer waiting requests
+npm test                                            # unit + integration
+npm run test:unit --workspace server                # rules and serializers, no database
+npm run test:integration --workspace server         # availability, dispatch, pools, constraints, races
+```
+
+The dispatch tests are explicit about the parts that are easy to get quietly wrong: that only an `AVAILABLE` driver with a usable vehicle, a fresh location and an active point is considered; that the spatial radius is a shortlist and the routed approach is the answer; that an unreachable driver is excluded even when they are the nearest on the map; that ordering is reproducible; that a request gets one offer and a driver holds one; that a refusal or an expiry leaves the request `WAITING` and passes it on without ever going back to the driver who did not take it; that acceptance produces exactly one pool, one member, two ordered stops, the status changes and both timelines; that every guard at acceptance time rolls the whole thing back; and that the races resolve one way or the other but never both.
+
+### What is deliberately not here
+
+There is **no** search for an existing pool to join, no `ADD_PASSENGER` offer, no shared matching, no pickup or drop-off insertion, no detour or route re-planning, no shared fare or pooling discount, and no trip operations at all -- no driver arrival, trip start, passenger pickup, drop-off or completion. No live GPS, no WebSockets and no notifications. A pool therefore has exactly one member and two stops, and `version` is never incremented. Each of those is the next milestone, and the schema, the enums and the constraints are already shaped for it: `ride_pool_status` and `pool_stop_status` carry the states, `driver_status.RESERVED` exists, and the active-pool index already covers the trip.
+
+Two operational notes: the sweep is a command nobody calls yet, so an expired offer is cleaned up when something runs it; and because `dispatch_offers.vehicle_id` and `ride_pools.vehicle_id` are `ON DELETE RESTRICT`, a vehicle that appears in dispatch history cannot be deleted while that history exists.
 
 
 ## Tests
@@ -1051,13 +1298,16 @@ npm run test:integration --workspace server
 
 Tests use Node's built-in runner (`node --test`) — no extra dependencies. The integration suites run against the real PostgreSQL database from `DATABASE_URL`, apply `server/db/*.sql` and the seed themselves, and clean up after themselves; the database must be reachable (`npm run db:up`). Constraint tests run inside rolled-back transactions.
 
-Coverage highlights: the PostGIS extension and the real spatial column types; the GiST spatial indexes; that coordinates are stored longitude-first; `ST_DWithin` proximity answering in metres with a distant point correctly excluded; the seed totals, per-zone point counts, correct zone membership and idempotency; the coordinate bounds; and -- for the graph -- no isolated vertex, one weakly connected component, every zone linked to another, edge endpoints aligned with their vertices, edge distance matching `ST_Length`, and the direction / duration / fare-weight invariants. It also asserts that the superseded `/api/transport/*` endpoints are gone, and that `/api/location/*` still exposes no routing of its own. Routing, pricing and ride requests are covered by their own suites -- see [Routing](#routing), [Fare quotes](#fare-quotes) and [Ride requests](#ride-requests) for the lists.
+Coverage highlights: the PostGIS extension and the real spatial column types; the GiST spatial indexes; that coordinates are stored longitude-first; `ST_DWithin` proximity answering in metres with a distant point correctly excluded; the seed totals, per-zone point counts, correct zone membership and idempotency; the coordinate bounds; and -- for the graph -- no isolated vertex, one weakly connected component, every zone linked to another, edge endpoints aligned with their vertices, edge distance matching `ST_Length`, and the direction / duration / fare-weight invariants. It also asserts that the superseded `/api/transport/*` endpoints are gone, and that `/api/location/*` still exposes no routing of its own. Routing, pricing, ride requests and dispatch are covered by their own suites -- see [Routing](#routing), [Fare quotes](#fare-quotes), [Ride requests](#ride-requests) and [Driver dispatch and pools](#driver-dispatch-and-pools) for the lists.
+
+Each milestone's suite also pins the boundary of the next one: the fare suite asserts which tables exist and that nothing shared, seated or paid does, and the dispatch suite asserts that no pool search, no `ADD_PASSENGER` offer and no trip operation is reachable.
 
 ## Next steps
 
 - Decide how schema changes are reviewed now that Prisma is in place: keep the idempotent `server/db/*.sql` files as the source of truth (the current setup, and what preserves the `CHECK` constraints, the partial unique index and the GiST indexes Prisma cannot model), or move fully to Prisma Migrate and express those another way.
-- Build the next milestone on top of ride requests: **pooling and matching**. A group of waiting requests becomes a `RidePool`, its members and its ordered stops, and `WAITING -> MATCHED -> IN_PROGRESS -> COMPLETED` becomes reachable. The status enum, the transition table, the events and the one-active-request rule are already in place for it, so that milestone adds tables and operations rather than reworking this one.
-- Run the expiration sweep on a schedule. `npm run ride-requests:expire --workspace server` is the operation; nothing calls it yet, so a request currently expires when someone runs it.
+- Build the next milestone on top of pools: **shared matching**. A second waiting request joins an existing pool as a new member with its own two stops, and the plan is re-ordered with the detour that costs least. `ADD_PASSENGER` already exists as an offer type, `ride_pool_status` and `pool_stop_status` already carry the states, `version` is there for optimistic concurrency, and `one_active_pool_per_driver` already covers an in-progress trip -- so that milestone adds operations rather than reworking the schema.
+- Add the trip: driver arrival, trip start, passenger pickup and drop-off, trip completion. The transitions (`MATCHED -> IN_PROGRESS -> COMPLETED`, `ASSIGNED -> PICKED_UP -> DROPPED_OFF`) and the events are defined and enforced already; what is missing is the endpoints and the rules about who may call them.
+- Run the sweeps on a schedule. `npm run ride-requests:expire --workspace server` and `npm run dispatch:sweep --workspace server` are the operations; nothing calls them yet, so requests and offers are cleaned up when someone runs them.
 - Consider time-dependent profiles *within* a journey (the current router picks one profile from the departure instant and applies it to the whole route), which needs per-second costs and a time-dependent router.
 - Authenticate the client: send the auth cookie from the Next.js app, then tighten `GET /api/users`, which is still public so the demo page keeps rendering. `POST /api/routes/estimate` already requires a session, so the client needs to carry the cookie before it can call it.
 - Add email verification and password reset. Sign-up currently accepts any address a caller supplies, so nobody proves they own the email they register with.

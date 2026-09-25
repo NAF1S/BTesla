@@ -76,3 +76,26 @@ export const requirePassengerProfileId = (user) => {
 
   return passengerProfileId;
 };
+
+/**
+ * The authenticated driver's own DriverProfile id.
+ *
+ * The driver equivalent of `requirePassengerProfileId`, and the same rule: the
+ * value comes from the database record `requireAuth` loaded, so there is no
+ * request field anywhere that names a driver. A driver can therefore only ever
+ * change their own availability, and the "which driver?" question has exactly
+ * one answer -- the one who is authenticated.
+ */
+export const requireDriverProfileId = (user) => {
+  if (!user) throw new ApiError(401, UNAUTHENTICATED);
+  if (user.role !== Role.DRIVER) {
+    throw new ApiError(403, 'Only a driver can manage driver availability');
+  }
+
+  const driverProfileId = user.driverProfile?.id;
+  if (!driverProfileId) {
+    throw new ApiError(403, 'A driver profile is required to go online');
+  }
+
+  return driverProfileId;
+};

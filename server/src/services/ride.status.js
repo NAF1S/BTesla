@@ -21,13 +21,13 @@ import { createHash } from 'node:crypto';
  * ---------------------------------------------------------------------------
  * Implemented in this phase:
  *
+ *     WAITING -> MATCHED            (a driver accepted a dispatch offer)
  *     WAITING -> CANCELLED
  *     WAITING -> EXPIRED
  *
  * Reserved for later milestones (allowed by the database trigger, unreachable
  * from the API because no operation performs them):
  *
- *     WAITING     -> MATCHED          (matching, when RidePool exists)
  *     MATCHED     -> IN_PROGRESS      (trip start)
  *     MATCHED     -> CANCELLED        (cancelling a matched request)
  *     IN_PROGRESS -> COMPLETED        (trip end)
@@ -67,6 +67,15 @@ export const RIDE_EVENT_TYPE = Object.freeze({
   RIDE_REQUESTED: 'RIDE_REQUESTED',
   RIDE_CANCELLED: 'RIDE_CANCELLED',
   RIDE_EXPIRED: 'RIDE_EXPIRED',
+  // Dispatch. DRIVER_OFFERED is written when an offer is created, and the other
+  // three record how it ended; PASSENGER_MATCHED (below) is the match itself.
+  DRIVER_OFFERED: 'DRIVER_OFFERED',
+  DRIVER_REJECTED: 'DRIVER_REJECTED',
+  DRIVER_OFFER_EXPIRED: 'DRIVER_OFFER_EXPIRED',
+  DRIVER_OFFER_CANCELLED: 'DRIVER_OFFER_CANCELLED',
+  DRIVER_ACCEPTED: 'DRIVER_ACCEPTED',
+  // The match. The name already existed and is reused rather than duplicated
+  // under a second name -- it is the moment a request stops waiting.
   PASSENGER_MATCHED: 'PASSENGER_MATCHED',
   RIDE_STARTED: 'RIDE_STARTED',
   RIDE_COMPLETED: 'RIDE_COMPLETED',
@@ -120,6 +129,7 @@ export const ALLOWED_TRANSITIONS = Object.freeze({
  */
 export const IMPLEMENTED_TRANSITIONS = Object.freeze({
   [RIDE_REQUEST_STATUS.WAITING]: Object.freeze([
+    RIDE_REQUEST_STATUS.MATCHED,
     RIDE_REQUEST_STATUS.CANCELLED,
     RIDE_REQUEST_STATUS.EXPIRED,
   ]),

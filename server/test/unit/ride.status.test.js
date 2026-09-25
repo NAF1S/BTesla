@@ -123,18 +123,22 @@ describe('ride request transitions', () => {
     }
   });
 
-  it('implements only the two transitions this milestone performs', () => {
+  it('implements the three transitions this milestone performs', () => {
     const implemented = TRANSITION_PAIRS()
       .filter(({ from, to }) => isImplementedTransition(from, to))
       .map(({ from, to }) => `${from}->${to}`)
       .sort();
 
-    assert.deepStrictEqual(implemented, ['WAITING->CANCELLED', 'WAITING->EXPIRED']);
+    assert.deepStrictEqual(implemented, [
+      'WAITING->CANCELLED',
+      'WAITING->EXPIRED',
+      // A driver accepting a dispatch offer is what performs this one.
+      'WAITING->MATCHED',
+    ]);
   });
 
-  it('reserves the matching and trip transitions for later: allowed, but unreachable', () => {
+  it('reserves the trip transitions for later: allowed, but unreachable', () => {
     for (const { from, to } of [
-      { from: 'WAITING', to: 'MATCHED' },
       { from: 'MATCHED', to: 'IN_PROGRESS' },
       { from: 'MATCHED', to: 'CANCELLED' },
       { from: 'IN_PROGRESS', to: 'COMPLETED' },

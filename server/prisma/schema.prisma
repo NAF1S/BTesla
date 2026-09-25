@@ -106,6 +106,8 @@ model ServicePoint {
   destinationQuotes   FareQuote[]              @relation("FareQuoteDestination")
   pickupRideRequests  RideRequest[]            @relation("RideRequestPickup")
   dropoffRideRequests RideRequest[]            @relation("RideRequestDropoff")
+  driversAtPoint      DriverProfile[]          @relation("DriverCurrentServicePoint")
+  poolStops           PoolStop[]
 
   @@unique([zoneId, name], map: "service_points_zone_name_unique")
   @@index([zoneId])
@@ -299,6 +301,9 @@ model RideRequest {
   pickupServicePoint      ServicePoint        @relation("RideRequestPickup", fields: [pickupServicePointId], references: [id], onDelete: Restrict, onUpdate: NoAction)
   dropoffServicePoint     ServicePoint        @relation("RideRequestDropoff", fields: [dropoffServicePointId], references: [id], onDelete: Restrict, onUpdate: NoAction)
   events                  RideEvent[]
+  dispatchOffers          DispatchOffer[]
+  poolMember              PoolMember?
+  poolStops               PoolStop[]
 
   @@unique([passengerProfileId, idempotencyKey], map: "ride_requests_passenger_idempotency_key_unique")
   @@index([passengerProfileId, requestedAt], map: "ride_requests_passenger_requested_at_idx")
@@ -351,6 +356,7 @@ model User {
   passengerProfile PassengerProfile?
   driverProfile    DriverProfile?
   rideEvents       RideEvent[]
+  poolEvents       PoolEvent[]
 
   @@index([role])
   @@map("users")
@@ -372,27 +378,46 @@ model PassengerProfile {
 }
 
 model DriverProfile {
-  id        String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  userId    String       @unique @map("user_id") @db.Uuid
-  status    DriverStatus @default(OFFLINE)
-  createdAt DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt DateTime     @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
-  vehicles  Vehicle[]
+  id                    String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId                String          @unique @map("user_id") @db.Uuid
+  status                DriverStatus    @default(OFFLINE)
+  /// Nullable while offline: a driver who has never gone online has no point.
+  currentServicePointId String?         @map("current_service_point_id") @db.Uuid
+  /// Set with the status change, so "available" always means "has a point and
+  /// said when". Cleared when the driver goes offline.
+  availableSince        DateTime?       @map("available_since") @db.Timestamptz(6)
+  /// The last time the driver reported where they were. A stale value makes them
+  /// ineligible for dispatch.
+  lastSeenAt            DateTime?       @map("last_seen_at") @db.Timestamptz(6)
+  /// The vehicle this driver went online with. Recorded, never guessed, so a
+  /// driver with several vehicles is dispatched in the one they chose.
+  activeVehicleId       String?         @map("active_vehicle_id") @db.Uuid
+  createdAt             DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime        @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  user                  User            @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  vehicles              Vehicle[]
+  currentServicePoint   ServicePoint?   @relation("DriverCurrentServicePoint", fields: [currentServicePointId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  activeVehicle         Vehicle?        @relation("DriverActiveVehicle", fields: [activeVehicleId], references: [id], onDelete: SetNull, onUpdate: NoAction)
+  ridePools             RidePool[]
+  dispatchOffers        DispatchOffer[]
 
+  @@index([currentServicePointId])
   @@map("driver_profiles")
 }
 
 /// This model contains an expression index which requires additional setup for migrations. Visit https://pris.ly/d/expression-indexes for more info.
 model Vehicle {
-  id           String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  driverId     String        @map("driver_id") @db.Uuid
-  name         String
-  seatCapacity Int           @map("seat_capacity")
-  active       Boolean       @default(true)
-  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt    DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-  driver       DriverProfile @relation(fields: [driverId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  id               String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  driverId         String          @map("driver_id") @db.Uuid
+  name             String
+  seatCapacity     Int             @map("seat_capacity")
+  active           Boolean         @default(true)
+  createdAt        DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime        @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  driver           DriverProfile   @relation(fields: [driverId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  activeForDrivers DriverProfile[] @relation("DriverActiveVehicle")
+  ridePools        RidePool[]
+  dispatchOffers   DispatchOffer[]
 
   @@index([driverId])
   @@map("vehicles")
@@ -411,6 +436,7 @@ enum Role {
 enum DriverStatus {
   OFFLINE
   AVAILABLE
+  RESERVED
   ON_RIDE
 
   @@map("driver_status")
@@ -441,8 +467,9 @@ enum RideRequestStatus {
   @@map("ride_request_status")
 }
 
-/// RIDE_REQUESTED, RIDE_CANCELLED and RIDE_EXPIRED are written today; the rest
-/// are reserved for matching and the trip itself.
+/// RIDE_REQUESTED, RIDE_CANCELLED, RIDE_EXPIRED and the DRIVER_* dispatch events
+/// are written today; PASSENGER_MATCHED is the match event (it already existed,
+/// so it is reused rather than duplicated); the rest are reserved for the trip.
 enum RideEventType {
   RIDE_REQUESTED
   RIDE_CANCELLED
@@ -452,6 +479,11 @@ enum RideEventType {
   RIDE_COMPLETED
   PASSENGER_PICKED_UP
   PASSENGER_DROPPED_OFF
+  DRIVER_OFFERED
+  DRIVER_REJECTED
+  DRIVER_OFFER_EXPIRED
+  DRIVER_OFFER_CANCELLED
+  DRIVER_ACCEPTED
 
   @@map("ride_event_type")
 }
@@ -471,4 +503,244 @@ enum CancellationReason {
   OTHER
 
   @@map("ride_cancellation_reason")
+}
+
+// ---------------------------------------------------------------------------
+// Driver dispatch and pools (server/db/09-driver-dispatch.sql)
+// ---------------------------------------------------------------------------
+
+/// A temporary offer of one ride request to one driver, in one vehicle.
+///
+/// It is the only thing that can turn a WAITING request into a pool, and it
+/// expires. Two partial unique indexes make sequential dispatch a database fact
+/// rather than a service convention: one PENDING initial offer per request, and
+/// one PENDING initial offer per driver. Prisma cannot express a partial index,
+/// so both appear in `prisma migrate diff` -- like the GiST indexes and
+/// `one_active_ride_request_per_passenger`.
+///
+/// A database trigger freezes the driver, request, vehicle, approach route,
+/// score, window and proposal, and allows the status to move PENDING -> one of
+/// the four terminal states exactly once.
+model DispatchOffer {
+  id                      String                   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  rideRequestId           String                   @map("ride_request_id") @db.Uuid
+  driverProfileId         String                   @map("driver_profile_id") @db.Uuid
+  vehicleId               String                   @map("vehicle_id") @db.Uuid
+  /// Set by acceptance, to the pool that acceptance created.
+  ridePoolId              String?                  @map("ride_pool_id") @db.Uuid
+  offerType               DispatchOfferType        @default(INITIAL_RIDE) @map("offer_type")
+  status                  DispatchOfferStatus      @default(PENDING)
+  approachDistanceMeters  Decimal                  @map("approach_distance_meters") @db.Decimal(12, 2)
+  approachDurationSeconds Int                      @map("approach_duration_seconds")
+  /// The deterministic candidate score this offer won with, kept so a dispatch
+  /// decision can be explained afterwards.
+  score                   Decimal                  @db.Decimal(12, 2)
+  offeredAt               DateTime                 @map("offered_at") @db.Timestamptz(6)
+  expiresAt               DateTime                 @map("expires_at") @db.Timestamptz(6)
+  respondedAt             DateTime?                @map("responded_at") @db.Timestamptz(6)
+  rejectionReason         DispatchRejectionReason? @map("rejection_reason")
+  /// What the driver was shown. Deliberately holds no passenger identity, no
+  /// contact details, no money and no tokens, so the driver DTO cannot leak.
+  proposalSnapshot        Json                     @map("proposal_snapshot")
+  createdAt               DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt               DateTime                 @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  rideRequest             RideRequest              @relation(fields: [rideRequestId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  driverProfile           DriverProfile            @relation(fields: [driverProfileId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  vehicle                 Vehicle                  @relation(fields: [vehicleId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  ridePool                RidePool?                @relation(fields: [ridePoolId], references: [id], onDelete: SetNull, onUpdate: NoAction)
+
+  @@index([rideRequestId, offeredAt], map: "dispatch_offers_request_idx")
+  @@index([driverProfileId, offeredAt], map: "dispatch_offers_driver_offered_at_idx")
+  @@map("dispatch_offers")
+}
+
+/// One driver, one vehicle, one active trip.
+///
+/// Only `FORMING` is created in the dispatch milestone; the other statuses exist
+/// so the trip milestones never alter an enum already in use, and the partial
+/// unique index `one_active_pool_per_driver` already covers all of them.
+///
+/// `capacitySnapshot` is a copy, so a later vehicle change cannot rewrite the
+/// capacity a pool was planned with. `plannedRouteGeometry` is the passenger's
+/// route as stored with the quote, and is `Unsupported` because Prisma has no
+/// PostGIS types (it is written through parameterised SQL).
+model RidePool {
+  id                     String                   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  driverProfileId        String                   @map("driver_profile_id") @db.Uuid
+  vehicleId              String                   @map("vehicle_id") @db.Uuid
+  status                 RidePoolStatus           @default(FORMING)
+  capacitySnapshot       Int                      @map("capacity_snapshot")
+  plannedRouteGeometry   Unsupported("geometry")? @map("planned_route_geometry")
+  plannedDistanceMeters  Decimal                  @map("planned_distance_meters") @db.Decimal(12, 2)
+  plannedDurationSeconds Int                      @map("planned_duration_seconds")
+  /// Bumped by future mutations (adding a passenger, re-planning), so a later
+  /// milestone can add optimistic concurrency without a migration.
+  version                Int                      @default(1)
+  createdAt              DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
+  acceptedAt             DateTime                 @default(now()) @map("accepted_at") @db.Timestamptz(6)
+  driverArrivedAt        DateTime?                @map("driver_arrived_at") @db.Timestamptz(6)
+  startedAt              DateTime?                @map("started_at") @db.Timestamptz(6)
+  completedAt            DateTime?                @map("completed_at") @db.Timestamptz(6)
+  cancelledAt            DateTime?                @map("cancelled_at") @db.Timestamptz(6)
+  updatedAt              DateTime                 @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  driverProfile          DriverProfile            @relation(fields: [driverProfileId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  vehicle                Vehicle                  @relation(fields: [vehicleId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  members                PoolMember[]
+  stops                  PoolStop[]
+  events                 PoolEvent[]
+  dispatchOffers         DispatchOffer[]
+
+  @@index([status])
+  @@map("ride_pools")
+}
+
+/// One passenger in a pool. `rideRequestId` is UNIQUE: a ride request can join
+/// at most one pool, and the member and the request describe the same journey.
+/// No passenger contact data is copied here.
+model PoolMember {
+  id            String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  ridePoolId    String           @map("ride_pool_id") @db.Uuid
+  rideRequestId String           @unique @map("ride_request_id") @db.Uuid
+  status        PoolMemberStatus @default(ASSIGNED)
+  matchedAt     DateTime         @default(now()) @map("matched_at") @db.Timestamptz(6)
+  pickedUpAt    DateTime?        @map("picked_up_at") @db.Timestamptz(6)
+  droppedOffAt  DateTime?        @map("dropped_off_at") @db.Timestamptz(6)
+  cancelledAt   DateTime?        @map("cancelled_at") @db.Timestamptz(6)
+  createdAt     DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  ridePool      RidePool         @relation(fields: [ridePoolId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  rideRequest   RideRequest      @relation(fields: [rideRequestId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  stops         PoolStop[]
+
+  @@index([ridePoolId])
+  @@map("pool_members")
+}
+
+/// The ordered plan for a pool: sequence 1 is the pickup, sequence 2 the
+/// drop-off. A trigger pins each stop to the service point the request named,
+/// keeps it with its own member, and refuses a drop-off before its pickup.
+model PoolStop {
+  id               String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  ridePoolId       String         @map("ride_pool_id") @db.Uuid
+  rideRequestId    String         @map("ride_request_id") @db.Uuid
+  poolMemberId     String         @map("pool_member_id") @db.Uuid
+  servicePointId   String         @map("service_point_id") @db.Uuid
+  stopType         PoolStopType   @map("stop_type")
+  sequence         Int
+  status           PoolStopStatus @default(PENDING)
+  plannedArrivalAt DateTime       @map("planned_arrival_at") @db.Timestamptz(6)
+  actualArrivalAt  DateTime?      @map("actual_arrival_at") @db.Timestamptz(6)
+  createdAt        DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime       @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  ridePool         RidePool       @relation(fields: [ridePoolId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  rideRequest      RideRequest    @relation(fields: [rideRequestId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  poolMember       PoolMember     @relation(fields: [poolMemberId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  servicePoint     ServicePoint   @relation(fields: [servicePointId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([ridePoolId, sequence], map: "pool_stops_pool_sequence_unique")
+  @@unique([poolMemberId, stopType], map: "pool_stops_member_type_unique")
+  @@index([rideRequestId])
+  @@map("pool_stops")
+}
+
+/// Append-only pool history, mirroring RideEvent: numbered per pool, with the
+/// actor and a small audit-safe JSON payload. UPDATE is refused by a trigger.
+model PoolEvent {
+  id          String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  ridePoolId  String        @map("ride_pool_id") @db.Uuid
+  sequence    Int
+  eventType   PoolEventType @map("event_type")
+  actorType   PoolActorType @map("actor_type")
+  actorUserId String?       @map("actor_user_id") @db.Uuid
+  metadata    Json          @default("{}")
+  createdAt   DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  ridePool    RidePool      @relation(fields: [ridePoolId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  actorUser   User?         @relation(fields: [actorUserId], references: [id], onDelete: SetNull, onUpdate: NoAction)
+
+  @@unique([ridePoolId, sequence], map: "pool_events_pool_sequence_unique")
+  @@map("pool_events")
+}
+
+enum DispatchOfferType {
+  INITIAL_RIDE
+  ADD_PASSENGER
+
+  @@map("dispatch_offer_type")
+}
+
+enum DispatchOfferStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  EXPIRED
+  CANCELLED
+
+  @@map("dispatch_offer_status")
+}
+
+enum DispatchRejectionReason {
+  TOO_FAR
+  UNAVAILABLE
+  VEHICLE_ISSUE
+  OTHER
+
+  @@map("dispatch_rejection_reason")
+}
+
+enum RidePoolStatus {
+  FORMING
+  DRIVER_EN_ROUTE
+  ARRIVED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+
+  @@map("ride_pool_status")
+}
+
+enum PoolMemberStatus {
+  ASSIGNED
+  PICKED_UP
+  DROPPED_OFF
+  CANCELLED
+  NO_SHOW
+
+  @@map("pool_member_status")
+}
+
+enum PoolStopType {
+  PICKUP
+  DROPOFF
+
+  @@map("pool_stop_type")
+}
+
+enum PoolStopStatus {
+  PENDING
+  ARRIVED
+  COMPLETED
+  SKIPPED
+
+  @@map("pool_stop_status")
+}
+
+enum PoolEventType {
+  POOL_CREATED
+  MEMBER_ADDED
+  ROUTE_PLAN_CREATED
+  MEMBER_PICKED_UP
+  MEMBER_DROPPED_OFF
+  POOL_STATUS_CHANGED
+  POOL_CANCELLED
+
+  @@map("pool_event_type")
+}
+
+enum PoolActorType {
+  PASSENGER
+  DRIVER
+  SYSTEM
+  ADMIN
+
+  @@map("pool_actor_type")
 }

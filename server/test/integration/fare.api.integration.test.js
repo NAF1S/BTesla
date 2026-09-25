@@ -791,18 +791,26 @@ describe('phase boundary', () => {
     assert.strictEqual(collection.status, 404);
   });
 
-  it('introduces no pool, shared-fare, seat or payment table', async () => {
+  it('introduces no shared, seated or payment table', async () => {
     const { rows } = await pool.query(
       `SELECT table_name FROM information_schema.tables
         WHERE table_schema = 'public'
-          AND table_name ~ '(ride|pool|payment|wallet|shared|match|seat|driver_assignment)'
+          AND table_name ~ '(ride|pool|dispatch|payment|wallet|shared|match|seat|driver_assignment)'
         ORDER BY table_name`,
     );
 
     assert.deepStrictEqual(
       rows.map((row) => row.table_name),
-      ['ride_events', 'ride_requests'],
-      'only the two ride-request tables may exist beyond pricing; nothing pooled or paid',
+      [
+        'dispatch_offers',
+        'pool_events',
+        'pool_members',
+        'pool_stops',
+        'ride_events',
+        'ride_pools',
+        'ride_requests',
+      ],
+      'pricing, ride and dispatch tables exist; nothing shared, seated or paid does',
     );
   });
 
