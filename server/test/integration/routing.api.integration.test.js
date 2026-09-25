@@ -1091,9 +1091,11 @@ describe('phase boundary', () => {
   it('introduces no shared, seated or payment table', async () => {
     // The routing milestone also asserted that *pricing* was absent. The fare
     // milestone lifted that half deliberately, the ride-request milestone added
-    // the ride tables, and the dispatch milestone added the pool tables. What
-    // must still hold is that nothing *shared*, seated, assigned or paid exists:
-    // every ride in this project is still one passenger, one request, one pool.
+    // the ride tables, the dispatch milestone added the pool tables and the
+    // shared-fare milestone added the two pool-fare tables. What must still hold
+    // is that nothing shared, seated, assigned or paid exists -- a shared *fare*
+    // is not a shared *ride*: each passenger still has their own request, and the
+    // fare tables only record what each of them owes for the plan they are on.
     const { rows } = await pool.query(
       `SELECT table_name FROM information_schema.tables
         WHERE table_schema = 'public'
@@ -1104,6 +1106,8 @@ describe('phase boundary', () => {
     assert.deepStrictEqual(rows.map((row) => row.table_name), [
       'dispatch_offers',
       'pool_events',
+      'pool_fare_calculations',
+      'pool_fare_legs',
       'pool_members',
       'pool_stops',
       'ride_events',
@@ -1112,17 +1116,24 @@ describe('phase boundary', () => {
     ]);
   });
 
-  it('has exactly the two pricing tables the fare milestone added', async () => {
+  it('has exactly the six pricing tables the fare milestones added', async () => {
     const { rows } = await pool.query(
       `SELECT table_name FROM information_schema.tables
         WHERE table_schema = 'public' AND table_name ~ '(fare|pricing|price|quote)'
         ORDER BY table_name`,
     );
 
-    assert.deepStrictEqual(
-      rows.map((row) => row.table_name),
-      ['fare_policies', 'fare_quotes'],
-    );
+    // Two from the solo-fare milestone -- a policy and an immutable quote -- and
+    // four from shared fares: the calculation, its legs, each passenger's
+    // allocation, and the share of each leg they pay for.
+    assert.deepStrictEqual(rows.map((row) => row.table_name), [
+      'fare_policies',
+      'fare_quotes',
+      'passenger_fare_allocations',
+      'passenger_fare_leg_shares',
+      'pool_fare_calculations',
+      'pool_fare_legs',
+    ]);
   });
 
   it('leaves the location endpoints untouched', async () => {

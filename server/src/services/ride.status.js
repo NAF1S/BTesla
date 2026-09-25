@@ -19,18 +19,18 @@ import { createHash } from 'node:crypto';
  * ---------------------------------------------------------------------------
  * TRANSITIONS
  * ---------------------------------------------------------------------------
- * Implemented in this phase:
+ * Implemented:
  *
- *     WAITING -> MATCHED            (a driver accepted a dispatch offer)
- *     WAITING -> CANCELLED
- *     WAITING -> EXPIRED
+ *     WAITING     -> MATCHED            (a driver accepted a dispatch offer)
+ *     WAITING     -> CANCELLED
+ *     WAITING     -> EXPIRED
+ *     MATCHED     -> IN_PROGRESS        (trip start, or collected during one)
+ *     IN_PROGRESS -> COMPLETED          (the passenger was delivered)
  *
- * Reserved for later milestones (allowed by the database trigger, unreachable
- * from the API because no operation performs them):
+ * Reserved for a later milestone (allowed by the database trigger, unreachable
+ * from the API because no operation performs it):
  *
- *     MATCHED     -> IN_PROGRESS      (trip start)
  *     MATCHED     -> CANCELLED        (cancelling a matched request)
- *     IN_PROGRESS -> COMPLETED        (trip end)
  *
  * Terminal statuses are terminal: COMPLETED, CANCELLED and EXPIRED have no
  * outgoing transition at all.
@@ -84,6 +84,15 @@ export const RIDE_EVENT_TYPE = Object.freeze({
   // The match. The name already existed and is reused rather than duplicated
   // under a second name -- it is the moment a request stops waiting.
   PASSENGER_MATCHED: 'PASSENGER_MATCHED',
+  // Shared fares: this passenger has been priced for a pool plan, and -- when a
+  // cap brought their fare down -- that a cap did so. Both carry only that
+  // passenger's own amounts.
+  PASSENGER_FARE_ALLOCATED: 'PASSENGER_FARE_ALLOCATED',
+  PASSENGER_FARE_REDUCED: 'PASSENGER_FARE_REDUCED',
+  // The trip. RIDE_STARTED, RIDE_COMPLETED, PASSENGER_PICKED_UP and
+  // PASSENGER_DROPPED_OFF already existed; DRIVER_ARRIVED is the one the trip
+  // adds, because "the car is at your pickup" had no name of its own.
+  DRIVER_ARRIVED: 'DRIVER_ARRIVED',
   RIDE_STARTED: 'RIDE_STARTED',
   RIDE_COMPLETED: 'RIDE_COMPLETED',
   PASSENGER_PICKED_UP: 'PASSENGER_PICKED_UP',
@@ -130,9 +139,13 @@ export const ALLOWED_TRANSITIONS = Object.freeze({
 });
 
 /**
- * Transitions this milestone implements. Everything else in ALLOWED_TRANSITIONS
- * is reserved: permitted by the database so no migration is needed later, but
- * not reachable, because no operation performs it.
+ * Transitions this codebase implements. Everything else in ALLOWED_TRANSITIONS
+ * is reserved: permitted by the database so no migration is needed later, but not
+ * reachable, because no operation performs it.
+ *
+ * The only reserved one left is MATCHED -> CANCELLED: cancelling a ride that a
+ * driver has already accepted, which is a product decision with money and a
+ * passenger's seat attached, and belongs to a milestone about cancellation.
  */
 export const IMPLEMENTED_TRANSITIONS = Object.freeze({
   [RIDE_REQUEST_STATUS.WAITING]: Object.freeze([
@@ -140,6 +153,11 @@ export const IMPLEMENTED_TRANSITIONS = Object.freeze({
     RIDE_REQUEST_STATUS.CANCELLED,
     RIDE_REQUEST_STATUS.EXPIRED,
   ]),
+  // The trip: starting the journey, or collecting a passenger while one is under
+  // way. Both are the moment this passenger's ride begins.
+  [RIDE_REQUEST_STATUS.MATCHED]: Object.freeze([RIDE_REQUEST_STATUS.IN_PROGRESS]),
+  // The trip: delivering this passenger.
+  [RIDE_REQUEST_STATUS.IN_PROGRESS]: Object.freeze([RIDE_REQUEST_STATUS.COMPLETED]),
 });
 
 export const isRideRequestStatus = (value) =>

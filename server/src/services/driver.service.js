@@ -48,7 +48,7 @@ const DRIVER_SCALARS = {
 
 /** The relations the driver's own availability DTO needs. Post-commit only. */
 const DRIVER_INCLUDE = {
-  currentServicePoint: { select: { code: true, name: true } },
+  currentServicePoint: { select: { id: true, code: true, name: true } },
   activeVehicle: { select: { id: true, name: true, seatCapacity: true } },
   vehicles: {
     where: { active: true },
@@ -101,16 +101,27 @@ const notFound = (driverProfileId) =>
  * A point that does not exist and a point that is switched off are different
  * answers on purpose: one is a typo, the other is a place that cannot be
  * driven to, and the driver can act on each differently.
+ *
+ * A point may be named by its stable `code` or by its `id`. The code is the
+ * project's usual way of naming a place (it is what `/location/points/:code`
+ * uses and what a client can put in a config file), and the id is what a client
+ * that already holds a location row has to hand. Both resolve to the same row and
+ * are validated the same way, so accepting the id is not a second code path --
+ * it is the same one with a different key.
  */
-const resolveServicePoint = async (tx, code) => {
+const resolveServicePoint = async (tx, { code = null, id = null }) => {
   const point = await tx.servicePoint.findUnique({
-    where: { code },
+    where: code ? { code } : { id },
     select: { id: true, code: true, name: true, active: true },
   });
 
-  if (!point) throw new ApiError(404, `Service point "${code}" was not found`);
+  if (!point) {
+    const named = code ? `Service point "${code}"` : `Service point "${id}"`;
+    throw new ApiError(404, `${named} was not found`);
+  }
+
   if (!point.active) {
-    throw new ApiError(409, `Service point "${code}" is not accepting rides right now`);
+    throw new ApiError(409, `Service point "${point.code}" is not accepting rides right now`);
   }
 
   return point;
@@ -179,7 +190,8 @@ const resolveVehicle = async (tx, { driverProfileId, vehicleId, preferredVehicle
  */
 export const goOnline = async ({
   driver,
-  currentServicePointCode,
+  currentServicePointCode = null,
+  currentServicePointId = null,
   vehicleId = null,
   now = new Date(),
 }) => {
@@ -196,7 +208,10 @@ export const goOnline = async ({
       );
     }
 
-    const point = await resolveServicePoint(tx, currentServicePointCode);
+    const point = await resolveServicePoint(tx, {
+      code: currentServicePointCode,
+      id: currentServicePointId,
+    });
     const vehicle = await resolveVehicle(tx, {
       driverProfileId,
       vehicleId,
@@ -291,7 +306,7 @@ export const setCurrentServicePoint = async ({
       );
     }
 
-    const point = await resolveServicePoint(tx, currentServicePointCode);
+    const point = await resolveServicePoint(tx, { code: currentServicePointCode });
 
     await tx.driverProfile.update({
       where: { id: driverProfileId },
@@ -310,6 +325,57 @@ export const getAvailability = async ({ driver }) => {
   if (!profile) throw notFound(driverProfileId);
 
   return profile;
+};
+
+/**
+ * One availability write, for the unified `PATCH /drivers/me/availability`.
+ *
+ * This is **not** a second implementation of going online. It is the same two
+ * operations the dedicated endpoints call, selected by one boolean:
+ *
+ *     { online: true,  servicePointId | servicePointCode }  -> goOnline
+ *     { online: false }                                      -> goOffline
+ *
+ * The reason to have it is the frontend: a toggle needs one endpoint whose body
+ * says what the driver wants, rather than a client that decides which of two URLs
+ * to call and has to handle "already offline" itself. Both spellings of the
+ * operation therefore share one state machine, one lock order and one set of
+ * refusals -- there is no way for them to disagree about whether a RESERVED
+ * driver may go offline.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THIS OPERATION CANNOT DO
+ * ---------------------------------------------------------------------------
+ * `operationalStatus` is absent from the accepted body, and the controller
+ * rejects it as an unknown field. A client may say "I am online" or "I am
+ * offline"; it may never say "I am ON_RIDE". `RESERVED` and `ON_RIDE` are facts
+ * the dispatch and trip code establish by accepting a ride and departing, and a
+ * driver who could set them directly could make themselves dispatchable while
+ * carrying a passenger, or invisible while committed to one.
+ *
+ * Going offline while RESERVED or ON_RIDE is refused for the mirror-image reason:
+ * those states mean "a passenger is waiting for this car". Releasing that is an
+ * operator's decision, not a device's.
+ */
+export const setAvailability = async ({
+  driver,
+  online,
+  currentServicePointCode = null,
+  currentServicePointId = null,
+  vehicleId = null,
+  now = new Date(),
+}) => {
+  if (online) {
+    return goOnline({
+      driver,
+      currentServicePointCode,
+      currentServicePointId,
+      vehicleId,
+      now,
+    });
+  }
+
+  return goOffline({ driver, now });
 };
 
 /**

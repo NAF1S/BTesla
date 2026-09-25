@@ -34,7 +34,7 @@ const PROFILE = {
   activeVehicleId: '44444444-4444-4444-4444-444444444444',
   createdAt: new Date('2026-09-01T00:00:00.000Z'),
   updatedAt: new Date('2026-09-25T03:01:00.000Z'),
-  currentServicePoint: { code: 'banani-kakoli', name: 'Banani Kakoli' },
+  currentServicePoint: { id: '33333333-3333-3333-3333-333333333333', code: 'banani-kakoli', name: 'Banani Kakoli' },
   activeVehicle: { id: '44444444-4444-4444-4444-444444444444', name: 'Bullet', seatCapacity: 3 },
   vehicles: [
     { id: '44444444-4444-4444-4444-444444444444', name: 'Bullet', seatCapacity: 3 },
@@ -50,11 +50,59 @@ describe('toDriverAvailabilityDto', () => {
       'currentServicePoint',
       'driverProfileId',
       'lastSeenAt',
+      'online',
+      'operationalStatus',
+      'servicePoint',
       'status',
       'updatedAt',
       'vehicle',
       'vehicles',
     ]);
+  });
+
+  it('reports online as the boolean a toggle binds to, and the status under its documented name', () => {
+    // `online` is false for exactly one of the four states, which is what makes it
+    // safe to bind a switch to: a RESERVED or ON_RIDE driver is working, and a
+    // switch that read "off" while they were carrying a passenger would be wrong.
+    for (const [status, online] of Object.entries({
+      OFFLINE: false,
+      AVAILABLE: true,
+      RESERVED: true,
+      ON_RIDE: true,
+    })) {
+      const dto = toDriverAvailabilityDto({ ...PROFILE, status });
+
+      assert.strictEqual(dto.online, online, status);
+      assert.strictEqual(dto.operationalStatus, status);
+      assert.strictEqual(dto.status, status);
+    }
+  });
+
+  it('carries the same place under both names, with the id only on the documented one', () => {
+    const dto = toDriverAvailabilityDto(PROFILE);
+
+    // `servicePoint` is the documented name and carries the id a client sends
+    // back; `currentServicePoint` is the earlier shape, kept so a caller written
+    // against it keeps working. They come from one row, so they cannot disagree.
+    assert.deepStrictEqual(dto.currentServicePoint, { code: 'banani-kakoli', name: 'Banani Kakoli' });
+    assert.deepStrictEqual(dto.servicePoint, {
+      id: '33333333-3333-3333-3333-333333333333',
+      code: 'banani-kakoli',
+      name: 'Banani Kakoli',
+    });
+    assert.strictEqual(dto.servicePoint.code, dto.currentServicePoint.code);
+    assert.strictEqual(dto.servicePoint.name, dto.currentServicePoint.name);
+  });
+
+  it('reports both place fields as null together for a driver with no point', () => {
+    const dto = toDriverAvailabilityDto({
+      ...PROFILE,
+      status: 'OFFLINE',
+      currentServicePoint: null,
+    });
+
+    assert.strictEqual(dto.servicePoint, null);
+    assert.strictEqual(dto.currentServicePoint, null);
   });
 
   it('never exposes the user id, the email or anything about another driver', () => {
@@ -74,8 +122,27 @@ describe('toDriverAvailabilityDto', () => {
       assert.ok(!serialized.includes(forbidden), `the payload must not mention ${forbidden}`);
     }
 
+    // The driver's *account* is never named. `driverProfileId` is the driver's own
+    // handle on themselves -- it is how they read and change their availability --
+    // and it addresses nobody else.
     assert.ok(!serialized.includes(PROFILE.userId));
-    assert.ok(!serialized.includes(PROFILE.currentServicePointId));
+  });
+
+  it('publishes the service point id, which is a place and not the driver', () => {
+    // `currentServicePointId` is the same value the profile row holds, and it is
+    // published on purpose: a client sends `servicePointId` back to PATCH its
+    // availability, and a service point is a public location -- it is reachable
+    // through `/location/points/{code}` by anybody. It names a corner, not a
+    // person, so exposing it is the opposite of the disclosure this file guards
+    // against.
+    const dto = toDriverAvailabilityDto(PROFILE);
+
+    assert.strictEqual(dto.servicePoint.id, PROFILE.currentServicePointId);
+    assert.strictEqual(dto.operationalStatus, dto.status);
+    assert.ok(
+      !JSON.stringify(dto).includes(PROFILE.userId),
+      'the account behind the profile stays hidden',
+    );
   });
 
   it('reports where the driver is and what they are driving', () => {
@@ -128,6 +195,9 @@ describe('toDriverAvailabilityDto', () => {
     });
 
     assert.strictEqual(dto.currentServicePoint, null);
+    assert.strictEqual(dto.servicePoint, null);
+    assert.strictEqual(dto.online, false);
+    assert.strictEqual(dto.operationalStatus, 'OFFLINE');
     assert.strictEqual(dto.vehicle, null);
     assert.strictEqual(dto.availableSince, null);
     assert.strictEqual(dto.lastSeenAt, null);

@@ -191,6 +191,7 @@ model FarePolicy {
   createdAt               DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt               DateTime    @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
   quotes                  FareQuote[]
+  poolFareCalculations    PoolFareCalculation[]
 
   @@unique([code, version], map: "fare_policies_code_version_unique")
   @@index([code, active, effectiveFrom])
@@ -284,6 +285,11 @@ model RideRequest {
   status                  RideRequestStatus   @default(WAITING)
   requestedAt             DateTime            @map("requested_at") @db.Timestamptz(6)
   searchExpiresAt         DateTime            @map("search_expires_at") @db.Timestamptz(6)
+  /// When this passenger's ride began, and when it ended. Both belong to the
+  /// request rather than to the pool, because a passenger is delivered while the
+  /// pool may still be carrying somebody else.
+  startedAt               DateTime?           @map("started_at") @db.Timestamptz(6)
+  completedAt             DateTime?           @map("completed_at") @db.Timestamptz(6)
   cancelledAt             DateTime?           @map("cancelled_at") @db.Timestamptz(6)
   cancellationReason      CancellationReason? @map("cancellation_reason")
   idempotencyKey          String              @map("idempotency_key")
@@ -304,9 +310,11 @@ model RideRequest {
   dispatchOffers          DispatchOffer[]
   poolMember              PoolMember?
   poolStops               PoolStop[]
+  fareAllocations         PassengerFareAllocation[]
 
   @@unique([passengerProfileId, idempotencyKey], map: "ride_requests_passenger_idempotency_key_unique")
   @@index([passengerProfileId, requestedAt], map: "ride_requests_passenger_requested_at_idx")
+  @@index([passengerProfileId, status, requestedAt], map: "ride_requests_passenger_status_requested_at_idx")
   @@index([status, searchExpiresAt])
   @@map("ride_requests")
 }
@@ -490,6 +498,10 @@ enum RideEventType {
   POOL_JOIN_REJECTED
   POOL_JOIN_ACCEPTED
   INITIAL_DISPATCH_FALLBACK
+  PASSENGER_FARE_ALLOCATED
+  PASSENGER_FARE_REDUCED
+  /// The trip: the driver reached this passenger's pickup stop.
+  DRIVER_ARRIVED
 
   @@map("ride_event_type")
 }
@@ -590,6 +602,9 @@ model RidePool {
   createdAt              DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
   acceptedAt             DateTime                 @default(now()) @map("accepted_at") @db.Timestamptz(6)
   driverArrivedAt        DateTime?                @map("driver_arrived_at") @db.Timestamptz(6)
+  /// When the driver set off for the first pickup: set once, with the move out
+  /// of FORMING, and the instant every later status is measured from.
+  departedAt             DateTime?                @map("departed_at") @db.Timestamptz(6)
   startedAt              DateTime?                @map("started_at") @db.Timestamptz(6)
   completedAt            DateTime?                @map("completed_at") @db.Timestamptz(6)
   cancelledAt            DateTime?                @map("cancelled_at") @db.Timestamptz(6)
@@ -600,8 +615,11 @@ model RidePool {
   stops                  PoolStop[]
   events                 PoolEvent[]
   dispatchOffers         DispatchOffer[]
+  fareCalculations       PoolFareCalculation[]
 
   @@index([status])
+  @@index([driverProfileId, createdAt, id], map: "ride_pools_driver_created_at_idx")
+  @@index([driverProfileId, status, createdAt], map: "ride_pools_driver_status_created_at_idx")
   @@map("ride_pools")
 }
 
@@ -622,6 +640,7 @@ model PoolMember {
   ridePool      RidePool         @relation(fields: [ridePoolId], references: [id], onDelete: Cascade, onUpdate: NoAction)
   rideRequest   RideRequest      @relation(fields: [rideRequestId], references: [id], onDelete: Restrict, onUpdate: NoAction)
   stops         PoolStop[]
+  fareAllocations PassengerFareAllocation[]
 
   @@index([ridePoolId])
   @@map("pool_members")
@@ -641,12 +660,18 @@ model PoolStop {
   status           PoolStopStatus @default(PENDING)
   plannedArrivalAt DateTime       @map("planned_arrival_at") @db.Timestamptz(6)
   actualArrivalAt  DateTime?      @map("actual_arrival_at") @db.Timestamptz(6)
+  /// When the last required action at this stop finished. A stop is reached and
+  /// then completed, and `pool_stops_lifecycle_consistent` refuses either
+  /// without its instant.
+  completedAt      DateTime?      @map("completed_at") @db.Timestamptz(6)
   createdAt        DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt        DateTime       @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
   ridePool         RidePool       @relation(fields: [ridePoolId], references: [id], onDelete: Cascade, onUpdate: NoAction)
   rideRequest      RideRequest    @relation(fields: [rideRequestId], references: [id], onDelete: Restrict, onUpdate: NoAction)
   poolMember       PoolMember     @relation(fields: [poolMemberId], references: [id], onDelete: Cascade, onUpdate: NoAction)
   servicePoint     ServicePoint   @relation(fields: [servicePointId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  fareLegsFrom     PoolFareLeg[]  @relation("FareLegFrom")
+  fareLegsTo       PoolFareLeg[]  @relation("FareLegTo")
 
   @@unique([ridePoolId, sequence], map: "pool_stops_pool_sequence_unique")
   @@unique([poolMemberId, stopType], map: "pool_stops_member_type_unique")
@@ -670,6 +695,169 @@ model PoolEvent {
 
   @@unique([ridePoolId, sequence], map: "pool_events_pool_sequence_unique")
   @@map("pool_events")
+}
+
+// ---------------------------------------------------------------------------
+// Shared fares (server/db/11-pool-fares.sql)
+// ---------------------------------------------------------------------------
+
+/// One immutable, versioned answer to "what does this pool owe, and to whom?".
+///
+/// It is written whenever the pool's plan changes: an initial pool creates
+/// version 1's calculation, and every accepted join supersedes it with the next
+/// version's. The previous row is kept, so the history of what each passenger
+/// was quoted at every step stays readable.
+///
+/// At most one row per pool is CURRENT (`one_current_pool_fare_calculation_per_pool`,
+/// a partial unique index Prisma cannot model), and at most one row ever exists
+/// per (pool version, rule version), which is what makes recalculation
+/// idempotent. A trigger makes every amount and every version write-once: only
+/// the status may move, and only CURRENT -> SUPERSEDED or CURRENT -> FINALIZED.
+model PoolFareCalculation {
+  id                          String                    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  ridePoolId                  String                    @map("ride_pool_id") @db.Uuid
+  poolVersion                 Int                       @map("pool_version")
+  pricingPolicyId             String                    @map("pricing_policy_id") @db.Uuid
+  pricingCode                 String                    @map("pricing_code")
+  pricingVersion              Int                       @map("pricing_version")
+  sharedFareRuleVersion       String                    @map("shared_fare_rule_version")
+  status                      PoolFareCalculationStatus @default(CURRENT)
+  currency                    String
+  trafficProfile              TrafficProfile            @map("traffic_profile")
+  routeDistanceMeters         Int                       @map("route_distance_meters")
+  routeDurationSeconds        Int                       @map("route_duration_seconds")
+  totalVariableRouteCost      Decimal                   @map("total_variable_route_cost") @db.Decimal(14, 6)
+  totalPassengerBaseFare      Decimal                   @map("total_passenger_base_fare") @db.Decimal(14, 6)
+  totalUncappedPassengerFare  Decimal                   @map("total_uncapped_passenger_fare") @db.Decimal(14, 6)
+  /// How much the minimum fare added across all passengers: money no passenger
+  /// produced, recorded rather than hidden in a difference.
+  totalMinimumFareUplift      Decimal                   @map("total_minimum_fare_uplift") @db.Decimal(14, 6)
+  totalFinalPassengerFare     Decimal                   @map("total_final_passenger_fare") @db.Decimal(14, 6)
+  totalSoloCapReduction       Decimal                   @map("total_solo_cap_reduction") @db.Decimal(14, 6)
+  totalNoIncreaseReduction    Decimal                   @map("total_no_increase_reduction") @db.Decimal(14, 6)
+  createdAt                   DateTime                  @default(now()) @map("created_at") @db.Timestamptz(6)
+  /// Set when the driver departs: the fare the trip is running under, frozen so
+  /// that a settlement milestone has one answer to settle.
+  finalizedAt                 DateTime?                 @map("finalized_at") @db.Timestamptz(6)
+  ridePool                    RidePool                  @relation(fields: [ridePoolId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  pricingPolicy               FarePolicy                @relation(fields: [pricingPolicyId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  legs                        PoolFareLeg[]
+  allocations                 PassengerFareAllocation[]
+
+  @@unique([ridePoolId, poolVersion, sharedFareRuleVersion], map: "pool_fare_calculations_version_rule_unique")
+  @@index([ridePoolId, createdAt(sort: Desc)], map: "pool_fare_calculations_pool_created_idx")
+  @@map("pool_fare_calculations")
+}
+
+/// One leg of the plan: travel from one ordered PoolStop to the next.
+///
+/// `onboardPassengerCount` is how many passengers were in the vehicle for this
+/// leg, derived from the stop actions before it. A leg with nobody on board is
+/// still recorded -- the driver drove it -- but it funds nothing, so all four
+/// money columns are zero; `pool_fare_legs_unfunded_is_free` enforces exactly
+/// that. The driver's approach to the first pickup is not a leg at all.
+///
+/// `routeSnapshot` holds the rendered edges and their weights, which is what
+/// makes the leg cost reproducible without asking the router again.
+model PoolFareLeg {
+  id                    String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  fareCalculationId     String              @map("fare_calculation_id") @db.Uuid
+  sequence              Int
+  fromPoolStopId        String              @map("from_pool_stop_id") @db.Uuid
+  toPoolStopId          String              @map("to_pool_stop_id") @db.Uuid
+  distanceMeters        Int                 @map("distance_meters")
+  durationSeconds       Int                 @map("duration_seconds")
+  distanceCost          Decimal             @map("distance_cost") @db.Decimal(14, 6)
+  timeCost              Decimal             @map("time_cost") @db.Decimal(14, 6)
+  trafficAdjustment     Decimal             @map("traffic_adjustment") @db.Decimal(14, 6)
+  totalLegCost          Decimal             @map("total_leg_cost") @db.Decimal(14, 6)
+  onboardPassengerCount Int                 @map("onboard_passenger_count")
+  routeSnapshot         Json                @map("route_snapshot")
+  createdAt             DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+  fareCalculation       PoolFareCalculation @relation(fields: [fareCalculationId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  fromPoolStop          PoolStop            @relation("FareLegFrom", fields: [fromPoolStopId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  toPoolStop            PoolStop            @relation("FareLegTo", fields: [toPoolStopId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  shares                PassengerFareLegShare[]
+
+  @@unique([fareCalculationId, sequence], map: "pool_fare_legs_sequence_unique")
+  @@index([fromPoolStopId])
+  @@map("pool_fare_legs")
+}
+
+/// What one member owes in one calculation, with every step of the capping
+/// written down: the accepted solo fare, the previous pooled fare that caps it,
+/// the shares they were given, and the two reductions.
+///
+/// The database enforces the guarantees rather than trusting the service:
+/// `finalFare <= acceptedSoloFare` always, `finalFare <= previousPooledFareCap`
+/// whenever there is one, and
+/// `finalFare + soloCapReduction + noIncreaseReduction = max(minimumFare, uncappedPooledFare)`
+/// so nothing is lost or created by a cap.
+model PassengerFareAllocation {
+  id                       String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  fareCalculationId        String              @map("fare_calculation_id") @db.Uuid
+  poolMemberId             String              @map("pool_member_id") @db.Uuid
+  rideRequestId            String              @map("ride_request_id") @db.Uuid
+  acceptedSoloFare         Decimal             @map("accepted_solo_fare") @db.Decimal(14, 6)
+  /// The fare this passenger was given by the preceding pool version's
+  /// calculation. Null for a passenger who has just joined.
+  previousPooledFareCap    Decimal?            @map("previous_pooled_fare_cap") @db.Decimal(14, 6)
+  baseFare                 Decimal             @map("base_fare") @db.Decimal(14, 6)
+  allocatedLegCost         Decimal             @map("allocated_leg_cost") @db.Decimal(14, 6)
+  uncappedPooledFare       Decimal             @map("uncapped_pooled_fare") @db.Decimal(14, 6)
+  minimumFare              Decimal             @map("minimum_fare") @db.Decimal(14, 6)
+  minimumFareApplied       Boolean             @map("minimum_fare_applied")
+  soloCapApplied           Boolean             @map("solo_cap_applied")
+  noIncreaseCapApplied     Boolean             @map("no_increase_cap_applied")
+  soloCapReduction         Decimal             @map("solo_cap_reduction") @db.Decimal(14, 6)
+  noIncreaseReduction      Decimal             @map("no_increase_reduction") @db.Decimal(14, 6)
+  finalFare                Decimal             @map("final_fare") @db.Decimal(14, 6)
+  currency                 String
+  createdAt                DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+  fareCalculation          PoolFareCalculation @relation(fields: [fareCalculationId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  poolMember               PoolMember          @relation(fields: [poolMemberId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  rideRequest              RideRequest         @relation(fields: [rideRequestId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  shares                   PassengerFareLegShare[]
+
+  @@unique([fareCalculationId, poolMemberId], map: "passenger_fare_allocations_member_unique")
+  @@index([rideRequestId, createdAt(sort: Desc)], map: "passenger_fare_allocations_request_idx")
+  @@map("passenger_fare_allocations")
+}
+
+/// One passenger's share of one leg.
+///
+/// `shareRatio` is 1/N, `unroundedAmount` the exact quotient, `allocatedAmount`
+/// what they were charged, and `roundingAdjustment` the residual that made the
+/// shares add up to the leg's cost exactly. A deferred constraint trigger checks
+/// that sum, and that there is one share per passenger on board, at commit.
+model PassengerFareLegShare {
+  id                         String                   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  passengerFareAllocationId  String                   @map("passenger_fare_allocation_id") @db.Uuid
+  poolFareLegId              String                   @map("pool_fare_leg_id") @db.Uuid
+  onboardPassengerCount      Int                      @map("onboard_passenger_count")
+  shareRatio                 Decimal                  @map("share_ratio") @db.Decimal(14, 10)
+  unroundedAmount            Decimal                  @map("unrounded_amount") @db.Decimal(20, 10)
+  allocatedAmount            Decimal                  @map("allocated_amount") @db.Decimal(14, 6)
+  /// What rounding added to (or took off) the exact quotient, at ten decimals.
+  roundingAdjustment         Decimal                  @map("rounding_adjustment") @db.Decimal(20, 10)
+  createdAt                  DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
+  allocation                 PassengerFareAllocation  @relation(fields: [passengerFareAllocationId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  leg                        PoolFareLeg              @relation(fields: [poolFareLegId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([passengerFareAllocationId, poolFareLegId], map: "passenger_fare_leg_shares_leg_unique")
+  @@index([poolFareLegId])
+  @@map("passenger_fare_leg_shares")
+}
+
+/// CURRENT is what the pool owes now; SUPERSEDED is a previous answer, kept for
+/// audit; FINALIZED is the answer the trip is running under, frozen at departure
+/// so that nothing can re-price a journey that has begun.
+enum PoolFareCalculationStatus {
+  CURRENT
+  SUPERSEDED
+  FINALIZED
+
+  @@map("pool_fare_calculation_status")
 }
 
 enum DispatchOfferType {
@@ -743,6 +931,16 @@ enum PoolEventType {
   ROUTE_PLAN_UPDATED
   MEMBER_PICKED_UP
   MEMBER_DROPPED_OFF
+  SHARED_FARE_CALCULATED
+  SHARED_FARE_SUPERSEDED
+  /// The trip: setting off, reaching a stop, starting, finishing and releasing
+  /// the driver. `POOL_STATUS_CHANGED` and `POOL_CANCELLED` stay reserved --
+  /// every transition this milestone performs has an event of its own.
+  DRIVER_DEPARTED
+  STOP_ARRIVED
+  TRIP_STARTED
+  TRIP_COMPLETED
+  DRIVER_AVAILABLE
   POOL_STATUS_CHANGED
   POOL_CANCELLED
 

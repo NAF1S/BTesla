@@ -33,4 +33,9 @@ router.get('/:id', requireAuth, requireRole(Role.PASSENGER), rides.getRideReques
 // Cancel -- the only passenger-driven status change in this milestone.
 router.post('/:id/cancel', requireAuth, requireRole(Role.PASSENGER), rides.cancelRideRequest);
 
+// The caller's own shared fare for this request. Registered after `/:id` because
+// it is a sub-path of it, and reachable only by the passenger the request
+// belongs to.
+router.get('/:id/fare', requireAuth, requireRole(Role.PASSENGER), rides.getRideRequestFare);
+
 export default router;

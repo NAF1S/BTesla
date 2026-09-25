@@ -21,7 +21,7 @@ import {
   DRIVER_AVAILABILITY,
   IMPLEMENTED_AVAILABILITY_TRANSITIONS,
   IMPLEMENTED_OFFER_TYPE,
-  IMPLEMENTED_POOL_STATUS,
+  IMPLEMENTED_POOL_STATUSES,
   isActivePoolStatus,
   isDriverAvailability,
   isImplementedAvailabilityChange,
@@ -123,18 +123,18 @@ describe('driver availability', () => {
       'AVAILABLE->OFFLINE',
       'AVAILABLE->RESERVED',
       'OFFLINE->AVAILABLE',
+      'ON_RIDE->AVAILABLE',
+      'RESERVED->ON_RIDE',
     ]);
   });
 
-  it('reserves the trip transitions: allowed by the product, unreachable from the API', () => {
-    for (const { from, to } of [
-      { from: 'RESERVED', to: 'ON_RIDE' },
-      { from: 'ON_RIDE', to: 'AVAILABLE' },
-      { from: 'RESERVED', to: 'OFFLINE' },
-    ]) {
-      assert.strictEqual(canChangeAvailability(from, to), true, `${from}->${to}`);
-      assert.strictEqual(isImplementedAvailabilityChange(from, to), false, `${from}->${to}`);
-    }
+  it('reserves the one availability change that needs an operator, not an endpoint', () => {
+    assert.strictEqual(canChangeAvailability('RESERVED', 'OFFLINE'), true, 'the product allows it');
+    assert.strictEqual(
+      isImplementedAvailabilityChange('RESERVED', 'OFFLINE'),
+      false,
+      'and no endpoint performs it',
+    );
   });
 
   it('never implements a change the product does not allow', () => {
@@ -291,8 +291,14 @@ describe('pools, members and stops', () => {
     ]);
   });
 
-  it('creates only FORMING in this milestone', () => {
-    assert.strictEqual(IMPLEMENTED_POOL_STATUS, POOL_STATUS.FORMING);
+  it('reaches every pool status but CANCELLED', () => {
+    assert.deepStrictEqual(
+      [...IMPLEMENTED_POOL_STATUSES],
+      ['FORMING', 'DRIVER_EN_ROUTE', 'ARRIVED', 'IN_PROGRESS', 'COMPLETED'],
+    );
+
+    // The trip is the only thing that moves a pool, and it never cancels one.
+    assert.strictEqual(IMPLEMENTED_POOL_STATUSES.includes('CANCELLED'), false);
   });
 
   it('records the initial plan as pickup first, drop-off second', () => {

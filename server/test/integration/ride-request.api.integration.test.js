@@ -42,12 +42,17 @@ const RIDE_REQUEST_KEYS = [
   'cancellable',
   'cancellationReason',
   'cancelledAt',
+  'completedAt',
   'destination',
   'id',
   'pickup',
   'requestedAt',
   'searchExpiresAt',
+  'startedAt',
   'status',
+  // The passenger's own trip. Null until the caller loads one: this endpoint is
+  // the request, and the trip is read for a single request rather than a page.
+  'trip',
 ];
 
 const ACCEPTED_QUOTE_KEYS = [
@@ -281,6 +286,9 @@ describe('creating a ride request', () => {
     assert.strictEqual(response.body.destination.code, DESTINATION);
     assert.strictEqual(response.body.cancelledAt, null);
     assert.strictEqual(response.body.cancellationReason, null);
+    assert.strictEqual(response.body.startedAt, null);
+    assert.strictEqual(response.body.completedAt, null);
+    assert.strictEqual(response.body.trip, null, 'a ride that has not been matched has no trip');
     assert.strictEqual(response.body.acceptedQuote.fareQuoteId, quoteId);
     assert.match(response.body.id, /^[0-9a-f-]{36}$/);
   });
@@ -1026,12 +1034,20 @@ describe('phase boundary', () => {
         ORDER BY table_name`,
     );
 
-    // The dispatch milestone added the four pool/dispatch tables; what must still
-    // be absent is anything shared, seated, paid or assigned to a driver.
-    assert.deepStrictEqual(
-      rows.map((row) => row.table_name),
-      ['dispatch_offers', 'pool_events', 'pool_members', 'pool_stops', 'ride_events', 'ride_pools', 'ride_requests'],
-    );
+    // The dispatch milestone added the four pool/dispatch tables, and the
+    // shared-fare milestone added the two pool-fare tables; what must still be
+    // absent is anything shared, seated, paid or assigned to a driver.
+    assert.deepStrictEqual(rows.map((row) => row.table_name), [
+      'dispatch_offers',
+      'pool_events',
+      'pool_fare_calculations',
+      'pool_fare_legs',
+      'pool_members',
+      'pool_stops',
+      'ride_events',
+      'ride_pools',
+      'ride_requests',
+    ]);
   });
 
   it('has no seat count, requested seats or per-seat fare anywhere on a request', async () => {

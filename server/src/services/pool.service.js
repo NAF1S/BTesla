@@ -1,5 +1,6 @@
 import { prisma } from '../db/prisma.js';
 import { ApiError } from '../utils/ApiError.js';
+import { POOL_FARE_STATUS } from './pool-fare.rules.js';
 import {
   ACTIVE_POOL_STATUSES,
   DROPOFF_SEQUENCE,
@@ -445,7 +446,9 @@ export const findActivePoolForDriver = (driverProfileId) =>
  *
  * The joins are a single Prisma query outside any transaction, which is the same
  * rule the rest of the project follows: relations are read after the commit, on
- * a pooled connection.
+ * a pooled connection. The settled fare is read for its status only: the driver's
+ * view of a pool carries no money, and `allowedActions` needs to know whether the
+ * trip is cleared to start.
  */
 export const loadPoolForDto = (ridePoolId) =>
   prisma.ridePool.findUnique({
@@ -459,6 +462,7 @@ export const loadPoolForDto = (ridePoolId) =>
       plannedDurationSeconds: true,
       createdAt: true,
       acceptedAt: true,
+      departedAt: true,
       driverArrivedAt: true,
       startedAt: true,
       completedAt: true,
@@ -470,6 +474,8 @@ export const loadPoolForDto = (ridePoolId) =>
           id: true,
           status: true,
           matchedAt: true,
+          pickedUpAt: true,
+          droppedOffAt: true,
           rideRequestId: true,
           rideRequest: {
             select: {
@@ -491,9 +497,19 @@ export const loadPoolForDto = (ridePoolId) =>
           status: true,
           plannedArrivalAt: true,
           actualArrivalAt: true,
+          completedAt: true,
           servicePoint: { select: { code: true, name: true } },
           poolMemberId: true,
         },
+      },
+      // The fare the trip is running under (FINALIZED) or the current estimate.
+      // Read only for its *status* and version: the driver's DTO carries no money,
+      // and this is what tells them the trip is cleared to start.
+      fareCalculations: {
+        where: { status: { in: [POOL_FARE_STATUS.CURRENT, POOL_FARE_STATUS.FINALIZED] } },
+        orderBy: [{ poolVersion: 'desc' }, { createdAt: 'desc' }],
+        take: 1,
+        select: { id: true, status: true, poolVersion: true, finalizedAt: true },
       },
       events: {
         orderBy: { sequence: 'asc' },

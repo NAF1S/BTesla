@@ -123,13 +123,15 @@ describe('ride request transitions', () => {
     }
   });
 
-  it('implements the three transitions this milestone performs', () => {
+  it('implements the transitions this codebase performs', () => {
     const implemented = TRANSITION_PAIRS()
       .filter(({ from, to }) => isImplementedTransition(from, to))
       .map(({ from, to }) => `${from}->${to}`)
       .sort();
 
     assert.deepStrictEqual(implemented, [
+      'IN_PROGRESS->COMPLETED',
+      'MATCHED->IN_PROGRESS',
       'WAITING->CANCELLED',
       'WAITING->EXPIRED',
       // A driver accepting a dispatch offer is what performs this one.
@@ -137,19 +139,13 @@ describe('ride request transitions', () => {
     ]);
   });
 
-  it('reserves the trip transitions for later: allowed, but unreachable', () => {
-    for (const { from, to } of [
-      { from: 'MATCHED', to: 'IN_PROGRESS' },
-      { from: 'MATCHED', to: 'CANCELLED' },
-      { from: 'IN_PROGRESS', to: 'COMPLETED' },
-    ]) {
-      assert.strictEqual(canTransition(from, to), true, `${from}->${to} must stay legal`);
-      assert.strictEqual(
-        isImplementedTransition(from, to),
-        false,
-        `${from}->${to} must not be implemented yet`,
-      );
-    }
+  it('reserves the one transition no operation performs: a matched ride being cancelled', () => {
+    assert.strictEqual(canTransition('MATCHED', 'CANCELLED'), true, 'the product allows it');
+    assert.strictEqual(
+      isImplementedTransition('MATCHED', 'CANCELLED'),
+      false,
+      'and nothing performs it yet',
+    );
   });
 
   it('never implements a transition the product does not allow', () => {

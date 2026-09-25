@@ -1,0 +1,3023 @@
+openapi: 3.1.0
+
+# ---------------------------------------------------------------------------
+# TeslaB — the read APIs the passenger and driver clients are built on.
+#
+# WHY THIS FILE EXISTS AND WHAT IT COVERS
+#
+# The project's primary documentation is `README.md`, which explains *why* each
+# milestone is shaped the way it is. This file is the machine-readable contract:
+# paths, parameters, status codes and response shapes, so a client generator or an
+# editor can work from the API rather than from prose.
+#
+# It documents the **passenger and driver read APIs** — current ride, ride
+# history, ride detail, current pool, driver history, and driver availability —
+# because those are the endpoints a frontend is built on and the ones added by the
+# read-API milestone. The write endpoints are described in outline under
+# `x-related-endpoints` at the bottom so the picture is complete; their detailed
+# schemas live in `README.md`, and this file grows to cover them rather than
+# guessing at them.
+#
+# The examples use the demo cast (`02-seed.sql`): Nusrat and Rafiq travel, Jashim
+# drives, and the Banani Road 11 → Mohakhali Bus Terminal journey is the reference
+# trip (2214 m, 569 s at rush hour, BDT 130.63 quoted solo).
+# ---------------------------------------------------------------------------
+
+info:
+  title: TeslaB API
+  version: 1.0.0
+  description: |
+    A ride-pooling API: passengers request journeys between service points, the
+    dispatcher matches them into pools, and drivers execute the trip.
+
+    ## Authentication
+
+    Authentication is a **signed JWT carried in an HttpOnly cookie**. Sign in with
+    `POST /api/auth/login`; the cookie is set on the response and every subsequent
+    request must carry it. There is no `Authorization` header and no token in a
+    response body — a browser client does nothing, and a non-browser client keeps
+    the cookie jar.
+
+    ```bash
+    curl -c cookies.txt -X POST localhost:4000/api/auth/login \
+      -H 'Content-Type: application/json' \
+      -d '{"email":"nusrat@example.com","password":"DemoPass123!"}'
+
+    curl -b cookies.txt localhost:4000/api/passengers/me/current-ride
+    ```
+
+    The token names a user; the **role is read from the database on every
+    request**, so a changed role or a deactivated account takes effect immediately
+    rather than when the token expires.
+
+    ## Roles
+
+    | Role | May use |
+    | ---- | ------- |
+    | `PASSENGER` | `/api/passengers/**`, `/api/ride-requests/**`, `/api/fare-quotes` |
+    | `DRIVER` | `/api/drivers/**` |
+    | `ADMIN` | `/api/users` |
+
+    ## Ownership, and why a missing ride is a 404 and not a 403
+
+    Every `*/me` path answers about the authenticated user. No path, query
+    parameter or body field names a passenger or a driver, so acting as somebody
+    else is not a request a client can construct.
+
+    Where a client *does* name a resource — `rideRequestId`, `poolId` — the id is
+    checked against the caller's own rows. A resource that belongs to somebody else
+    answers **404**, the same as an id that does not exist. A 403 would confirm
+    that the id is real, which is itself information about another person. The one
+    place a 403 appears is the role guard: "authenticated, but not this kind of
+    user".
+
+    ## Pagination
+
+    List endpoints use `limit` + `offset`, newest first, with a stable
+    tie-breaker:
+
+    ```text
+    ORDER BY created_at DESC, id DESC      (driver history, by pool)
+    ORDER BY requested_at DESC, id DESC    (passenger history, by request)
+    ```
+
+    The tie-breaker is not cosmetic. Two rows written in the same millisecond have
+    no inherent order, so without it a client paging through them would see one
+    twice and miss another. With it the order is total, and page N+1 starts exactly
+    where page N stopped.
+
+    Every list answers with the same envelope:
+
+    ```json
+    {
+      "data": [ … ],
+      "pagination": { "limit": 20, "offset": 0, "returned": 20, "total": 57, "hasMore": true }
+    }
+    ```
+
+    `total` is the count of everything matching the filter, not of the page, so a
+    client can render "page 1 of 3" without a second call. `limit` is capped
+    (100 for history), and a value outside its range is a 400 rather than being
+    clamped silently.
+
+    ## Empty states
+
+    Three different things, and the API keeps them apart on purpose:
+
+    | Situation | Answer |
+    | --------- | ------ |
+    | The passenger is not on a ride | `200` with `{ "ride": null }` |
+    | The driver has no active pool | `200` with `{ "pool": null }` |
+    | A history has no matching rows | `200` with `"data": []` and `"total": 0` |
+    | A named ride or pool is not the caller's | `404` |
+    | There is no shared fare for a request | `404` (not `0.00`) |
+
+    "You have no current ride" is a normal state, not a missing resource, so it is
+    a 200. A named resource that cannot be found *is* missing, so it is a 404.
+    Reporting a passenger's uncalculated fare as `0.00` would be inventing an
+    answer, so it is a 404 as well.
+
+    ## Errors
+
+    Every error has one shape, and a database error never reaches a client:
+
+    ```json
+    { "error": { "message": "Ride \"e0b2…\" was not found" } }
+    ```
+
+    | Status | Meaning |
+    | ------ | ------- |
+    | `400` | Malformed: bad uuid, unknown status, unknown query parameter, unparseable date, a date range that cannot be satisfied |
+    | `401` | No valid authentication |
+    | `403` | Authenticated, but the wrong role |
+    | `404` | Not found, or not yours |
+    | `409` | The request conflicts with the current state |
+    | `500` | Unexpected; the message is generic in production |
+
+    Unknown query parameters are rejected rather than ignored. `?passengerId=…` is
+    a 400 with the supported list, so a client learns that this API does not work
+    that way instead of silently reading somebody else's data or its own.
+
+servers:
+  - url: http://localhost:4000/api
+    description: Local development (the API and the client together via `npm run dev`)
+
+tags:
+  - name: Passenger reads
+    description: |
+      The ride a passenger is on, their history, and one ride in detail.
+      All require the `PASSENGER` role and answer only about the caller.
+  - name: Driver availability
+    description: |
+      Whether a driver is taking work, and where they are. The driver is taken
+      from the session; no endpoint accepts a driver id.
+  - name: Driver reads
+    description: |
+      The pool a driver is committed to, and the pools they have driven. All
+      require the `DRIVER` role and answer only about the caller.
+  - name: Documentation
+    description: This document.
+
+security:
+  - cookieAuth: []
+
+paths:
+  # -------------------------------------------------------------------------
+  # Passenger reads
+  # -------------------------------------------------------------------------
+  /passengers/me/current-ride:
+    get:
+      tags: [Passenger reads]
+      summary: The passenger's current ride
+      description: |
+        The passenger's single active ride request, with everything a client needs
+        to render the journey: where the car is in the plan, this passenger's own
+        two stops, who is driving, and what they may do next.
+
+        "Active" means `WAITING`, `MATCHED` or `IN_PROGRESS` — the statuses in
+        which a ride is still happening. At most one can exist at a time
+        (`one_active_ride_request_per_passenger`), so this is never a choice among
+        candidates.
+
+        **Nothing about another passenger is returned.** The pool is reached
+        through this passenger's own member row, so a co-passenger's name, request
+        id, places, fare and event history are not merely filtered out — they are
+        never read. What is shared is aggregate: `passengerCount` and the vehicle's
+        `seatCapacity`.
+
+        `stage` and `nextAction` are computed on the server from the request's own
+        timestamps, so a client never reimplements the state machine and cannot
+        disagree with the server about which button to show.
+      operationId: getCurrentRide
+      parameters: []
+      responses:
+        '200':
+          description: |
+            The active ride, or `null` when there is none. Not being on a ride is a
+            normal state, so this is never a 404 — a client polling this endpoint
+            should not have to treat the ordinary answer as an error.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ride]
+                properties:
+                  ride:
+                    oneOf:
+                      - $ref: '#/components/schemas/CurrentRide'
+                      - type: 'null'
+              examples:
+                matched:
+                  summary: Jashim has accepted and is on his way
+                  value:
+                    ride:
+                      rideRequestId: 86274eb8-0f84-42b3-b2b8-3619d7c7f902
+                      status: MATCHED
+                      cancellable: false
+                      pickup: { code: banani-road-11, name: Banani Road 11 }
+                      destination: { code: mohakhali-bus-terminal, name: Mohakhali Bus Terminal }
+                      requestedAt: '2026-09-25T12:17:06.592Z'
+                      startedAt: null
+                      completedAt: null
+                      cancelledAt: null
+                      route: { distanceMeters: 2214, durationSeconds: 569 }
+                      soloEstimate:
+                        fare: '130.63'
+                        currency: BDT
+                        pricingCode: dhaka-solo
+                        pricingVersion: 1
+                      sharedFare:
+                        fare: '126.63'
+                        currency: BDT
+                        finalized: true
+                        poolVersion: 1
+                      driver: { displayName: Jashim }
+                      vehicle: { name: Bullet, seatCapacity: 3 }
+                      passengerCount: 1
+                      stage: DRIVER_EN_ROUTE
+                      nextAction: WATCH_DRIVER
+                      searchExpiresAt: '2026-09-25T12:27:06.592Z'
+                      memberStatus: ASSIGNED
+                      pool:
+                        poolId: f9247881-c272-4117-83ce-4f502f521b7b
+                        status: DRIVER_EN_ROUTE
+                        completedAt: null
+                      timeline:
+                        matchedAt: '2026-09-25T12:17:06.902Z'
+                        departedAt: '2026-09-25T12:17:07.382Z'
+                        driverArrivedAt: null
+                        pickedUpAt: null
+                        droppedOffAt: null
+                      myStops:
+                        - stopId: 8100d3eb-db04-4a6c-8329-04b9c85f397f
+                          sequence: 1
+                          stopType: PICKUP
+                          status: PENDING
+                          servicePoint: { code: banani-road-11, name: Banani Road 11 }
+                          plannedArrivalAt: '2026-09-25T12:19:00.902Z'
+                          actualArrivalAt: null
+                          completedAt: null
+                noRide:
+                  summary: The passenger is not on a ride
+                  value: { ride: null }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+
+  /passengers/me/rides:
+    get:
+      tags: [Passenger reads]
+      summary: The passenger's ride history
+      description: |
+        Every ride this passenger has requested, newest first, paged.
+
+        The item is a **summary**: enough to render a list — where it was, when,
+        what it cost, who drove — and deliberately not the full detail. Reading
+        each ride's stops and event log to build a list would be a query per row,
+        which is exactly the N+1 this projection exists to avoid. Use
+        `GET /passengers/me/rides/{rideRequestId}` for one ride's detail.
+
+        `from` and `to` are an inclusive range on `requested_at`. Both are optional
+        and independent: `?from=` alone means "since", `?to=` alone means "up to".
+      operationId: listMyRides
+      parameters:
+        - name: status
+          in: query
+          description: Only rides in this status. Unknown values are a 400, not an empty page.
+          required: false
+          schema:
+            $ref: '#/components/schemas/RideRequestStatus'
+        - name: from
+          in: query
+          description: Inclusive lower bound on `requestedAt`, as an ISO 8601 instant with an offset.
+          required: false
+          schema: { type: string, format: date-time }
+          example: '2026-09-01T00:00:00+06:00'
+        - name: to
+          in: query
+          description: Inclusive upper bound on `requestedAt`.
+          required: false
+          schema: { type: string, format: date-time }
+          example: '2026-09-30T23:59:59+06:00'
+        - name: limit
+          in: query
+          description: Page size. Defaults to 20; the maximum is 100.
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: offset
+          in: query
+          description: Rows to skip. Combine with `hasMore` from the previous page.
+          required: false
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: One page of the passenger's own rides, newest first.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Pagination'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/RideSummary' }
+              examples:
+                settled:
+                  summary: A completed shared ride
+                  value:
+                    data:
+                      - rideRequestId: 86274eb8-0f84-42b3-b2b8-3619d7c7f902
+                        status: COMPLETED
+                        cancellable: false
+                        pickup: { code: banani-road-11, name: Banani Road 11 }
+                        destination: { code: mohakhali-bus-terminal, name: Mohakhali Bus Terminal }
+                        requestedAt: '2026-09-25T12:17:06.592Z'
+                        startedAt: '2026-09-25T12:17:07.709Z'
+                        completedAt: '2026-09-25T12:17:07.895Z'
+                        cancelledAt: null
+                        route: { distanceMeters: 2214, durationSeconds: 569 }
+                        soloEstimate:
+                          fare: '130.63'
+                          currency: BDT
+                          pricingCode: dhaka-solo
+                          pricingVersion: 1
+                        sharedFare: { fare: '126.63', currency: BDT, finalized: true, poolVersion: 1 }
+                        driver: { displayName: Jashim }
+                        vehicle: { name: Bullet, seatCapacity: 3 }
+                        passengerCount: 1
+                    pagination: { limit: 20, offset: 0, returned: 1, total: 1, hasMore: false }
+                empty:
+                  summary: A passenger who has never ridden
+                  value:
+                    data: []
+                    pagination: { limit: 20, offset: 0, returned: 0, total: 0, hasMore: false }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+
+  /passengers/me/rides/{rideRequestId}:
+    get:
+      tags: [Passenger reads]
+      summary: One of the passenger's own rides, in detail
+      description: |
+        Adds three things a summary does not have: this passenger's own stops,
+        their own lifecycle timeline, and the pool the journey was shared with.
+
+        **Another passenger's ride is a 404**, not a 403 — a 403 would confirm the
+        id is real, which tells one passenger that another passenger's ride exists.
+        The ownership filter is part of the database query, so a ride that is not
+        the caller's is simply not found.
+
+        `timeline` is built by `src/services/timeline.rules.js`, which turns
+        internal event types into sentences and **drops everything the passenger
+        should not see**: the dispatch family (`DRIVER_OFFERED`, `DRIVER_REJECTED`,
+        `DRIVER_OFFER_EXPIRED`, `POOL_CANDIDATE_EVALUATED`, `POOL_JOIN_OFFERED`,
+        `POOL_JOIN_REJECTED`, `INITIAL_DISPATCH_FALLBACK`) is absent entirely, and
+        no event's `metadata` — which names offers, candidate scores and member ids
+        — is ever read. Entries are ordered by `sequence`, then timestamp, then id.
+      operationId: getMyRide
+      parameters:
+        - name: rideRequestId
+          in: path
+          required: true
+          description: The ride request to read. Must belong to the authenticated passenger.
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The ride, with its own stops and timeline.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RideDetail' }
+              example:
+                rideRequestId: 86274eb8-0f84-42b3-b2b8-3619d7c7f902
+                status: COMPLETED
+                cancellable: false
+                pickup: { code: banani-road-11, name: Banani Road 11 }
+                destination: { code: mohakhali-bus-terminal, name: Mohakhali Bus Terminal }
+                requestedAt: '2026-09-25T12:17:06.592Z'
+                startedAt: '2026-09-25T12:17:07.709Z'
+                completedAt: '2026-09-25T12:17:07.895Z'
+                cancelledAt: null
+                route: { distanceMeters: 2214, durationSeconds: 569 }
+                soloEstimate: { fare: '130.63', currency: BDT, pricingCode: dhaka-solo, pricingVersion: 1 }
+                sharedFare: { fare: '126.63', currency: BDT, finalized: true, poolVersion: 1 }
+                driver: { displayName: Jashim }
+                vehicle: { name: Bullet, seatCapacity: 3 }
+                passengerCount: 1
+                stage: RIDE_COMPLETED
+                nextAction: RIDE_FINISHED
+                searchExpiresAt: '2026-09-25T12:27:06.592Z'
+                memberStatus: DROPPED_OFF
+                myStops:
+                  - stopId: 8100d3eb-db04-4a6c-8329-04b9c85f397f
+                    sequence: 1
+                    stopType: PICKUP
+                    status: COMPLETED
+                    servicePoint: { code: banani-road-11, name: Banani Road 11 }
+                    plannedArrivalAt: '2026-09-25T12:19:00.902Z'
+                    actualArrivalAt: '2026-09-25T12:17:07.486Z'
+                    completedAt: '2026-09-25T12:17:07.607Z'
+                  - stopId: d5c2eee2-c522-437a-a9c9-40d5f387e4d2
+                    sequence: 2
+                    stopType: DROPOFF
+                    status: COMPLETED
+                    servicePoint: { code: mohakhali-bus-terminal, name: Mohakhali Bus Terminal }
+                    plannedArrivalAt: '2026-09-25T12:28:29.902Z'
+                    actualArrivalAt: '2026-09-25T12:17:07.801Z'
+                    completedAt: '2026-09-25T12:17:07.895Z'
+                sharedRoute: { distanceMeters: 2214, durationSeconds: 569 }
+                pool:
+                  poolId: f9247881-c272-4117-83ce-4f502f521b7b
+                  status: COMPLETED
+                  passengerCount: 1
+                  capacity: 3
+                  completedAt: '2026-09-25T12:17:08.017Z'
+                member:
+                  memberStatus: DROPPED_OFF
+                  matchedAt: '2026-09-25T12:17:06.902Z'
+                  pickedUpAt: '2026-09-25T12:17:07.607Z'
+                  droppedOffAt: '2026-09-25T12:17:07.895Z'
+                timeline:
+                  - sequence: 1
+                    eventType: RIDE_REQUESTED
+                    phase: REQUEST
+                    label: Ride requested
+                    actorType: PASSENGER
+                    at: '2026-09-25T12:17:06.592Z'
+                  - sequence: 3
+                    eventType: PASSENGER_MATCHED
+                    phase: MATCHING
+                    label: You were matched with a driver
+                    actorType: SYSTEM
+                    at: '2026-09-25T12:17:06.902Z'
+                  - sequence: 6
+                    eventType: DRIVER_ARRIVED
+                    phase: PICKUP
+                    label: Your driver arrived at your pickup
+                    actorType: SYSTEM
+                    at: '2026-09-25T12:17:07.486Z'
+                  - sequence: 7
+                    eventType: PASSENGER_PICKED_UP
+                    phase: PICKUP
+                    label: You were picked up
+                    actorType: DRIVER
+                    at: '2026-09-25T12:17:07.607Z'
+                  - sequence: 10
+                    eventType: RIDE_COMPLETED
+                    phase: END
+                    label: Ride completed
+                    actorType: SYSTEM
+                    at: '2026-09-25T12:17:07.895Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # -------------------------------------------------------------------------
+  # Driver availability
+  # -------------------------------------------------------------------------
+  /drivers/me/availability:
+    get:
+      tags: [Driver availability]
+      summary: The driver's own availability
+      description: |
+        Whether dispatch will consider this driver, and where they are.
+
+        `operationalStatus` is the state machine's four values. A driver is
+        dispatchable only while `AVAILABLE`; `OFFLINE` is excluded by the
+        candidate query, `RESERVED` means an accepted pool whose trip has not
+        departed, and `ON_RIDE` means a passenger is in the car.
+
+        `online` is that same fact as the boolean a toggle binds to: `false`
+        exactly when the status is `OFFLINE`. `canGoOnline`/`canGoOffline` are
+        derived from the state, so a client shows the button the server would
+        accept rather than reimplementing the rules.
+
+        `servicePoint` and `currentServicePoint` are the same place; `servicePoint`
+        also carries the id, which is what a client sends back when it goes
+        online. Both are published so that a caller written against either shape
+        works, and both come from one row so they cannot disagree.
+      operationId: getAvailability
+      parameters: []
+      responses:
+        '200':
+          description: The driver's own availability.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DriverAvailability' }
+              examples:
+                available:
+                  summary: Jashim is online at Banani Kakoli, waiting for work
+                  value:
+                    driverProfileId: 781bd925-1aa6-42ac-a03c-c2f49afa4a9e
+                    status: AVAILABLE
+                    online: true
+                    operationalStatus: AVAILABLE
+                    currentServicePoint: { code: banani-kakoli, name: Banani Kakoli }
+                    servicePoint:
+                      id: 00984d60-f962-4765-bbe3-ba40e7f61d98
+                      code: banani-kakoli
+                      name: Banani Kakoli
+                    vehicle:
+                      vehicleId: 136e7c11-0758-4887-b04b-41017bedf94e
+                      name: Bullet
+                      seatCapacity: 3
+                    vehicles:
+                      - vehicleId: 136e7c11-0758-4887-b04b-41017bedf94e
+                        name: Bullet
+                        seatCapacity: 3
+                    availableSince: '2026-09-25T12:17:06.051Z'
+                    lastSeenAt: '2026-09-25T12:17:06.051Z'
+                    canGoOnline: true
+                    canGoOffline: true
+                    updatedAt: '2026-09-25T12:17:06.053Z'
+                offline:
+                  summary: A driver taking no work
+                  value:
+                    driverProfileId: 781bd925-1aa6-42ac-a03c-c2f49afa4a9e
+                    status: OFFLINE
+                    online: false
+                    operationalStatus: OFFLINE
+                    currentServicePoint: null
+                    servicePoint: null
+                    vehicle: null
+                    vehicles: []
+                    availableSince: null
+                    lastSeenAt: '2026-09-25T12:15:00.000Z'
+                    canGoOnline: true
+                    canGoOffline: false
+                    updatedAt: '2026-09-25T12:15:00.000Z'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+    patch:
+      tags: [Driver availability]
+      summary: Go online or offline
+      description: |
+        One write for the whole toggle, so a client sends what the driver wants
+        rather than deciding which of two URLs to call and handling "already
+        offline" itself.
+
+        ```text
+        { online: true,  servicePointCode | servicePointId, vehicleId? }  -> AVAILABLE
+        { online: false }                                                 -> OFFLINE
+        ```
+
+        ## What this endpoint deliberately cannot do
+
+        `operationalStatus` and `status` are **not accepted**: sending either is a
+        400, not a silent no-op. A client may say "I am online" or "I am offline";
+        it may never say "I am `ON_RIDE`". `RESERVED` and `ON_RIDE` are established
+        by accepting an offer and departing for the first pickup, and a device that
+        could set them could make itself dispatchable while carrying a passenger,
+        or invisible while committed to one.
+
+        ## Refusals
+
+        | Situation | Status | Why |
+        | --------- | ------ | --- |
+        | `online: true` with no place | `400` | A driver who is online is somewhere; dispatch measures an approach from it |
+        | Both `servicePointCode` and `servicePointId` | `400` | Two answers to one question; guessing which was meant puts the driver at the wrong corner |
+        | `online` not a boolean | `400` | `"yes"` is not a state |
+        | Unknown service point | `404` | A typo |
+        | Inactive service point | `409` | A real place that is not accepting rides |
+        | A `RESERVED` or `ON_RIDE` driver going offline | `409` | A passenger is waiting for this car; releasing that is an operator's decision, not a device's |
+        | No active vehicle, or several and none chosen | `409` | Dispatch needs a vehicle with capacity |
+        | Going offline while already offline | `200` | Idempotent: a retried toggle is not an error |
+
+        Going online again while already `AVAILABLE` does not reset `availableSince`
+        — a driver cannot gain idle credit by refreshing their position — but it
+        does refresh `lastSeenAt`, which is what keeps them eligible for dispatch.
+      operationId: setAvailability
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AvailabilityRequest' }
+            examples:
+              onlineByCode:
+                summary: Come online at a service point code
+                value: { online: true, servicePointCode: banani-kakoli }
+              onlineById:
+                summary: Come online at a service point id, with a chosen vehicle
+                value:
+                  online: true
+                  servicePointId: 00984d60-f962-4765-bbe3-ba40e7f61d98
+                  vehicleId: 136e7c11-0758-4887-b04b-41017bedf94e
+              offline:
+                summary: Stop taking work
+                value: { online: false }
+      responses:
+        '200':
+          description: The availability after the change, in the same shape as the `GET`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DriverAvailability' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+        '404':
+          description: The service point in the body does not exist.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error: { message: 'Service point "nowhere-at-all" was not found' }
+        '409':
+          description: |
+            The driver is `RESERVED` or `ON_RIDE`, the service point is inactive,
+            or they have no usable vehicle.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                reserved:
+                  value:
+                    error: { message: 'A driver who is RESERVED cannot go offline through this endpoint' }
+                inactivePoint:
+                  value:
+                    error: { message: 'Service point "gulshan-2-circle" is not accepting rides right now' }
+
+  # -------------------------------------------------------------------------
+  # Driver reads
+  # -------------------------------------------------------------------------
+  /drivers/me/current-pool:
+    get:
+      tags: [Driver reads]
+      summary: The pool the driver is committed to
+      description: |
+        The driver's active pool: the ordered plan, the next actionable stop, the
+        passengers, the route, and — computed from the state on every read — the
+        list of commands the driver may issue next.
+
+        `allowedActions` is the point of the endpoint. It contains an action only
+        when the corresponding command would succeed, so a client renders buttons
+        rather than guessing, and it cannot drift from the rules because the same
+        `trip.rules.js` answers both this and the command. On a finished pool it is
+        empty.
+
+        `pricing` reports **whether the fare is settled, never an amount**: a
+        boolean and a version. Mid-trip, what a passenger is paying must not be part
+        of a driver's decision about where to go next. A driver's *history* does
+        report the pool's total — see `GET /drivers/me/rides/{poolId}`.
+
+        `pool` is `null` for a driver with no active pool, which is the same answer
+        a driver whose trip just finished gets. `/drivers/me/pool` is an alias of
+        this path, kept so that a caller written before the trip milestone keeps
+        working; both answer identically.
+      operationId: getCurrentPool
+      parameters: []
+      responses:
+        '200':
+          description: The active pool, or `null`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [pool]
+                properties:
+                  pool:
+                    oneOf:
+                      - $ref: '#/components/schemas/Pool'
+                      - type: 'null'
+              examples:
+                arrived:
+                  summary: Jashim is at Nusrat's pickup and may collect her
+                  value:
+                    pool:
+                      poolId: f9247881-c272-4117-83ce-4f502f521b7b
+                      status: ARRIVED
+                      version: 1
+                      capacity: 3
+                      vehicle: { name: Bullet, seatCapacity: 3 }
+                      plan: { distanceMeters: 2214, durationSeconds: 569, stopCount: 2 }
+                      stops:
+                        - stopId: 8100d3eb-db04-4a6c-8329-04b9c85f397f
+                          sequence: 1
+                          stopType: PICKUP
+                          status: ARRIVED
+                          servicePoint: { code: banani-road-11, name: Banani Road 11 }
+                          plannedArrivalAt: '2026-09-25T12:19:00.902Z'
+                          actualArrivalAt: '2026-09-25T12:17:07.486Z'
+                          completedAt: null
+                        - stopId: d5c2eee2-c522-437a-a9c9-40d5f387e4d2
+                          sequence: 2
+                          stopType: DROPOFF
+                          status: PENDING
+                          servicePoint: { code: mohakhali-bus-terminal, name: Mohakhali Bus Terminal }
+                          plannedArrivalAt: '2026-09-25T12:28:29.902Z'
+                          actualArrivalAt: null
+                          completedAt: null
+                      nextStop:
+                        stopId: 8100d3eb-db04-4a6c-8329-04b9c85f397f
+                        sequence: 1
+                        stopType: PICKUP
+                        status: ARRIVED
+                      allowedActions: [PICKUP_PASSENGER]
+                      pricing: { finalized: true, finalizedAt: '2026-09-25T12:17:07.382Z', poolVersion: 1 }
+                      departedAt: '2026-09-25T12:17:07.382Z'
+                      members:
+                        - memberId: 2378fa0d-54f7-48c8-b588-e1ef23bbd66d
+                          status: ASSIGNED
+                          rideStatus: MATCHED
+                          displayName: Nusrat
+                          pickup: { code: banani-road-11, name: Banani Road 11 }
+                          dropoff: { code: mohakhali-bus-terminal, name: Mohakhali Bus Terminal }
+                          matchedAt: '2026-09-25T12:17:06.902Z'
+                          pickedUpAt: null
+                          droppedOffAt: null
+                      events:
+                        - sequence: 1
+                          eventType: POOL_CREATED
+                          actorType: DRIVER
+                          createdAt: '2026-09-25T12:17:06.902Z'
+                noPool:
+                  summary: A driver between rides
+                  value: { pool: null }
+                sharedCorner:
+                  summary: |
+                    Two passengers collected at the same corner. A stop names one
+                    member and one type, so this is **two consecutive pickup stops at
+                    one service point** — which is why a shared corner stays open
+                    until everybody there is aboard, with no special rule for it.
+                  value:
+                    pool:
+                      poolId: 7c1a2b3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d
+                      status: DRIVER_EN_ROUTE
+                      version: 2
+                      capacity: 3
+                      vehicle: { name: Bullet, seatCapacity: 3 }
+                      plan: { distanceMeters: 2680, durationSeconds: 690, stopCount: 4 }
+                      stops:
+                        - stopId: 11111111-1111-4111-8111-111111111111
+                          sequence: 1
+                          stopType: PICKUP
+                          status: PENDING
+                          servicePoint: { code: banani-road-11, name: Banani Road 11 }
+                          plannedArrivalAt: '2026-09-25T12:19:00.902Z'
+                          actualArrivalAt: null
+                          completedAt: null
+                        - stopId: 22222222-2222-4222-8222-222222222222
+                          sequence: 2
+                          stopType: PICKUP
+                          status: PENDING
+                          servicePoint: { code: banani-road-11, name: Banani Road 11 }
+                          plannedArrivalAt: '2026-09-25T12:19:00.902Z'
+                          actualArrivalAt: null
+                          completedAt: null
+                        - stopId: 33333333-3333-4333-8333-333333333333
+                          sequence: 3
+                          stopType: DROPOFF
+                          status: PENDING
+                          servicePoint: { code: mohakhali-bus-terminal, name: Mohakhali Bus Terminal }
+                          plannedArrivalAt: '2026-09-25T12:28:29.902Z'
+                          actualArrivalAt: null
+                          completedAt: null
+                        - stopId: 44444444-4444-4444-8444-444444444444
+                          sequence: 4
+                          stopType: DROPOFF
+                          status: PENDING
+                          servicePoint: { code: gulshan-2-circle, name: Gulshan 2 Circle }
+                          plannedArrivalAt: '2026-09-25T12:35:11.902Z'
+                          actualArrivalAt: null
+                          completedAt: null
+                      nextStop:
+                        stopId: 11111111-1111-4111-8111-111111111111
+                        sequence: 1
+                        stopType: PICKUP
+                        status: PENDING
+                      allowedActions: [ARRIVE_AT_STOP]
+                      pricing: { finalized: true, finalizedAt: '2026-09-25T12:17:00.000Z', poolVersion: 2 }
+                      departedAt: '2026-09-25T12:17:00.000Z'
+                      members:
+                        - memberId: 2378fa0d-54f7-48c8-b588-e1ef23bbd66d
+                          status: ASSIGNED
+                          rideStatus: MATCHED
+                          displayName: Nusrat
+                          pickup: { code: banani-road-11, name: Banani Road 11 }
+                          dropoff: { code: mohakhali-bus-terminal, name: Mohakhali Bus Terminal }
+                          matchedAt: '2026-09-25T12:16:00.000Z'
+                          pickedUpAt: null
+                          droppedOffAt: null
+                        - memberId: 5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b
+                          status: ASSIGNED
+                          rideStatus: MATCHED
+                          displayName: Shirin
+                          pickup: { code: banani-road-11, name: Banani Road 11 }
+                          dropoff: { code: gulshan-2-circle, name: Gulshan 2 Circle }
+                          matchedAt: '2026-09-25T12:16:30.000Z'
+                          pickedUpAt: null
+                          droppedOffAt: null
+                      events:
+                        - sequence: 1
+                          eventType: POOL_CREATED
+                          actorType: DRIVER
+                          createdAt: '2026-09-25T12:16:00.000Z'
+                        - sequence: 2
+                          eventType: MEMBER_ADDED
+                          actorType: DRIVER
+                          createdAt: '2026-09-25T12:16:30.000Z'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+
+  /drivers/me/rides:
+    get:
+      tags: [Driver reads]
+      summary: The pools the driver has driven
+      description: |
+        The driver's own history, newest first, paged.
+
+        The unit is a **pool**, not a ride request. A pool is one car's journey: a
+        driver who carried three passengers drove one trip, not three, and a
+        history per ride request would show the same journey three times and make
+        "how many trips did I drive" unanswerable.
+
+        Each item is a summary: the vehicle, when it ran, where it started and
+        ended, the route, and two counts. It deliberately does **not** include the
+        passenger rows — a count is enough for a list, and reading every member of
+        every pool on the page is the N+1 this projection avoids.
+
+        `from` and `to` filter `createdAt`, not `completedAt`, because `createdAt`
+        is never null: filtering by completion would hide the pools a driver cares
+        most about, the ones still running. "Finished trips in a range" is
+        `?status=COMPLETED&from=…&to=…`.
+      operationId: listMyRides
+      parameters:
+        - name: status
+          in: query
+          description: Only pools in this status.
+          required: false
+          schema: { $ref: '#/components/schemas/RidePoolStatus' }
+        - name: from
+          in: query
+          description: Inclusive lower bound on `createdAt`.
+          required: false
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          description: Inclusive upper bound on `createdAt`.
+          required: false
+          schema: { type: string, format: date-time }
+        - name: limit
+          in: query
+          description: Page size. Defaults to 20; the maximum is 100.
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: offset
+          in: query
+          description: Rows to skip.
+          required: false
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: One page of the driver's own pools, newest first.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Pagination'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/DriverRideSummary' }
+              examples:
+                completed:
+                  summary: Jashim's finished Banani → Mohakhali trip
+                  value:
+                    data:
+                      - poolId: f9247881-c272-4117-83ce-4f502f521b7b
+                        status: COMPLETED
+                        vehicle:
+                          vehicleId: 136e7c11-0758-4887-b04b-41017bedf94e
+                          name: Bullet
+                          seatCapacity: 3
+                        createdAt: '2026-09-25T12:17:06.902Z'
+                        acceptedAt: '2026-09-25T12:17:06.902Z'
+                        completedAt: '2026-09-25T12:17:08.017Z'
+                        firstServicePoint: { code: banani-road-11, name: Banani Road 11 }
+                        finalServicePoint: { code: mohakhali-bus-terminal, name: Mohakhali Bus Terminal }
+                        route: { distanceMeters: 2214, durationSeconds: 569 }
+                        passengerCount: 1
+                        stopCount: 2
+                        completedStopCount: 2
+                        fare:
+                          fareStatus: FINALIZED
+                          finalized: true
+                          finalizedAt: '2026-09-25T12:17:07.382Z'
+                          currency: BDT
+                          poolVersion: 1
+                          totalPassengerFare: '126.63'
+                    pagination: { limit: 20, offset: 0, returned: 1, total: 1, hasMore: false }
+                empty:
+                  summary: A driver who has not driven yet
+                  value:
+                    data: []
+                    pagination: { limit: 20, offset: 0, returned: 0, total: 0, hasMore: false }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+
+  /drivers/me/rides/{poolId}:
+    get:
+      tags: [Driver reads]
+      summary: One of the driver's own pools, in detail
+      description: |
+        The ordered plan, the passengers, the driver's own timestamps, the pool's
+        lifecycle timeline, and the fare the pool came to.
+
+        **Another driver's pool is a 404**, not a 403: a 403 would tell one driver
+        that another driver's pool id is real.
+
+        ## What a driver may see, and what they may not
+
+        A driver has to operate the ride, so a passenger appears with a first name,
+        their two service points and their own timestamps. Nothing else is read:
+
+        * no passenger account field, user id, email or credential;
+        * no *per-passenger* fare. `fare.totalPassengerFare` is the whole pool added
+          up, with no key that could attribute an amount to a person;
+        * no passenger event history — `ride_events` is that passenger's own record
+          and is not queried here. The timeline is the **pool's**;
+        * no other driver's data.
+
+        `allowedActions` is included and is empty for a finished pool, so a
+        history detail and a live pool answer in one shape.
+      operationId: getMyRide
+      parameters:
+        - name: poolId
+          in: path
+          required: true
+          description: The pool to read. Must have been driven by the authenticated driver.
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The pool, with its plan, passengers, fare and timeline.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DriverRideDetail' }
+              example:
+                poolId: f9247881-c272-4117-83ce-4f502f521b7b
+                status: COMPLETED
+                version: 1
+                capacity: 3
+                vehicle:
+                  vehicleId: 136e7c11-0758-4887-b04b-41017bedf94e
+                  name: Bullet
+                  seatCapacity: 3
+                createdAt: '2026-09-25T12:17:06.902Z'
+                acceptedAt: '2026-09-25T12:17:06.902Z'
+                departedAt: '2026-09-25T12:17:07.382Z'
+                driverArrivedAt: '2026-09-25T12:17:07.486Z'
+                startedAt: '2026-09-25T12:17:07.709Z'
+                completedAt: '2026-09-25T12:17:08.017Z'
+                cancelledAt: null
+                route: { distanceMeters: 2214, durationSeconds: 569 }
+                stops:
+                  - stopId: 8100d3eb-db04-4a6c-8329-04b9c85f397f
+                    sequence: 1
+                    stopType: PICKUP
+                    status: COMPLETED
+                    servicePoint: { code: banani-road-11, name: Banani Road 11 }
+                    poolMemberId: 2378fa0d-54f7-48c8-b588-e1ef23bbd66d
+                    plannedArrivalAt: '2026-09-25T12:19:00.902Z'
+                    actualArrivalAt: '2026-09-25T12:17:07.486Z'
+                    completedAt: '2026-09-25T12:17:07.607Z'
+                  - stopId: d5c2eee2-c522-437a-a9c9-40d5f387e4d2
+                    sequence: 2
+                    stopType: DROPOFF
+                    status: COMPLETED
+                    servicePoint: { code: mohakhali-bus-terminal, name: Mohakhali Bus Terminal }
+                    poolMemberId: 2378fa0d-54f7-48c8-b588-e1ef23bbd66d
+                    plannedArrivalAt: '2026-09-25T12:28:29.902Z'
+                    actualArrivalAt: '2026-09-25T12:17:07.801Z'
+                    completedAt: '2026-09-25T12:17:07.895Z'
+                nextStop: null
+                passengers:
+                  - memberId: 2378fa0d-54f7-48c8-b588-e1ef23bbd66d
+                    memberStatus: DROPPED_OFF
+                    displayName: Nusrat
+                    pickup: { code: banani-road-11, name: Banani Road 11 }
+                    dropoff: { code: mohakhali-bus-terminal, name: Mohakhali Bus Terminal }
+                    matchedAt: '2026-09-25T12:17:06.902Z'
+                    pickedUpAt: '2026-09-25T12:17:07.607Z'
+                    droppedOffAt: '2026-09-25T12:17:07.895Z'
+                passengerCount: 1
+                fare:
+                  fareStatus: FINALIZED
+                  finalized: true
+                  finalizedAt: '2026-09-25T12:17:07.382Z'
+                  currency: BDT
+                  poolVersion: 1
+                  totalPassengerFare: '126.63'
+                allowedActions: []
+                timeline:
+                  - sequence: 1
+                    eventType: POOL_CREATED
+                    phase: REQUEST
+                    label: Pool created
+                    actorType: DRIVER
+                    at: '2026-09-25T12:17:06.902Z'
+                  - sequence: 4
+                    eventType: SHARED_FARE_CALCULATED
+                    phase: MATCHING
+                    label: Shared fare calculated
+                    actorType: SYSTEM
+                    at: '2026-09-25T12:17:07.382Z'
+                  - sequence: 5
+                    eventType: DRIVER_DEPARTED
+                    phase: PICKUP
+                    label: Departed for the first pickup
+                    actorType: DRIVER
+                    at: '2026-09-25T12:17:07.382Z'
+                  - sequence: 8
+                    eventType: TRIP_STARTED
+                    phase: RIDE
+                    label: Trip started
+                    actorType: DRIVER
+                    at: '2026-09-25T12:17:07.709Z'
+                  - sequence: 11
+                    eventType: TRIP_COMPLETED
+                    phase: END
+                    label: Trip completed
+                    actorType: DRIVER
+                    at: '2026-09-25T12:17:08.017Z'
+                  - sequence: 12
+                    eventType: DRIVER_AVAILABLE
+                    phase: END
+                    label: Driver available again
+                    actorType: SYSTEM
+                    at: '2026-09-25T12:17:08.017Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # -------------------------------------------------------------------------
+  # Documentation
+  # -------------------------------------------------------------------------
+  /docs:
+    get:
+      tags: [Documentation]
+      summary: This document
+      description: Served verbatim from `server/openapi.yaml`, as `text/yaml`.
+      operationId: getOpenApiDocument
+      security: []
+      responses:
+        '200':
+          description: The OpenAPI 3.1 document.
+          content:
+            text/yaml:
+              schema: { type: string }
+
+  # -------------------------------------------------------------------------
+  # The rest of the API
+  #
+  # These predate the read-API milestone and are described in full, one section
+  # per milestone, in `README.md`. They are documented here too -- concisely, with
+  # their parameters, bodies and responses -- because a specification that covers
+  # only part of the API is worse than none: a reader cannot tell a missing
+  # endpoint from one that does not exist.
+  # -------------------------------------------------------------------------
+  /auth/register:
+    post:
+      tags: [Authentication]
+      summary: Sign up as a PASSENGER or DRIVER, and sign in
+      operationId: register
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, password]
+              additionalProperties: false
+              properties:
+                name: { type: string, example: Nusrat Jahan }
+                email: { type: string, format: email, example: nusrat@example.com }
+                password: { type: string, minLength: 8, format: password }
+                role: { type: string, enum: [PASSENGER, DRIVER], default: PASSENGER }
+      responses:
+        '201':
+          description: The account was created and the auth cookie set.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthenticatedUser' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: An account with that email already exists.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /auth/login:
+    post:
+      tags: [Authentication]
+      summary: Log in; sets the auth cookie
+      description: |
+        The token is returned **only** as an HttpOnly cookie, never in the body.
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              additionalProperties: false
+              properties:
+                email: { type: string, format: email, example: jashim@example.com }
+                password: { type: string, format: password }
+            example: { email: jashim@example.com, password: DemoPass123! }
+      responses:
+        '200':
+          description: Signed in; the cookie is set.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthenticatedUser' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: The email or password is wrong. One message for both, so neither can be probed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /auth/me:
+    get:
+      tags: [Authentication]
+      summary: The authenticated user
+      operationId: getAuthenticatedUser
+      parameters: []
+      responses:
+        '200':
+          description: The user the cookie names, as the database has them now.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthenticatedUser' }
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  /auth/logout:
+    post:
+      tags: [Authentication]
+      summary: Clear the auth cookie
+      description: Safe to retry — a second logout is still a success.
+      operationId: logout
+      parameters: []
+      responses:
+        '200':
+          description: The cookie was cleared.
+          content:
+            application/json:
+              schema: { type: object, properties: { message: { type: string } } }
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  /users:
+    get:
+      tags: [Users]
+      summary: List users
+      description: >
+        **Still public**, so the demo page renders before anyone signs in. See the
+        README's next steps.
+      operationId: listUsers
+      security: []
+      parameters: []
+      responses:
+        '200':
+          description: Every user.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/User' } }
+    post:
+      tags: [Users]
+      summary: Create a user
+      description: ADMIN only.
+      operationId: createUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email]
+              additionalProperties: false
+              properties:
+                name: { type: string, example: Shirin Akter }
+                email: { type: string, format: email, example: shirin@example.com }
+      responses:
+        '201':
+          description: The user was created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+
+  /users/{id}:
+    get:
+      tags: [Users]
+      summary: Get a single user
+      description: Public, like the list.
+      operationId: getUser
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /health:
+    get:
+      tags: [Operational]
+      summary: Service status
+      description: |
+        Reports `"ok"` when the database is reachable and `"degraded"` when it is
+        not. Never fails the request, so a monitor gets an answer either way.
+      operationId: getHealth
+      security: []
+      parameters: []
+      responses:
+        '200':
+          description: The status, whatever the database is doing.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok, degraded] }
+                  uptime: { type: number }
+                  timestamp: { type: string, format: date-time }
+                  database:
+                    type: object
+                    properties:
+                      status: { type: string, enum: [up, down] }
+                      latencyMs: { type: integer, nullable: true }
+              example:
+                status: ok
+                uptime: 23.6
+                timestamp: '2026-09-22T18:47:05.740Z'
+                database: { status: up, latencyMs: 2 }
+
+  /location/zones:
+    get:
+      tags: [Location]
+      summary: List the active service zones
+      operationId: listZones
+      security: []
+      parameters: []
+      responses:
+        '200':
+          description: The seeded zones.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/Zone' } }
+
+  /location/points:
+    get:
+      tags: [Location]
+      summary: List active service points
+      operationId: listServicePoints
+      security: []
+      parameters:
+        - name: zoneCode
+          in: query
+          required: false
+          description: Restrict to one zone. Case-insensitive.
+          schema: { type: string, example: banani }
+      responses:
+        '200':
+          description: The service points, optionally filtered by zone.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ServicePointWithId' }
+              example:
+                data:
+                  - id: 00984d60-f962-4765-bbe3-ba40e7f61d98
+                    code: banani-road-11
+                    name: Banani Road 11
+                    zoneCode: banani
+                    latitude: 23.7937
+                    longitude: 90.4043
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /location/points/{code}:
+    get:
+      tags: [Location]
+      summary: Get one service point by code
+      operationId: getServicePoint
+      security: []
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema: { type: string, example: banani-road-11 }
+      responses:
+        '200':
+          description: The service point.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServicePointWithId' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The point exists but is inactive.
+
+  /routes/estimate:
+    post:
+      tags: [Routing and pricing]
+      summary: Estimate a route between two service points
+      description: Requires authentication — see the README's Routing section.
+      operationId: estimateRoute
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [originServicePointCode, destinationServicePointCode]
+              additionalProperties: false
+              properties:
+                originServicePointCode: { type: string, example: banani-road-11 }
+                destinationServicePointCode: { type: string, example: mohakhali-bus-terminal }
+                departureAt: { type: string, format: date-time, description: 'Defaults to now.' }
+      responses:
+        '200':
+          description: The route, in metres and seconds, with the profile it was measured under.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RouteEstimate' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          description: No route exists between the two points in this direction.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /fare-quotes:
+    post:
+      tags: [Routing and pricing]
+      summary: Quote a solo fare
+      description: PASSENGER only. The quote is owned by the caller and frozen.
+      operationId: createFareQuote
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [originServicePointCode, destinationServicePointCode]
+              additionalProperties: false
+              properties:
+                originServicePointCode: { type: string, example: banani-road-11 }
+                destinationServicePointCode: { type: string, example: mohakhali-bus-terminal }
+                departureAt:
+                  type: string
+                  format: date-time
+                  description: 'The instant the fare is priced at. Defaults to now.'
+      responses:
+        '201':
+          description: The quote. A retry with the same inputs returns the same quote.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FareQuote' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /ride-requests:
+    post:
+      tags: [Ride requests]
+      summary: Ask for a ride from a quote the caller owns
+      description: |
+        PASSENGER only. The `Idempotency-Key` header is **required**: a retry with
+        the same key returns the request the first call created, as a `200`.
+      operationId: createRideRequest
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: 8–128 characters. Identifies one intent, not one attempt.
+          schema: { type: string, minLength: 8, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fareQuoteId]
+              additionalProperties: false
+              properties:
+                fareQuoteId: { type: string, format: uuid }
+            example: { fareQuoteId: 3f2a1b0c-9d8e-4f7a-8b6c-5d4e3f2a1b0c }
+      responses:
+        '201':
+          description: The request was created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RideRequestWithTrip' }
+        '200':
+          description: An idempotent retry returned the request that already existed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RideRequestWithTrip' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+        '404':
+          description: The quote does not exist, or is not the caller's.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: The caller already has an active ride request.
+
+  /ride-requests/my:
+    get:
+      tags: [Ride requests]
+      summary: The caller's own ride requests, newest first
+      description: |
+        Superseded by `GET /passengers/me/rides` for a passenger client, and still
+        supported. Same pagination envelope.
+      operationId: listMyRideRequests
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/RideRequestStatus' }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: offset
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: One page of the caller's own requests.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Pagination' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+
+  /ride-requests/{id}:
+    get:
+      tags: [Ride requests]
+      summary: One of the caller's own ride requests
+      description: |
+        Includes the `trip` block once the request is matched. Somebody else's
+        request is a `404`.
+      operationId: getRideRequest
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The request, with the passenger's own trip when there is one.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RideRequestWithTrip' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /ride-requests/{id}/cancel:
+    post:
+      tags: [Ride requests]
+      summary: Cancel a request that is still WAITING
+      description: The only passenger-driven status change. A matched request cannot be cancelled.
+      operationId: cancelRideRequest
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                reason:
+                  type: string
+                  enum: [CHANGED_MIND, FOUND_OTHER_RIDE, WAITING_TOO_LONG, OTHER]
+                  default: OTHER
+      responses:
+        '200':
+          description: The cancelled request.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RideRequestWithTrip' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The request is no longer WAITING.
+
+  /ride-requests/{id}/fare:
+    get:
+      tags: [Ride requests]
+      summary: The caller's own shared fare, with its breakdown
+      description: |
+        Answers `404` when there is no shared fare to report — before a match, and
+        for the moment around a match before its calculation is written. A
+        passenger who is not sharing anything has no pooled fare, and reporting
+        `0.00` would be inventing an answer.
+      operationId: getRideRequestFare
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: This passenger's allocation, and the rules that produced it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PassengerFare' }
+              example:
+                rideRequestId: 86274eb8-0f84-42b3-b2b8-3619d7c7f902
+                fareStatus: FINALIZED
+                calculationStatus: FINALIZED
+                currency: BDT
+                acceptedSoloFare: '130.63'
+                currentPooledFare: '126.63'
+                baseFare: '40.00'
+                allocatedLegCost: '86.63'
+                uncappedPooledFare: '126.63'
+                minimumFare: '80.00'
+                minimumFareApplied: false
+                legsPaidFor: 1
+                previousPooledFare: null
+                soloCapApplied: false
+                noIncreaseCapApplied: false
+                soloCapReduction: '0.00'
+                noIncreaseReduction: '0.00'
+                totalReduction: '0.00'
+                savedAgainstSoloFare: '4.00'
+                pricingCode: dhaka-solo
+                pricingVersion: 1
+                sharedFareRuleVersion: pool-leg-share-v1
+                poolVersion: 1
+                calculatedAt: '2026-09-25T12:17:06.902Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /drivers/me/online:
+    post:
+      tags: [Driver availability]
+      summary: Go online
+      description: |
+        Superseded by `PATCH /drivers/me/availability`, and still supported with
+        the same behaviour and the same refusals.
+      operationId: goOnline
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [currentServicePointCode]
+              additionalProperties: false
+              properties:
+                currentServicePointCode: { type: string, example: banani-kakoli }
+                vehicleId: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The availability after the change.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DriverAvailability' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Already reserved or on a ride, no usable vehicle, or an inactive service point.
+
+  /drivers/me/offline:
+    post:
+      tags: [Driver availability]
+      summary: Go offline
+      description: Superseded by `PATCH /drivers/me/availability`. Idempotent.
+      operationId: goOffline
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: false }
+      responses:
+        '200':
+          description: The availability after the change.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DriverAvailability' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+        '409':
+          description: The driver is RESERVED or ON_RIDE.
+
+  /drivers/me/current-service-point:
+    put:
+      tags: [Driver availability]
+      summary: Move to another service point
+      description: |
+        The MVP's stand-in for GPS, and how a driver refreshes `lastSeenAt` while
+        waiting. A RESERVED or ON_RIDE driver cannot move.
+      operationId: setCurrentServicePoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [currentServicePointCode]
+              additionalProperties: false
+              properties:
+                currentServicePointCode: { type: string, example: gulshan-2-circle }
+      responses:
+        '200':
+          description: The availability after the move.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DriverAvailability' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The driver is RESERVED or ON_RIDE, or the point is inactive.
+
+  /drivers/me/offers:
+    get:
+      tags: [Dispatch]
+      summary: The driver's own dispatch offers, of both kinds
+      description: Defaults to the offers the driver can still act on; `status=ALL` asks for the history.
+      operationId: listOffers
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema: { type: string, enum: [PENDING, ACCEPTED, REJECTED, EXPIRED, CANCELLED, ALL] }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: The driver's own offers.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/DispatchOffer' } }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+
+  /drivers/me/offers/{offerId}:
+    get:
+      tags: [Dispatch]
+      summary: One of the driver's own offers
+      operationId: getOffer
+      parameters:
+        - name: offerId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The offer.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DispatchOffer' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /drivers/me/offers/{offerId}/accept:
+    post:
+      tags: [Dispatch]
+      summary: Accept an offer
+      description: |
+        Takes **no body** — anything sent is a `400`. Creates a pool, or adds the
+        passenger to the one the offer named, and answers with the pool.
+      operationId: acceptOffer
+      parameters:
+        - name: offerId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: false }
+      responses:
+        '200':
+          description: The pool the acceptance produced.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Pool' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            The offer expired or was already answered, the driver is no longer
+            eligible, the vehicle changed, or the pool moved on.
+
+  /drivers/me/offers/{offerId}/reject:
+    post:
+      tags: [Dispatch]
+      summary: Refuse an offer
+      description: The request moves on; the pool does not change.
+      operationId: rejectOffer
+      parameters:
+        - name: offerId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                reason: { type: string, enum: [TOO_FAR, BREAK, ENDING_SHIFT, VEHICLE, OTHER] }
+      responses:
+        '200':
+          description: The refused offer.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DispatchOffer' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The offer is no longer pending.
+
+  /drivers/me/pool:
+    get:
+      tags: [Driver reads]
+      summary: The pool the driver is committed to (alias)
+      description: An alias of `/drivers/me/current-pool`, kept for callers written before the trip milestone. All three of these names answer with the same DTO; `current-pool` is the documented one.
+      operationId: getCurrentPoolLegacyAlias
+      parameters: []
+      responses:
+        '200':
+          description: The active pool, or `null`.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pool:
+                    oneOf:
+                      - $ref: '#/components/schemas/Pool'
+                      - type: 'null'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+
+  /drivers/me/pools/{poolId}/depart:
+    post:
+      tags: [Trip]
+      summary: Set off for the first pickup
+      description: |
+        Closes the pool to matching and **freezes the fare** in the same
+        transaction. Takes no body. Idempotent by state: a second departure
+        returns the state the first one produced, moving no timestamp.
+      operationId: departPool
+      parameters:
+        - name: poolId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: false }
+      responses:
+        '200':
+          description: The pool as it now stands.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PoolEnvelope' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The pool is not FORMING, has no members, or has no drivable plan.
+
+  /drivers/me/pools/{poolId}/stops/{stopId}/arrive:
+    post:
+      tags: [Trip]
+      summary: Reach the next actionable stop
+      description: |
+        Only the lowest-sequence stop that is not `COMPLETED` may be reached, so a
+        driver cannot jump ahead to a later passenger. Arriving at the *first*
+        pickup is what moves the pool out of `DRIVER_EN_ROUTE`.
+      operationId: arriveAtStop
+      parameters:
+        - name: poolId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: stopId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: false }
+      responses:
+        '200':
+          description: The pool as it now stands.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PoolEnvelope' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The stop is not the next actionable one, or the pool has not departed.
+
+  /drivers/me/pools/{poolId}/stops/{stopId}/members/{memberId}/pickup:
+    post:
+      tags: [Trip]
+      summary: Confirm a passenger is in the vehicle
+      description: |
+        The stop must be the next actionable one, a `PICKUP`, and **that
+        passenger's own stop**, so a driver cannot complete somebody else's stop by
+        naming the wrong member. A passenger collected during a trip that is
+        already under way begins their ride immediately.
+      operationId: pickUpMember
+      parameters:
+        - name: poolId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: stopId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: memberId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: false }
+      responses:
+        '200':
+          description: The pool as it now stands.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PoolEnvelope' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The stop has not been reached, is not this passenger's, or the ride is not waiting to be collected.
+
+  /drivers/me/pools/{poolId}/start:
+    post:
+      tags: [Trip]
+      summary: Begin the journey with the passengers aboard
+      description: |
+        Requires `ARRIVED`, at least one passenger in the car, and **no pickup
+        still open at the next actionable stop** — so a passenger waiting further
+        along the route is still `MATCHED` and is collected into a running trip.
+        This is also the operation that refuses without a frozen fare.
+      operationId: startTrip
+      parameters:
+        - name: poolId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: false }
+      responses:
+        '200':
+          description: The pool as it now stands.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PoolEnvelope' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Nobody is aboard, a pickup is still open, or the fare is not finalized.
+
+  /drivers/me/pools/{poolId}/stops/{stopId}/members/{memberId}/dropoff:
+    post:
+      tags: [Trip]
+      summary: Deliver a passenger
+      description: |
+        Completes **that passenger's** ride and no more: the pool carries on with
+        whoever is still aboard, and is only `COMPLETED` when the last of them is
+        delivered.
+      operationId: dropOffMember
+      parameters:
+        - name: poolId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: stopId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: memberId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: false }
+      responses:
+        '200':
+          description: The pool as it now stands.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PoolEnvelope' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The passenger was not collected, the stop is not next, or the trip has not started.
+
+  /drivers/me/pools/{poolId}/complete:
+    post:
+      tags: [Trip]
+      summary: Finish the trip and release the driver
+      description: |
+        The only operation that is purely about facts, and it refuses if any is
+        missing: every stop completed, nobody still in the car, every ride
+        completed, and a fare frozen before the trip. It then sets the driver
+        `ON_RIDE -> AVAILABLE` **at the final drop-off's service point**, so the
+        next trip is dispatched from where this one ended.
+      operationId: completeTrip
+      parameters:
+        - name: poolId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: false }
+      responses:
+        '200':
+          description: The pool as it now stands, with the driver released.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PoolEnvelope' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: A stop is unfinished, a passenger is aboard, a ride is open, or the fare is not frozen.
+
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: teslab_auth
+      description: |
+        The signed JWT issued by `POST /api/auth/login` as an HttpOnly cookie. The
+        cookie name is configurable (`AUTH_COOKIE_NAME`); `teslab_auth` is the
+        default. Nothing is ever put in `localStorage`, and there is no bearer
+        token.
+
+  responses:
+    BadRequest:
+      description: |
+        Malformed request: a bad uuid, an unknown status, an unknown query
+        parameter, an unparseable date, or two mutually exclusive fields.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            unknownStatus:
+              value:
+                error:
+                  message: >-
+                    status must be one of: WAITING, MATCHED, IN_PROGRESS,
+                    COMPLETED, CANCELLED, EXPIRED
+            unknownParameter:
+              value:
+                error: { message: 'Unsupported query parameter(s): passengerId. Supported: status, from, to, limit, offset' }
+            badUuid:
+              value:
+                error: { message: 'rideRequestId must be a UUID' }
+    Unauthenticated:
+      description: No valid authentication, or a deactivated account.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { message: Authentication required } }
+    WrongRole:
+      description: |
+        Authenticated, but the wrong role for this endpoint — a driver calling a
+        passenger endpoint, or a passenger calling a driver one. The only 403 in
+        the API: a resource that belongs to somebody else is a 404.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { message: You do not have access to this resource } }
+    NotFound:
+      description: |
+        No such resource, **or** a resource that is not the caller's. The two are
+        deliberately the same answer, so an id cannot be probed for existence.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            ride:
+              value: { error: { message: 'Ride "e0b2c1a4-0000-4000-8000-000000000000" was not found' } }
+            pool:
+              value: { error: { message: 'Ride pool "e0b2c1a4-0000-4000-8000-000000000000" was not found' } }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [message]
+          properties:
+            message: { type: string }
+            details: { description: 'Present only for validation errors that carry a list.' }
+
+    User:
+      type: object
+      description: A user as the (still public) user endpoints report them. Never the password hash.
+      required: [id, name, email, role]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, example: Nusrat Jahan }
+        email: { type: string, format: email, example: nusrat@example.com }
+        role: { type: string, enum: [PASSENGER, DRIVER, ADMIN] }
+        active: { type: boolean }
+
+    AuthenticatedUser:
+      type: object
+      description: |
+        The authenticated user, as `/auth/me` and the sign-in endpoints report them.
+        The role is read from the database on every request, never from the token.
+      required: [id, name, email, role]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, example: Jashim Uddin }
+        email: { type: string, format: email, example: jashim@example.com }
+        role: { type: string, enum: [PASSENGER, DRIVER, ADMIN] }
+        active: { type: boolean }
+
+    Zone:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string, example: banani }
+        name: { type: string, example: Banani }
+        active: { type: boolean }
+
+    RouteEstimate:
+      type: object
+      description: A routed journey between two service points.
+      properties:
+        origin: { $ref: '#/components/schemas/ServicePoint' }
+        destination: { $ref: '#/components/schemas/ServicePoint' }
+        distanceMeters: { type: integer, example: 2214 }
+        durationSeconds: { type: integer, example: 569 }
+        trafficProfile: { type: string, enum: [NORMAL, RUSH_HOUR] }
+        edges:
+          type: array
+          items:
+            type: object
+            properties:
+              fromCode: { type: string }
+              toCode: { type: string }
+              distanceMeters: { type: integer }
+
+    FareQuote:
+      type: object
+      description: A solo fare quote, frozen at the instant it was priced.
+      properties:
+        id: { type: string, format: uuid }
+        fare: { type: string, example: '130.63' }
+        currency: { type: string, example: BDT }
+        distanceMeters: { type: integer, example: 2214 }
+        durationSeconds: { type: integer, example: 569 }
+        pricingCode: { type: string, example: dhaka-solo }
+        pricingVersion: { type: integer, example: 1 }
+        fareBreakdown:
+          type: object
+          properties:
+            baseFare: { type: string, example: '40.00' }
+            distanceFare: { type: string }
+            timeFare: { type: string }
+            trafficMultiplier: { type: string, example: '1.10' }
+            roundingScale: { type: integer, example: 2 }
+        expiresAt: { type: string, format: date-time }
+
+    PassengerFare:
+      type: object
+      description: |
+        One passenger's own pooled fare, and the rules that produced it. Derived
+        from a single allocation, so there is no shape of it in which another
+        passenger's fare could appear.
+      properties:
+        rideRequestId: { type: string, format: uuid }
+        fareStatus: { type: string, enum: [ESTIMATED, FINALIZED] }
+        calculationStatus: { type: string, enum: [CURRENT, SUPERSEDED, FINALIZED] }
+        currency: { type: string, example: BDT }
+        acceptedSoloFare: { type: string, example: '130.63' }
+        currentPooledFare: { type: string, example: '126.63' }
+        baseFare: { type: string, example: '40.00' }
+        allocatedLegCost: { type: string, example: '86.63' }
+        uncappedPooledFare: { type: string, example: '126.63' }
+        minimumFare: { type: string, example: '80.00' }
+        minimumFareApplied: { type: boolean }
+        legsPaidFor: { type: integer, example: 1 }
+        previousPooledFare: { type: string, nullable: true }
+        soloCapApplied: { type: boolean }
+        noIncreaseCapApplied: { type: boolean }
+        soloCapReduction: { type: string, example: '0.00' }
+        noIncreaseReduction: { type: string, example: '0.00' }
+        totalReduction: { type: string, example: '0.00' }
+        savedAgainstSoloFare: { type: string, example: '4.00' }
+        pricingCode: { type: string, example: dhaka-solo }
+        pricingVersion: { type: integer, example: 1 }
+        sharedFareRuleVersion: { type: string, example: pool-leg-share-v1 }
+        poolVersion: { type: integer, example: 1 }
+        calculatedAt: { type: string, format: date-time }
+
+    RideRequestWithTrip:
+      type: object
+      description: |
+        A ride request as its own passenger sees it, plus the `trip` block once it
+        is matched. `trip` is `null` before that and is left out of list pages.
+      properties:
+        id: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/RideRequestStatus' }
+        cancellable: { type: boolean }
+        pickup: { $ref: '#/components/schemas/ServicePoint' }
+        destination: { $ref: '#/components/schemas/ServicePoint' }
+        acceptedQuote:
+          type: object
+          properties:
+            fareQuoteId: { type: string, format: uuid }
+            fare: { type: string, example: '130.63' }
+            currency: { type: string, example: BDT }
+            pricingCode: { type: string, example: dhaka-solo }
+            pricingVersion: { type: integer, example: 1 }
+            distanceMeters: { type: integer, example: 2214 }
+            durationSeconds: { type: integer, example: 569 }
+        requestedAt: { type: string, format: date-time }
+        searchExpiresAt: { type: string, format: date-time }
+        startedAt: { type: string, format: date-time, nullable: true }
+        completedAt: { type: string, format: date-time, nullable: true }
+        cancelledAt: { type: string, format: date-time, nullable: true }
+        cancellationReason: { type: string, nullable: true }
+        trip:
+          description: |
+            This passenger's own part of the trip. `null` before a match. Identical
+            in shape to the `trip` fields of a `CurrentRide`, minus the summary.
+          oneOf:
+            - $ref: '#/components/schemas/PassengerTripBlock'
+            - type: 'null'
+
+    PassengerTripBlock:
+      type: object
+      properties:
+        poolId: { type: string, format: uuid }
+        poolStatus: { $ref: '#/components/schemas/RidePoolStatus' }
+        memberStatus: { $ref: '#/components/schemas/PoolMemberStatus' }
+        stage: { $ref: '#/components/schemas/PassengerStage' }
+        driver:
+          oneOf:
+            - $ref: '#/components/schemas/DriverPublicSummary'
+            - type: 'null'
+        vehicle:
+          oneOf:
+            - $ref: '#/components/schemas/VehiclePublicSummary'
+            - type: 'null'
+        stops: { type: array, items: { $ref: '#/components/schemas/Stop' } }
+        nextStop:
+          oneOf:
+            - $ref: '#/components/schemas/Stop'
+            - type: 'null'
+        timeline:
+          type: object
+          properties:
+            matchedAt: { type: string, format: date-time, nullable: true }
+            departedAt: { type: string, format: date-time, nullable: true }
+            driverArrivedAt: { type: string, format: date-time, nullable: true }
+            pickedUpAt: { type: string, format: date-time, nullable: true }
+            droppedOffAt: { type: string, format: date-time, nullable: true }
+        events: { type: array, items: { $ref: '#/components/schemas/TimelineEntry' } }
+
+    DispatchOffer:
+      type: object
+      description: |
+        A dispatch offer, as the driver it was made to sees it. The candidate score
+        and the other drivers considered are never included.
+      properties:
+        offerId: { type: string, format: uuid }
+        offerType: { type: string, enum: [INITIAL_RIDE, ADD_PASSENGER] }
+        status: { type: string, enum: [PENDING, ACCEPTED, REJECTED, EXPIRED, CANCELLED] }
+        rideRequestId: { type: string, format: uuid }
+        ridePoolId: { type: string, format: uuid, nullable: true }
+        poolVersion: { type: integer, nullable: true }
+        expiresAt: { type: string, format: date-time }
+        offeredAt: { type: string, format: date-time }
+        pickup: { $ref: '#/components/schemas/ServicePoint' }
+        destination: { $ref: '#/components/schemas/ServicePoint' }
+        approach:
+          type: object
+          description: How the driver was measured to reach the pickup.
+          properties:
+            fromServicePointCode: { type: string, example: banani-kakoli }
+            distanceMeters: { type: integer }
+            durationSeconds: { type: integer }
+        rejectionReason: { type: string, nullable: true }
+
+    PoolEnvelope:
+      type: object
+      description: Every trip command answers with the pool as it now stands after the change.
+      required: [pool]
+      properties:
+        pool: { $ref: '#/components/schemas/Pool' }
+
+    Pagination:
+      type: object
+      required: [pagination]
+      properties:
+        pagination:
+          type: object
+          required: [limit, offset, returned, total, hasMore]
+          properties:
+            limit: { type: integer, description: The page size used. }
+            offset: { type: integer, description: The offset used. }
+            returned: { type: integer, description: How many rows this page holds. }
+            total: { type: integer, description: How many rows match the filter in total. }
+            hasMore: { type: boolean, description: Whether `offset + returned < total`. }
+
+    ServicePoint:
+      type: object
+      required: [code, name]
+      properties:
+        code: { type: string, example: banani-road-11 }
+        name: { type: string, example: Banani Road 11 }
+
+    ServicePointWithId:
+      allOf:
+        - $ref: '#/components/schemas/ServicePoint'
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+
+    RideRequestStatus:
+      type: string
+      description: |
+        `WAITING` → `MATCHED` → `IN_PROGRESS` → `COMPLETED`, or `CANCELLED` /
+        `EXPIRED` from `WAITING`. The three middle values are the "active" ones.
+      enum: [WAITING, MATCHED, IN_PROGRESS, COMPLETED, CANCELLED, EXPIRED]
+
+    RidePoolStatus:
+      type: string
+      description: |
+        `FORMING` → `DRIVER_EN_ROUTE` → `ARRIVED` → `IN_PROGRESS` → `COMPLETED`.
+        A pool that is no longer `FORMING` is closed to matching. `CANCELLED` is
+        defined and not yet reached.
+      enum: [FORMING, DRIVER_EN_ROUTE, ARRIVED, IN_PROGRESS, COMPLETED, CANCELLED]
+
+    PoolMemberStatus:
+      type: string
+      description: |
+        `ASSIGNED` → `PICKED_UP` → `DROPPED_OFF`. `CANCELLED` and `NO_SHOW` are
+        reserved.
+      enum: [ASSIGNED, PICKED_UP, DROPPED_OFF, CANCELLED, NO_SHOW]
+
+    PoolStopStatus:
+      type: string
+      description: '`PENDING` → `ARRIVED` → `COMPLETED`. `SKIPPED` is reserved.'
+      enum: [PENDING, ARRIVED, COMPLETED, SKIPPED]
+
+    StopType:
+      type: string
+      enum: [PICKUP, DROPOFF]
+
+    PassengerStage:
+      type: string
+      description: |
+        Where the passenger is in their own journey, derived from their own
+        timestamps rather than stored.
+
+        | Stage | Means |
+        | ----- | ----- |
+        | `DRIVER_ASSIGNED` | A driver accepted; nobody has set off |
+        | `DRIVER_EN_ROUTE` | The driver left for the first pickup |
+        | `DRIVER_ARRIVED` | The car is at *this* passenger's pickup |
+        | `PICKED_UP` | This passenger is in the car; the trip has not started |
+        | `IN_PROGRESS` | This passenger's ride has begun |
+        | `RIDE_COMPLETED` | This passenger has been delivered |
+      enum: [DRIVER_ASSIGNED, DRIVER_EN_ROUTE, DRIVER_ARRIVED, PICKED_UP, IN_PROGRESS, RIDE_COMPLETED]
+
+    PassengerNextAction:
+      type: string
+      description: |
+        The single thing a passenger's client should offer next. Computed on the
+        server from the stage, so a client never derives it.
+
+        | Action | Offer |
+        | ------ | ----- |
+        | `WAIT_FOR_DRIVER` | Nothing; keep waiting |
+        | `WATCH_DRIVER` | A map of the approaching car |
+        | `BOARD_VEHICLE` | "Your car is here" |
+        | `IN_RIDE` | Nothing; the ride is happening |
+        | `RIDE_FINISHED` | The trip summary |
+      enum: [WAIT_FOR_DRIVER, WATCH_DRIVER, BOARD_VEHICLE, IN_RIDE, RIDE_FINISHED]
+
+    SoloEstimate:
+      type: object
+      description: The solo fare the passenger accepted when the request was made, frozen.
+      required: [fare, currency, pricingCode, pricingVersion]
+      properties:
+        fare: { type: string, example: '130.63' }
+        currency: { type: string, example: BDT }
+        pricingCode: { type: string, example: dhaka-solo }
+        pricingVersion: { type: integer, example: 1 }
+
+    SharedFareSummary:
+      type: object
+      description: |
+        This passenger's own pooled fare. `null` before a match — a passenger who
+        is not sharing anything has no pooled fare, and `"0.00"` would be inventing
+        an answer.
+      required: [fare, currency, finalized, poolVersion]
+      properties:
+        fare: { type: string, example: '126.63' }
+        currency: { type: string, example: BDT }
+        finalized:
+          type: boolean
+          description: True once the driver has departed, which freezes the fare.
+        poolVersion: { type: integer, example: 1 }
+
+    DriverPublicSummary:
+      type: object
+      description: |
+        A driver as a passenger may know them: a first name. Not their user id,
+        their email, or any contact detail.
+      properties:
+        displayName: { type: string, nullable: true, example: Jashim }
+
+    VehiclePublicSummary:
+      type: object
+      properties:
+        name: { type: string, example: Bullet }
+        seatCapacity: { type: integer, example: 3 }
+
+    Stop:
+      type: object
+      description: |
+        One stop of a plan. A stop names **one member and one type**, so two
+        passengers collected at the same corner are two consecutive stops.
+      required: [stopId, sequence, stopType, status]
+      properties:
+        stopId: { type: string, format: uuid }
+        sequence: { type: integer, description: 'The order it is driven in. 1 is first.' }
+        stopType: { $ref: '#/components/schemas/StopType' }
+        status: { $ref: '#/components/schemas/PoolStopStatus' }
+        servicePoint: { $ref: '#/components/schemas/ServicePoint' }
+        plannedArrivalAt: { type: string, format: date-time, nullable: true }
+        actualArrivalAt: { type: string, format: date-time, nullable: true }
+        completedAt: { type: string, format: date-time, nullable: true }
+
+    PoolStop:
+      allOf:
+        - $ref: '#/components/schemas/Stop'
+        - type: object
+          properties:
+            poolMemberId: { type: string, format: uuid }
+
+    TimelineEntry:
+      type: object
+      description: |
+        One event from the append-only history, as a sentence. Produced by
+        `timeline.rules.js`, which drops any event whose type is not on a
+        whitelist for this audience and never reads the event's `metadata`. An
+        internal event type therefore cannot leak by being added to the enum.
+      required: [sequence, eventType, phase, label, at]
+      properties:
+        sequence: { type: integer, description: 'Per request or per pool; the order things happened in.' }
+        eventType: { type: string, example: DRIVER_DEPARTED }
+        phase:
+          type: string
+          description: Coarse grouping, so a client can build sections without parsing labels.
+          enum: [REQUEST, MATCHING, PICKUP, RIDE, END]
+        label: { type: string, description: 'A sentence for a human.', example: 'Your driver set off' }
+        actorType: { type: string, enum: [PASSENGER, DRIVER, SYSTEM, ADMIN], nullable: true }
+        at: { type: string, format: date-time, nullable: true }
+
+    RideSummary:
+      type: object
+      description: One row of the passenger's history.
+      required: [rideRequestId, status, pickup, destination, requestedAt]
+      properties:
+        rideRequestId: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/RideRequestStatus' }
+        cancellable: { type: boolean, description: 'Derived: true exactly while the status is WAITING.' }
+        pickup: { $ref: '#/components/schemas/ServicePoint' }
+        destination: { $ref: '#/components/schemas/ServicePoint' }
+        requestedAt: { type: string, format: date-time }
+        startedAt: { type: string, format: date-time, nullable: true, description: 'This ride began.' }
+        completedAt: { type: string, format: date-time, nullable: true, description: 'This ride ended.' }
+        cancelledAt: { type: string, format: date-time, nullable: true }
+        route:
+          type: object
+          description: The route the accepted quote priced.
+          properties:
+            distanceMeters: { type: integer, example: 2214 }
+            durationSeconds: { type: integer, example: 569 }
+        soloEstimate: { $ref: '#/components/schemas/SoloEstimate' }
+        sharedFare:
+          oneOf:
+            - $ref: '#/components/schemas/SharedFareSummary'
+            - type: 'null'
+        driver:
+          oneOf:
+            - $ref: '#/components/schemas/DriverPublicSummary'
+            - type: 'null'
+        vehicle:
+          oneOf:
+            - $ref: '#/components/schemas/VehiclePublicSummary'
+            - type: 'null'
+        passengerCount:
+          type: integer
+          nullable: true
+          description: 'Aggregate only: how many people shared the car. No row behind this is read.'
+
+    CurrentRide:
+      allOf:
+        - $ref: '#/components/schemas/RideSummary'
+        - type: object
+          required: [stage, nextAction]
+          properties:
+            stage: { $ref: '#/components/schemas/PassengerStage' }
+            nextAction: { $ref: '#/components/schemas/PassengerNextAction' }
+            searchExpiresAt:
+              type: string
+              format: date-time
+              description: 'When a WAITING request stops looking for a driver.'
+            memberStatus:
+              oneOf:
+                - $ref: '#/components/schemas/PoolMemberStatus'
+                - type: 'null'
+            pool:
+              oneOf:
+                - type: object
+                  properties:
+                    poolId: { type: string, format: uuid }
+                    status: { $ref: '#/components/schemas/RidePoolStatus' }
+                    completedAt: { type: string, format: date-time, nullable: true }
+                - type: 'null'
+            timeline:
+              type: object
+              description: The passenger's own instants, so a tracker needs no date arithmetic.
+              properties:
+                matchedAt: { type: string, format: date-time, nullable: true }
+                departedAt: { type: string, format: date-time, nullable: true }
+                driverArrivedAt: { type: string, format: date-time, nullable: true }
+                pickedUpAt: { type: string, format: date-time, nullable: true }
+                droppedOffAt: { type: string, format: date-time, nullable: true }
+            myStops:
+              type: array
+              description: This passenger's own stops — at most two, and never a co-passenger's.
+              items: { $ref: '#/components/schemas/Stop' }
+
+    RideDetail:
+      allOf:
+        - $ref: '#/components/schemas/RideSummary'
+        - type: object
+          required: [stage, nextAction, myStops, timeline]
+          properties:
+            stage: { $ref: '#/components/schemas/PassengerStage' }
+            nextAction: { $ref: '#/components/schemas/PassengerNextAction' }
+            searchExpiresAt: { type: string, format: date-time }
+            memberStatus:
+              oneOf:
+                - $ref: '#/components/schemas/PoolMemberStatus'
+                - type: 'null'
+            myStops:
+              type: array
+              items: { $ref: '#/components/schemas/Stop' }
+            sharedRoute:
+              type: object
+              nullable: true
+              description: The pool's planned route once matched; null before that.
+              properties:
+                distanceMeters: { type: integer }
+                durationSeconds: { type: integer }
+            pool:
+              oneOf:
+                - type: object
+                  properties:
+                    poolId: { type: string, format: uuid }
+                    status: { $ref: '#/components/schemas/RidePoolStatus' }
+                    passengerCount: { type: integer }
+                    capacity: { type: integer }
+                    completedAt: { type: string, format: date-time, nullable: true }
+                - type: 'null'
+            member:
+              oneOf:
+                - type: object
+                  properties:
+                    memberStatus: { $ref: '#/components/schemas/PoolMemberStatus' }
+                    matchedAt: { type: string, format: date-time, nullable: true }
+                    pickedUpAt: { type: string, format: date-time, nullable: true }
+                    droppedOffAt: { type: string, format: date-time, nullable: true }
+                - type: 'null'
+            timeline:
+              type: array
+              description: |
+                This passenger's lifecycle, with every dispatch event removed and
+                no event payload included. Ordered by sequence, then timestamp.
+              items: { $ref: '#/components/schemas/TimelineEntry' }
+
+    DriverAvailability:
+      type: object
+      required: [driverProfileId, status, online, operationalStatus, canGoOnline, canGoOffline]
+      properties:
+        driverProfileId: { type: string, format: uuid, description: 'The driver''s own profile. Never a user id or an email.' }
+        status: { $ref: '#/components/schemas/DriverOperationalStatus' }
+        online:
+          type: boolean
+          description: 'False exactly when the status is OFFLINE. The value a toggle binds to.'
+        operationalStatus: { $ref: '#/components/schemas/DriverOperationalStatus' }
+        currentServicePoint:
+          oneOf:
+            - $ref: '#/components/schemas/ServicePoint'
+            - type: 'null'
+        servicePoint:
+          oneOf:
+            - $ref: '#/components/schemas/ServicePointWithId'
+            - type: 'null'
+        vehicle:
+          oneOf:
+            - type: object
+              properties:
+                vehicleId: { type: string, format: uuid }
+                name: { type: string, example: Bullet }
+                seatCapacity: { type: integer, example: 3 }
+            - type: 'null'
+        vehicles:
+          type: array
+          description: The driver's own active vehicles, so one with several knows what to pick.
+          items:
+            type: object
+            properties:
+              vehicleId: { type: string, format: uuid }
+              name: { type: string }
+              seatCapacity: { type: integer }
+        availableSince: { type: string, format: date-time, nullable: true }
+        lastSeenAt: { type: string, format: date-time, nullable: true }
+        canGoOnline: { type: boolean, description: 'Derived, so a client shows only buttons the server would accept.' }
+        canGoOffline: { type: boolean, description: 'False while RESERVED or ON_RIDE.' }
+        updatedAt: { type: string, format: date-time }
+
+    DriverOperationalStatus:
+      type: string
+      description: |
+        `OFFLINE` is excluded from dispatch. `RESERVED` means an accepted pool
+        whose trip has not departed; `ON_RIDE` means a passenger is in the car.
+        Neither can be set through the API — they are established by accepting an
+        offer and departing.
+      enum: [OFFLINE, AVAILABLE, RESERVED, ON_RIDE]
+
+    AvailabilityRequest:
+      type: object
+      required: [online]
+      additionalProperties: false
+      properties:
+        online: { type: boolean, description: 'true to take work, false to stop.' }
+        servicePointCode:
+          type: string
+          description: 'Required when going online (unless servicePointId is given). A stable code.'
+          example: banani-kakoli
+        servicePointId:
+          type: string
+          format: uuid
+          description: 'Required when going online (unless servicePointCode is given). Mutually exclusive with it.'
+        vehicleId:
+          type: string
+          format: uuid
+          description: 'Required only when the driver has more than one active vehicle.'
+
+    PoolMemberForDriver:
+      type: object
+      description: |
+        A passenger, as the driver operating the ride may know them: a first name
+        and their own two places. No account field, no fare.
+      properties:
+        memberId: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/PoolMemberStatus' }
+        rideStatus: { $ref: '#/components/schemas/RideRequestStatus' }
+        displayName: { type: string, nullable: true, example: Nusrat }
+        pickup: { $ref: '#/components/schemas/ServicePoint' }
+        dropoff: { $ref: '#/components/schemas/ServicePoint' }
+        matchedAt: { type: string, format: date-time, nullable: true }
+        pickedUpAt: { type: string, format: date-time, nullable: true }
+        droppedOffAt: { type: string, format: date-time, nullable: true }
+
+    Pool:
+      type: object
+      description: |
+        The pool a driver is currently committed to. `pricing` reports whether the
+        fare is settled, never an amount: mid-trip a driver's decision about where
+        to go next must not depend on what a passenger is paying.
+      required: [poolId, status, allowedActions, pricing]
+      properties:
+        poolId: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/RidePoolStatus' }
+        version: { type: integer }
+        capacity: { type: integer }
+        vehicle:
+          oneOf:
+            - $ref: '#/components/schemas/VehiclePublicSummary'
+            - type: 'null'
+        plan:
+          type: object
+          properties:
+            distanceMeters: { type: integer }
+            durationSeconds: { type: integer }
+            stopCount: { type: integer }
+        stops:
+          type: array
+          items: { $ref: '#/components/schemas/Stop' }
+        nextStop:
+          oneOf:
+            - $ref: '#/components/schemas/Stop'
+            - type: 'null'
+        allowedActions:
+          type: array
+          description: |
+            The commands that would succeed right now, computed from the state. An
+            action is absent when its command would be refused, so a client renders
+            these rather than deciding.
+          items:
+            type: string
+            enum: [DEPART, ARRIVE_AT_STOP, PICKUP_PASSENGER, START_TRIP, DROPOFF_PASSENGER, COMPLETE_TRIP]
+        pricing:
+          type: object
+          properties:
+            finalized: { type: boolean }
+            finalizedAt: { type: string, format: date-time, nullable: true }
+            poolVersion: { type: integer, nullable: true }
+        departedAt: { type: string, format: date-time, nullable: true }
+        driverArrivedAt: { type: string, format: date-time, nullable: true }
+        startedAt: { type: string, format: date-time, nullable: true }
+        completedAt: { type: string, format: date-time, nullable: true }
+        cancelledAt: { type: string, format: date-time, nullable: true }
+        acceptedAt: { type: string, format: date-time }
+        members:
+          type: array
+          items: { $ref: '#/components/schemas/PoolMemberForDriver' }
+        events:
+          type: array
+          description: The pool's own audit trail, without any event payload.
+          items:
+            type: object
+            properties:
+              sequence: { type: integer }
+              eventType: { type: string }
+              actorType: { type: string }
+              createdAt: { type: string, format: date-time }
+
+    PoolFareSummary:
+      type: object
+      description: |
+        The pool's fare, as the driver's history reports it. **Totals only**: there
+        is no per-passenger breakdown, because attributing an amount to a named
+        person would disclose what that passenger was charged.
+      properties:
+        fareStatus: { type: string, enum: [ESTIMATED, FINALIZED] }
+        finalized: { type: boolean, description: 'True once the driver departed, which freezes it.' }
+        finalizedAt: { type: string, format: date-time, nullable: true }
+        currency: { type: string, example: BDT }
+        poolVersion: { type: integer }
+        totalPassengerFare: { type: string, description: 'Every passenger in the pool, added up.', example: '126.63' }
+
+    DriverRideSummary:
+      type: object
+      description: One row of the driver's history. Counts, not rows.
+      required: [poolId, status, route, passengerCount, stopCount, completedStopCount]
+      properties:
+        poolId: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/RidePoolStatus' }
+        vehicle:
+          oneOf:
+            - type: object
+              properties:
+                vehicleId: { type: string, format: uuid }
+                name: { type: string, example: Bullet }
+                seatCapacity: { type: integer, example: 3 }
+            - type: 'null'
+        createdAt: { type: string, format: date-time }
+        acceptedAt: { type: string, format: date-time }
+        completedAt: { type: string, format: date-time, nullable: true }
+        firstServicePoint:
+          oneOf:
+            - $ref: '#/components/schemas/ServicePoint'
+            - type: 'null'
+        finalServicePoint:
+          oneOf:
+            - $ref: '#/components/schemas/ServicePoint'
+            - type: 'null'
+        route:
+          type: object
+          properties:
+            distanceMeters: { type: integer, example: 2214 }
+            durationSeconds: { type: integer, example: 569 }
+        passengerCount: { type: integer, example: 1 }
+        stopCount: { type: integer, example: 2 }
+        completedStopCount: { type: integer, example: 2 }
+        fare:
+          oneOf:
+            - $ref: '#/components/schemas/PoolFareSummary'
+            - type: 'null'
+
+    DriverRideDetail:
+      type: object
+      required: [poolId, status, stops, passengers, allowedActions, timeline]
+      properties:
+        poolId: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/RidePoolStatus' }
+        version: { type: integer }
+        capacity: { type: integer }
+        vehicle:
+          oneOf:
+            - type: object
+              properties:
+                vehicleId: { type: string, format: uuid }
+                name: { type: string }
+                seatCapacity: { type: integer }
+            - type: 'null'
+        createdAt: { type: string, format: date-time }
+        acceptedAt: { type: string, format: date-time }
+        departedAt: { type: string, format: date-time, nullable: true }
+        driverArrivedAt: { type: string, format: date-time, nullable: true }
+        startedAt: { type: string, format: date-time, nullable: true }
+        completedAt: { type: string, format: date-time, nullable: true }
+        cancelledAt: { type: string, format: date-time, nullable: true }
+        route:
+          type: object
+          properties:
+            distanceMeters: { type: integer }
+            durationSeconds: { type: integer }
+        stops:
+          type: array
+          items: { $ref: '#/components/schemas/PoolStop' }
+        nextStop:
+          oneOf:
+            - $ref: '#/components/schemas/PoolStop'
+            - type: 'null'
+        passengers:
+          type: array
+          items: { $ref: '#/components/schemas/PoolMemberForDriver' }
+        passengerCount: { type: integer }
+        fare:
+          oneOf:
+            - $ref: '#/components/schemas/PoolFareSummary'
+            - type: 'null'
+        allowedActions:
+          type: array
+          description: Empty for a finished pool, so a history detail and a live pool answer alike.
+          items:
+            type: string
+            enum: [DEPART, ARRIVE_AT_STOP, PICKUP_PASSENGER, START_TRIP, DROPOFF_PASSENGER, COMPLETE_TRIP]
+        timeline:
+          type: array
+          description: The pool's lifecycle, mapped from `pool_events` with no payload included.
+          items: { $ref: '#/components/schemas/TimelineEntry' }
+
+# ---------------------------------------------------------------------------
+# The rest of the API, in outline.
+#
+# These are described in full in `README.md`, one section per milestone. They are
+# listed here so a reader can see the whole surface, and so this document does not
+# pretend the read APIs are all there is.
+# ---------------------------------------------------------------------------
+x-related-endpoints:
+  authentication:
+    - { method: POST, path: /auth/register, operation: 'Sign up as a PASSENGER or DRIVER; signs in.' }
+    - { method: POST, path: /auth/login, operation: 'Log in; sets the auth cookie.' }
+    - { method: GET, path: /auth/me, operation: 'The authenticated user.' }
+    - { method: POST, path: /auth/logout, operation: 'Clear the auth cookie. Safe to retry.' }
+  location:
+    - { method: GET, path: /location/zones, operation: 'The active service zones.' }
+    - { method: GET, path: /location/points, operation: 'Active service points, optional ?zoneCode=.' }
+    - { method: GET, path: /location/points/{code}, operation: 'One service point by code.' }
+  routingAndPricing:
+    - { method: POST, path: /routes/estimate, operation: 'Estimate a route between two service points.' }
+    - { method: POST, path: /fare-quotes, operation: 'Quote a solo fare in BDT. PASSENGER only.' }
+  rideRequests:
+    - { method: POST, path: /ride-requests, operation: 'Ask for a ride from a quote the caller owns.' }
+    - { method: GET, path: /ride-requests/my, operation: 'The caller''s own requests, newest first, paged.' }
+    - { method: GET, path: /ride-requests/{id}, operation: 'One of the caller''s own requests, with the trip block.' }
+    - { method: POST, path: /ride-requests/{id}/cancel, operation: 'Cancel a request that is still WAITING.' }
+    - { method: GET, path: /ride-requests/{id}/fare, operation: 'The caller''s own shared fare, with its breakdown.' }
+  dispatch:
+    - { method: GET, path: /drivers/me/offers, operation: 'The driver''s own dispatch offers, both kinds.' }
+    - { method: GET, path: /drivers/me/offers/{offerId}, operation: 'One of the driver''s own offers.' }
+    - { method: POST, path: /drivers/me/offers/{offerId}/accept, operation: 'Accept an offer. No body.' }
+    - { method: POST, path: /drivers/me/offers/{offerId}/reject, operation: 'Refuse an offer.' }
+    - { method: POST, path: /drivers/me/online, operation: 'Go online. Superseded by PATCH /drivers/me/availability, still supported.' }
+    - { method: POST, path: /drivers/me/offline, operation: 'Go offline. Superseded by PATCH /drivers/me/availability, still supported.' }
+    - { method: PUT, path: /drivers/me/current-service-point, operation: 'Move to another service point.' }
+  trip:
+    - { method: POST, path: /drivers/me/pools/{poolId}/depart, operation: 'Set off; closes the pool to matching and freezes the fare.' }
+    - { method: POST, path: /drivers/me/pools/{poolId}/stops/{stopId}/arrive, operation: 'Reach the next actionable stop.' }
+    - { method: POST, path: /drivers/me/pools/{poolId}/stops/{stopId}/members/{memberId}/pickup, operation: 'Confirm a passenger is in the car.' }
+    - { method: POST, path: /drivers/me/pools/{poolId}/start, operation: 'Begin the journey with the passengers aboard.' }
+    - { method: POST, path: /drivers/me/pools/{poolId}/stops/{stopId}/members/{memberId}/dropoff, operation: 'Deliver a passenger.' }
+    - { method: POST, path: /drivers/me/pools/{poolId}/complete, operation: 'Finish the trip and release the driver.' }
+    - { method: GET, path: /drivers/me/pool, operation: 'Alias of /drivers/me/current-pool.' }
+  operational:
+    - { method: GET, path: /health, operation: 'Service status, uptime and a database probe.' }
+    - { method: GET, path: /users, operation: 'List users. Still public; see README.' }

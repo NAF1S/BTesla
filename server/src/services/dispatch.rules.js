@@ -21,14 +21,13 @@
  *     OFFLINE   -> AVAILABLE      (go online: profile, vehicle and point checked)
  *     AVAILABLE -> OFFLINE        (go offline)
  *     AVAILABLE -> RESERVED       (accepted a pool; trip has not started)
+ *     RESERVED  -> ON_RIDE        (the driver departed for the first pickup)
+ *     ON_RIDE   -> AVAILABLE      (the trip completed)
  *     RESERVED  -> OFFLINE        (reserved for a later milestone)
- *     RESERVED  -> ON_RIDE        (reserved: trip start)
- *     ON_RIDE   -> AVAILABLE      (reserved: trip end)
  *
- * Implemented in this milestone: OFFLINE -> AVAILABLE, AVAILABLE -> OFFLINE and
- * AVAILABLE -> RESERVED. A RESERVED or ON_RIDE driver cannot go offline through
- * the normal endpoint, which is the rule an operator would otherwise break by
- * accident on a driver's behalf.
+ * Implemented: everything except RESERVED -> OFFLINE. A RESERVED or ON_RIDE
+ * driver cannot go offline through the normal endpoint, which is the rule an
+ * operator would otherwise break by accident on a driver's behalf.
  */
 
 export const DRIVER_AVAILABILITY = Object.freeze({
@@ -61,13 +60,18 @@ export const AVAILABILITY_TRANSITIONS = Object.freeze({
   [DRIVER_AVAILABILITY.ON_RIDE]: Object.freeze([DRIVER_AVAILABILITY.AVAILABLE]),
 });
 
-/** The availability changes this milestone performs. The rest are reserved. */
+/** The availability changes this codebase performs. The rest are reserved. */
 export const IMPLEMENTED_AVAILABILITY_TRANSITIONS = Object.freeze({
   [DRIVER_AVAILABILITY.OFFLINE]: Object.freeze([DRIVER_AVAILABILITY.AVAILABLE]),
   [DRIVER_AVAILABILITY.AVAILABLE]: Object.freeze([
     DRIVER_AVAILABILITY.OFFLINE,
     DRIVER_AVAILABILITY.RESERVED,
   ]),
+  // The trip: departure commits the driver to the pool, completion releases
+  // them. RESERVED -> OFFLINE stays reserved (an operator's decision, not an
+  // endpoint's).
+  [DRIVER_AVAILABILITY.RESERVED]: Object.freeze([DRIVER_AVAILABILITY.ON_RIDE]),
+  [DRIVER_AVAILABILITY.ON_RIDE]: Object.freeze([DRIVER_AVAILABILITY.AVAILABLE]),
 });
 
 export const isDriverAvailability = (value) =>
@@ -194,8 +198,17 @@ export const TERMINAL_POOL_STATUSES = Object.freeze([
   POOL_STATUS.CANCELLED,
 ]);
 
-/** The only pool status this milestone creates. */
-export const IMPLEMENTED_POOL_STATUS = POOL_STATUS.FORMING;
+/**
+ * The pool statuses this codebase reaches. Only CANCELLED is unreachable: no
+ * operation cancels a pool, and the state exists for the milestone that adds one.
+ */
+export const IMPLEMENTED_POOL_STATUSES = Object.freeze([
+  POOL_STATUS.FORMING,
+  POOL_STATUS.DRIVER_EN_ROUTE,
+  POOL_STATUS.ARRIVED,
+  POOL_STATUS.IN_PROGRESS,
+  POOL_STATUS.COMPLETED,
+]);
 
 export const isPoolStatus = (value) =>
   typeof value === 'string' && POOL_STATUSES.includes(value);
@@ -230,8 +243,20 @@ export const POOL_EVENT_TYPE = Object.freeze({
   // adopted (which is also the moment the pool's version moves on).
   JOIN_PLAN_CREATED: 'JOIN_PLAN_CREATED',
   ROUTE_PLAN_UPDATED: 'ROUTE_PLAN_UPDATED',
+  // Shared fares: the pool's plan was priced, and a previous pricing was
+  // replaced. Both carry the calculation id rather than any passenger's amount.
+  SHARED_FARE_CALCULATED: 'SHARED_FARE_CALCULATED',
+  SHARED_FARE_SUPERSEDED: 'SHARED_FARE_SUPERSEDED',
   MEMBER_PICKED_UP: 'MEMBER_PICKED_UP',
   MEMBER_DROPPED_OFF: 'MEMBER_DROPPED_OFF',
+  // The trip: setting off, reaching a stop, starting, finishing, and releasing
+  // the driver. Each transition has its own event, so POOL_STATUS_CHANGED below
+  // stays reserved rather than duplicating one of them.
+  DRIVER_DEPARTED: 'DRIVER_DEPARTED',
+  STOP_ARRIVED: 'STOP_ARRIVED',
+  TRIP_STARTED: 'TRIP_STARTED',
+  TRIP_COMPLETED: 'TRIP_COMPLETED',
+  DRIVER_AVAILABLE: 'DRIVER_AVAILABLE',
   POOL_STATUS_CHANGED: 'POOL_STATUS_CHANGED',
   POOL_CANCELLED: 'POOL_CANCELLED',
 });

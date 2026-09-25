@@ -1,8 +1,12 @@
 import { env } from '../config/env.js';
 import { currentUser } from '../middleware/auth.js';
 import * as assignment from '../services/assignment.service.js';
+import * as poolFares from '../services/pool-fare.service.js';
 import * as rides from '../services/ride-request.service.js';
+import * as trips from '../services/trip.service.js';
+import { ApiError } from '../utils/ApiError.js';
 import * as dto from '../serializers/ride-request.serializer.js';
+import { toPassengerFareDto } from '../serializers/pool-fare.serializer.js';
 import { CANCELLATION_REASONS, DEFAULT_CANCELLATION_REASON, RIDE_REQUEST_STATUSES } from '../services/ride.status.js';
 import {
   assertBodyKeys,
@@ -91,7 +95,13 @@ export const getRideRequest = async (req, res) => {
     rideRequestId,
   });
 
-  res.json(dto.toRideRequestDto(request));
+  // The passenger's own trip, if they have been matched: who is driving, where
+  // the car is, and what has happened to *their* ride. Only their own member,
+  // stops and events are read, so a passenger cannot be shown another's part of
+  // the pool. The history page deliberately leaves this out (see the serializer).
+  const trip = await trips.loadPassengerTrip(rideRequestId);
+
+  res.json(dto.toRideRequestDto(request, { trip }));
 };
 
 export const listMyRideRequests = async (req, res) => {
@@ -136,4 +146,34 @@ export const cancelRideRequest = async (req, res) => {
   });
 
   res.json(dto.toRideRequestDto(request));
+};
+
+/**
+ * The fare this passenger is currently being charged for one of their requests.
+ *
+ * `GET /ride-requests/:id/fare` answers 404 when there is no shared fare to
+ * report -- before a request is matched, and for the moment around a match before
+ * its calculation is written. Empty is a 404 here, not a zero: a passenger who is
+ * not sharing anything has an accepted solo fare (visible on the request itself),
+ * and reporting "0.00" would be inventing an answer.
+ *
+ * The ownership check is the same one `GET /ride-requests/:id` uses, and somebody
+ * else's request is a 404 rather than a 403, so this cannot be used to discover
+ * which request ids exist. There is deliberately no route that takes a pool id: a
+ * passenger cannot ask about a pool, and therefore cannot ask about the people in
+ * it.
+ */
+export const getRideRequestFare = async (req, res) => {
+  const rideRequestId = requireUuid(req.params.id, 'id');
+
+  // Throws 404 unless the request is the caller's own.
+  await rides.findRideRequestForPassenger({ passenger: currentUser(req), rideRequestId });
+
+  const fare = await poolFares.loadCurrentFareForRequest({ rideRequestId });
+
+  if (!fare) {
+    throw new ApiError(404, 'No shared fare has been calculated for this ride request yet');
+  }
+
+  res.json(toPassengerFareDto({ rideRequestId, ...fare }));
 };

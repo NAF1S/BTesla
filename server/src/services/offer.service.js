@@ -29,6 +29,7 @@ import {
   lockPool,
   lockPoolStops,
 } from './pool.service.js';
+import { recalculatePoolFares } from './pool-fare.service.js';
 import { appendRideEvent, applyRideRequestTransition, lockRideRequest } from './ride-request.service.js';
 import { RIDE_ACTOR_TYPE, RIDE_EVENT_TYPE, RIDE_REQUEST_STATUS } from './ride.status.js';
 
@@ -718,6 +719,18 @@ const acceptInitialRideOffer = async ({ driver, driverProfileId, offerId, rideRe
       now,
     });
 
+    // 25. The pool has a plan, so it has fares. This is inside the transaction on
+    // purpose: a pool that cannot be priced must not exist, so a failure here
+    // rolls back the pool, its member, its stops and the match. The pool was just
+    // created, which is why its version is known without a second read.
+    await recalculatePoolFares({
+      tx,
+      ridePoolId: created.pool.id,
+      expectedPoolVersion: created.pool.version,
+      now,
+      actorUserId: driver.id,
+    });
+
     return { expired: false, ridePoolId: created.pool.id, rideRequestId: request.id };
   });
 
@@ -1032,6 +1045,19 @@ const acceptAddPassengerOffer = async ({ driver, driverProfileId, offerId, now }
         stopOrder: proposal.stops.map((stop) => `${stop.sequence}:${stop.stopType}`),
       },
       now,
+    });
+
+    // The plan has changed, so everybody's fare changes with it. One recalculation
+    // replaces the pool's fares for the new version and supersedes the previous
+    // one: nobody stays matched without an allocation for the plan they are
+    // actually travelling on, and if this fails the join rolls back rather than
+    // committing without a fare.
+    await recalculatePoolFares({
+      tx,
+      ridePoolId: pool.id,
+      expectedPoolVersion: added.version,
+      now,
+      actorUserId: driver.id,
     });
 
     // The driver stays RESERVED: they were committed to this pool before the offer

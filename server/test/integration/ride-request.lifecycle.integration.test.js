@@ -40,11 +40,12 @@ const DEPARTURE = new Date('2026-09-24T08:41:00+06:00');
 const INSERT_REQUEST = `
   INSERT INTO ride_requests (
     passenger_profile_id, fare_quote_id, pickup_service_point_id, dropoff_service_point_id,
-    status, requested_at, search_expires_at, cancelled_at, cancellation_reason,
+    status, requested_at, search_expires_at, started_at, completed_at,
+    cancelled_at, cancellation_reason,
     idempotency_key, request_fingerprint, accepted_fare, currency,
     accepted_pricing_code, accepted_pricing_version,
     accepted_distance_meters, accepted_duration_seconds
-  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
   RETURNING id`;
 
 let nusrat;
@@ -80,6 +81,8 @@ const insertRequest = async (exec, overrides = {}) => {
     status: 'WAITING',
     requestedAt,
     searchExpiresAt: new Date(requestedAt.getTime() + env.rideRequests.searchTtlSeconds * 1000),
+    startedAt: null,
+    completedAt: null,
     cancelledAt: null,
     cancellationReason: null,
     idempotencyKey: key(),
@@ -93,6 +96,16 @@ const insertRequest = async (exec, overrides = {}) => {
     ...overrides,
   };
 
+  // A request's status and the ride's own instants have to agree
+  // (`ride_requests_lifecycle_consistent`), so a fixture that fabricates a state
+  // fills in what that state implies.
+  if (['IN_PROGRESS', 'COMPLETED'].includes(row.status) && row.startedAt === null) {
+    row.startedAt = new Date('2026-09-24T02:45:00.000Z');
+  }
+  if (row.status === 'COMPLETED' && row.completedAt === null) {
+    row.completedAt = new Date('2026-09-24T03:05:00.000Z');
+  }
+
   const { rows } = await exec.query(INSERT_REQUEST, [
     row.passengerProfileId,
     row.fareQuoteId,
@@ -101,6 +114,8 @@ const insertRequest = async (exec, overrides = {}) => {
     row.status,
     row.requestedAt,
     row.searchExpiresAt,
+    row.startedAt,
+    row.completedAt,
     row.cancelledAt,
     row.cancellationReason,
     row.idempotencyKey,
@@ -428,12 +443,14 @@ describe('history is append-only', () => {
       const requestId = await insertRequest(tx, { status: 'WAITING' });
 
       await tx.query(`UPDATE ride_requests SET status = 'MATCHED' WHERE id = $1::uuid`, [requestId]);
-      await tx.query(`UPDATE ride_requests SET status = 'IN_PROGRESS' WHERE id = $1::uuid`, [
-        requestId,
-      ]);
-      await tx.query(`UPDATE ride_requests SET status = 'COMPLETED' WHERE id = $1::uuid`, [
-        requestId,
-      ]);
+      await tx.query(
+        `UPDATE ride_requests SET status = 'IN_PROGRESS', started_at = now() WHERE id = $1::uuid`,
+        [requestId],
+      );
+      await tx.query(
+        `UPDATE ride_requests SET status = 'COMPLETED', completed_at = now() WHERE id = $1::uuid`,
+        [requestId],
+      );
 
       const { rows } = await tx.query(`SELECT status FROM ride_requests WHERE id = $1::uuid`, [
         requestId,

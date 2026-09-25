@@ -128,8 +128,14 @@ export const findEffectiveFarePolicy = async (at) => {
   return policies[0];
 };
 
-/** Fare weights for the edges a route actually used, keyed by edge code. */
-const loadFareWeights = async (edgeCodes) => {
+/**
+ * Fare weights for the edges a route actually used, keyed by edge code.
+ *
+ * Exported because the shared-fare calculation prices legs over the same graph
+ * and must use the same weights: a second query would be a second definition of
+ * what an edge costs.
+ */
+export const loadFareWeights = async (edgeCodes) => {
   const rows = await prisma.routingEdge.findMany({
     where: { code: { in: edgeCodes } },
     select: { code: true, fareWeight: true },

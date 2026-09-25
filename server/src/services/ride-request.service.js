@@ -80,6 +80,8 @@ export const RIDE_REQUEST_SCALARS = {
   status: true,
   requestedAt: true,
   searchExpiresAt: true,
+  startedAt: true,
+  completedAt: true,
   cancelledAt: true,
   cancellationReason: true,
   idempotencyKey: true,
@@ -192,9 +194,15 @@ export const appendRideEvent = async (
  * caller's transaction, so "the status changed" and "history says why" are the
  * same commit -- there is no window in which one exists without the other.
  *
- * Exported because the dispatch milestone moves a request into MATCHED, and a
- * second writer of `status` would be a second place for the transition table to
- * be wrong.
+ * Exported because the dispatch milestone moves a request into MATCHED and the
+ * trip milestone moves it into IN_PROGRESS and COMPLETED, and a second writer of
+ * `status` would be a second place for the transition table to be wrong.
+ *
+ * `startedAt` and `completedAt` default to "leave it alone" rather than to null,
+ * unlike the cancellation columns: a ride that is under way must keep the start
+ * it was given when a *later* transition happens to it, and only the move that
+ * means "this ride began/ended" supplies one. The lifecycle CHECK in
+ * 12-driver-trip.sql is what refuses a status whose instants disagree with it.
  */
 export const applyRideRequestTransition = async (
   tx,
@@ -208,6 +216,8 @@ export const applyRideRequestTransition = async (
     now,
     cancelledAt = null,
     cancellationReason = null,
+    startedAt = undefined,
+    completedAt = undefined,
   },
 ) => {
   if (!canTransition(request.status, toStatus)) {
@@ -219,7 +229,7 @@ export const applyRideRequestTransition = async (
 
   const updated = await tx.rideRequest.update({
     where: { id: request.id },
-    data: { status: toStatus, cancelledAt, cancellationReason },
+    data: { status: toStatus, cancelledAt, cancellationReason, startedAt, completedAt },
     select: RIDE_REQUEST_SCALARS,
   });
 

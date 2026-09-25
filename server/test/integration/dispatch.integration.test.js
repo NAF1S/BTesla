@@ -1031,12 +1031,17 @@ describe('scope boundary', () => {
     }
   });
 
-  it('offers no trip-operation endpoint, from either side', async () => {
+  it('offers no trip-operation endpoint that is not scoped to one pool', async () => {
+    // The trip exists as of the trip milestone, but only ever as a command on one
+    // driver's own pool: there is no "the current trip" path to act on, and no
+    // passenger-side operation at all. Every path here is one of the shapes a
+    // client might otherwise reach for.
     for (const path of [
       '/drivers/me/pool/arrive',
       '/drivers/me/pool/start',
       '/drivers/me/pool/complete',
       '/drivers/me/trips',
+      '/drivers/me/trips/current',
       '/ride-requests/00000000-0000-4000-8000-000000000000/pickup',
       '/ride-requests/00000000-0000-4000-8000-000000000000/dropoff',
       '/ride-requests/00000000-0000-4000-8000-000000000000/complete',

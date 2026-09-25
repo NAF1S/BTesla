@@ -39,6 +39,8 @@ const ROW = {
   status: 'WAITING',
   requestedAt: new Date('2026-09-24T02:41:30.000Z'),
   searchExpiresAt: new Date('2026-09-24T02:51:30.000Z'),
+  startedAt: null,
+  completedAt: null,
   cancelledAt: null,
   cancellationReason: null,
   idempotencyKey: 'probe-key-0001',
@@ -61,12 +63,15 @@ describe('toRideRequestDto', () => {
       'cancellable',
       'cancellationReason',
       'cancelledAt',
+      'completedAt',
       'destination',
       'id',
       'pickup',
       'requestedAt',
       'searchExpiresAt',
+      'startedAt',
       'status',
+      'trip',
     ]);
 
     assert.deepStrictEqual(Object.keys(toRideRequestDto(ROW).acceptedQuote).sort(), [
@@ -81,6 +86,89 @@ describe('toRideRequestDto', () => {
 
     assert.deepStrictEqual(Object.keys(toRideRequestDto(ROW).pickup).sort(), ['code', 'name']);
     assert.deepStrictEqual(Object.keys(toRideRequestDto(ROW).destination).sort(), ['code', 'name']);
+  });
+
+  it('carries no trip until the caller has loaded one', () => {
+    // The history page does not read the pool, the member and the timeline of
+    // every row, so the key is there and empty rather than missing: a client can
+    // tell "no trip" from "not asked for".
+    assert.strictEqual(toRideRequestDto(ROW).trip, null);
+
+    const trip = toRideRequestDto(ROW, {
+      trip: {
+        member: {
+          id: 'member-1',
+          status: 'PICKED_UP',
+          matchedAt: new Date('2026-09-24T02:42:00.000Z'),
+          pickedUpAt: new Date('2026-09-24T02:50:00.000Z'),
+          droppedOffAt: null,
+        },
+        pool: {
+          id: 'pool-1',
+          status: 'IN_PROGRESS',
+          departedAt: new Date('2026-09-24T02:45:00.000Z'),
+          driverArrivedAt: new Date('2026-09-24T02:49:00.000Z'),
+          startedAt: new Date('2026-09-24T02:52:00.000Z'),
+          completedAt: null,
+          vehicle: { name: 'Bullet', seatCapacity: 3 },
+          driverProfile: { user: { name: 'Jashim Uddin' } },
+        },
+        stops: [
+          {
+            id: 'stop-1',
+            sequence: 1,
+            stopType: 'PICKUP',
+            status: 'COMPLETED',
+            plannedArrivalAt: new Date('2026-09-24T02:49:00.000Z'),
+            actualArrivalAt: new Date('2026-09-24T02:49:30.000Z'),
+            completedAt: new Date('2026-09-24T02:50:00.000Z'),
+            servicePoint: { code: 'banani-road-11', name: 'Banani Road 11' },
+          },
+        ],
+        events: [
+          {
+            sequence: 5,
+            eventType: 'PASSENGER_PICKED_UP',
+            actorType: 'SYSTEM',
+            createdAt: new Date('2026-09-24T02:50:00.000Z'),
+          },
+        ],
+      },
+    });
+
+    assert.deepStrictEqual(Object.keys(trip.trip).sort(), [
+      'driver',
+      'events',
+      'memberStatus',
+      'nextStop',
+      'poolId',
+      'poolStatus',
+      'stage',
+      'stops',
+      'timeline',
+      'vehicle',
+    ]);
+
+    assert.strictEqual(trip.trip.stage, 'PICKED_UP');
+    assert.strictEqual(trip.trip.driver.displayName, 'Jashim', 'a first name is all a driver gets too');
+    assert.deepStrictEqual(Object.keys(trip.trip.timeline).sort(), [
+      'departedAt',
+      'driverArrivedAt',
+      'droppedOffAt',
+      'matchedAt',
+      'pickedUpAt',
+    ]);
+
+    // The events a passenger is given carry no metadata: the payloads name pools,
+    // offers and drivers.
+    for (const event of trip.trip.events) {
+      assert.deepStrictEqual(Object.keys(event).sort(), [
+        'actorType',
+        'createdAt',
+        'eventType',
+        'sequence',
+      ]);
+    }
   });
 
   it('never exposes the fingerprint, the passenger, the key, or the quote internals', () => {

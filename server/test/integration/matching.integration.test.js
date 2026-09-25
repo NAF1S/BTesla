@@ -1,4 +1,4 @@
-import '../helpers/test-env.js';
+﻿import '../helpers/test-env.js';
 
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
@@ -16,6 +16,7 @@ import {
   PLAN_REJECTION,
   simulateOccupancy,
 } from '../../src/services/matching.rules.js';
+import { SHARED_FARE_RULE_VERSION } from '../../src/services/pool-fare.rules.js';
 import * as offers from '../../src/services/offer.service.js';
 import { listPoolEvents } from '../../src/services/pool.service.js';
 import {
@@ -59,13 +60,16 @@ import {
  */
 
 /**
- * Noon: off-peak, so the fare and the routing profile are deterministic. It also
- * matters for a subtler reason: a passenger's detour is measured against the
- * duration their own quote froze, so the quote has to be priced in the same
- * traffic regime the plan is measured in, or every join would look like a
- * saving (see the note on `measurePlan` in matching.service.js).
+ * The instant a fixture prices and plans at.
+ *
+ * It is "now", not a pinned noon, and that is the point: a passenger's detour is
+ * measured against the duration their own quote froze, so a quote priced in one
+ * traffic regime and a plan measured in another make every join look like a
+ * detour. Pinning noon made the suite pass in the off-peak window and fail inside
+ * the rush (16:30-20:00 Dhaka) for a reason that had nothing to do with the rules
+ * being tested. A test that needs a specific instant passes `now` explicitly.
  */
-const DEPARTURE = new Date('2026-09-24T12:00:00+06:00');
+const planNow = () => new Date();
 
 let api;
 let nusrat;
@@ -113,7 +117,7 @@ const requestRide = async (
     passengerProfileId: passenger.passengerProfile.id,
     originServicePointCode: origin,
     destinationServicePointCode: destination,
-    departureAt: DEPARTURE,
+    departureAt: now ?? planNow(),
   });
 
   const { request } = await createRideRequest({
@@ -405,14 +409,17 @@ describe('candidate pools', () => {
       // eslint-disable-next-line no-await-in-loop
       await pool.query(
         `UPDATE ride_pools
-            SET status = 'FORMING', started_at = NULL, completed_at = NULL, cancelled_at = NULL
+            SET status = 'FORMING', departed_at = NULL, driver_arrived_at = NULL,
+                started_at = NULL, completed_at = NULL, cancelled_at = NULL
           WHERE id = $1::uuid`,
         [poolId],
       );
       // eslint-disable-next-line no-await-in-loop
       await pool.query(
         `UPDATE ride_pools
-            SET status = $2::ride_pool_status
+            SET status = $2::ride_pool_status,
+                departed_at = now(),
+                driver_arrived_at = CASE WHEN $2 = 'ARRIVED' THEN now() ELSE NULL END
                 ${timestampColumn ? `, ${timestampColumn} = now()` : ''}
           WHERE id = $1::uuid`,
         [poolId, status],
@@ -461,7 +468,8 @@ describe('candidate pools', () => {
     const rafiqRequest = await requestRide(rafiq);
 
     await pool.query(
-      `UPDATE pool_stops SET status = 'ARRIVED' WHERE ride_pool_id = $1::uuid AND sequence = 1`,
+      `UPDATE pool_stops SET status = 'ARRIVED', actual_arrival_at = now()
+        WHERE ride_pool_id = $1::uuid AND sequence = 1`,
       [poolId],
     );
 
@@ -874,9 +882,13 @@ describe('capacity', () => {
 
     const search = await withEnv(
       env.matching,
-      // The operator has to allow the extra driving and the long trip; the point
-      // of the test is the order the seats are used in.
-      { destinationRadiusMeters: 20_000, maxAddedPoolDurationSeconds: 3600 },
+      // The operator has to allow the extra driving, the long trip and the wait at
+      // the corner; the point of the test is the order the seats are used in.
+      {
+        destinationRadiusMeters: 20_000,
+        maxAddedPoolDurationSeconds: 3600,
+        maxPickupWaitSeconds: 3600,
+      },
       () => bestPlanFor(rafiqRequest.id),
     );
 
@@ -895,14 +907,14 @@ describe('capacity', () => {
     // And the pool genuinely accepts the second passenger on that plan.
     const outcome = await withEnv(
       env.matching,
-      { destinationRadiusMeters: 20_000, maxAddedPoolDurationSeconds: 3600 },
+      { destinationRadiusMeters: 20_000, maxAddedPoolDurationSeconds: 3600, maxPickupWaitSeconds: 3600 },
       () => assignment.assignWaitingRequest({ rideRequestId: rafiqRequest.id }),
     );
     assert.strictEqual(outcome.mode, 'POOL_JOIN');
 
     await withEnv(
       env.matching,
-      { destinationRadiusMeters: 20_000, maxAddedPoolDurationSeconds: 3600 },
+      { destinationRadiusMeters: 20_000, maxAddedPoolDurationSeconds: 3600, maxPickupWaitSeconds: 3600 },
       () => offers.acceptOffer({ driver: jashim, offerId: outcome.offerId }),
     );
 
@@ -939,7 +951,8 @@ describe('capacity', () => {
     // collected after the offer was made, so the plan no longer describes the
     // pool, and the whole transaction is rolled back.
     await pool.query(
-      `UPDATE pool_stops SET status = 'ARRIVED' WHERE ride_pool_id = $1::uuid AND sequence = 1`,
+      `UPDATE pool_stops SET status = 'ARRIVED', actual_arrival_at = now()
+        WHERE ride_pool_id = $1::uuid AND sequence = 1`,
       [poolId],
     );
 
@@ -1610,14 +1623,45 @@ describe('acceptance', () => {
 
     // 42: the events, written in the same transaction.
     const rideEvents = await rideEventTypes(rafiqRequest.id);
-    assert.deepStrictEqual(rideEvents.slice(-2), ['PASSENGER_MATCHED', 'POOL_JOIN_ACCEPTED']);
+    assert.deepStrictEqual(rideEvents.slice(-3), [
+      'PASSENGER_MATCHED',
+      'POOL_JOIN_ACCEPTED',
+      // The join changed the plan, so it re-priced everybody: the joining
+      // passenger's allocation is the last thing on their own timeline.
+      'PASSENGER_FARE_ALLOCATED',
+    ]);
     const poolEvents = await listPoolEvents(poolId);
     assert.deepStrictEqual(
-      poolEvents.map((event) => event.eventType).slice(-2),
-      ['MEMBER_ADDED', 'ROUTE_PLAN_UPDATED'],
+      poolEvents.map((event) => event.eventType).slice(-4),
+      [
+        'MEMBER_ADDED',
+        'ROUTE_PLAN_UPDATED',
+        'SHARED_FARE_SUPERSEDED',
+        'SHARED_FARE_CALCULATED',
+      ],
     );
 
-    const acceptedEvent = (await listRideEvents(rafiqRequest.id)).at(-1);
+    // The passenger's own fare was allocated against the new pool version, and
+    // the event carries only their amounts.
+    const allocationEvent = (await listRideEvents(rafiqRequest.id)).at(-1);
+    assert.strictEqual(allocationEvent.eventType, 'PASSENGER_FARE_ALLOCATED');
+    assert.strictEqual(allocationEvent.metadata.poolVersion, 2);
+    assert.strictEqual(allocationEvent.metadata.sharedFareRuleVersion, SHARED_FARE_RULE_VERSION);
+    assert.strictEqual(allocationEvent.metadata.previousPooledFare, null, 'a new passenger has no cap');
+
+    // The event's fare and the request's stored fare are the same amount, shown
+    // at the two precisions they are kept at: the timeline is audience-facing and
+    // formatted at the policy's scale, the column holds the exact accepted value.
+    const [{ fare }] = (
+      await pool.query(`SELECT accepted_fare::text AS fare FROM ride_requests WHERE id = $1::uuid`, [
+        rafiqRequest.id,
+      ])
+    ).rows;
+    assert.strictEqual(allocationEvent.metadata.acceptedSoloFare, Number(fare).toFixed(2));
+
+    const acceptedEvent = (await listRideEvents(rafiqRequest.id)).find(
+      (event) => event.eventType === 'POOL_JOIN_ACCEPTED',
+    );
     assert.strictEqual(acceptedEvent.metadata.poolVersionBefore, 1);
     assert.strictEqual(acceptedEvent.metadata.poolVersionAfter, 2);
     assert.strictEqual(acceptedEvent.metadata.ruleVersion, MATCHING_RULE_VERSION);
@@ -1628,7 +1672,7 @@ describe('acceptance', () => {
       '4:DROPOFF',
     ]);
 
-    const joined = poolEvents.at(-1);
+    const joined = poolEvents.find((event) => event.eventType === 'ROUTE_PLAN_UPDATED');
     assert.strictEqual(joined.eventType, 'ROUTE_PLAN_UPDATED');
     assert.strictEqual(joined.metadata.poolVersionBefore, 1);
     assert.strictEqual(joined.metadata.poolVersionAfter, 2);
@@ -1796,7 +1840,12 @@ describe('concurrency', () => {
     );
 
     const poolEvents = await poolEventTypes(poolId);
-    assert.deepStrictEqual(poolEvents.slice(-2), ['MEMBER_ADDED', 'ROUTE_PLAN_UPDATED']);
+    assert.deepStrictEqual(poolEvents.slice(-4), [
+      'MEMBER_ADDED',
+      'ROUTE_PLAN_UPDATED',
+      'SHARED_FARE_SUPERSEDED',
+      'SHARED_FARE_CALCULATED',
+    ]);
     assert.strictEqual(
       poolEvents.filter((type) => type === 'MEMBER_ADDED').length,
       2,
@@ -2191,26 +2240,51 @@ describe('scope', () => {
     assert.ok(Number(rows[0].fare) > 0, 'the passenger still holds their solo fare');
   });
 
-  it('introduces no trip-operation endpoints (category 57)', async () => {
+  it('introduces no trip-operation endpoint of its own (category 57)', async () => {
+    // This milestone neither performs nor exposes a trip operation. The trip
+    // routes exist now, but every one of them is scoped to one driver's own pool
+    // (`/drivers/me/pools/:poolId/...`) and none of them is reachable through the
+    // paths a passenger or a different driver could guess at.
+    //
+    // The check reads the *route declarations* rather than the file's text: a
+    // comment explaining that a pool may carry several passengers is prose, not a
+    // route, and a test that fails on it is testing the wrong thing.
     const routes = await readFile(
       new URL('../../src/routes/driver.routes.js', import.meta.url),
       'utf8',
     );
 
-    assert.doesNotMatch(routes, /trip|complete|arrive|start/i);
+    const declared = [...routes.matchAll(/router\.(get|post|put|patch|delete)\(\s*'([^']*)'/g)].map(
+      (match) => match[2],
+    );
 
-    // And nothing answers on the paths a trip feature would have.
+    assert.ok(declared.length > 0, 'the route file really declares routes');
+    for (const path of declared) {
+      assert.doesNotMatch(path, /admin|passengers|\/trips\b/i, `${path} is not a driver path`);
+    }
+
+    assert.match(routes, /\/me\/pools\/:poolId\//, 'the trip is scoped to the driver\'s own pool');
+
     const cookie = await login('jashim@example.com');
     for (const path of [
       '/drivers/me/trips',
       '/drivers/me/trips/current/start',
       '/rides/current/complete',
       '/drivers/me/pool/stops/1/arrive',
+      '/ride-requests/00000000-0000-4000-8000-000000000000/pickup',
     ]) {
       // eslint-disable-next-line no-await-in-loop
       const response = await asDriver(cookie, path, { method: 'POST' });
       assert.strictEqual(response.status, 404, `${path} must not exist`);
     }
+
+    // The driver's history reads are a pool per trip, addressed by the driver's own
+    // pool id, so the boundary still holds: `/drivers/me/rides/{poolId}` is a
+    // read of one of *their* pools and answers 404 for anybody else's.
+    assert.ok(
+      declared.some((path) => path === '/me/rides/:poolId'),
+      'the history detail is scoped to one pool',
+    );
   });
 
   it('never matches into a pool that has started (category 58)', async () => {
@@ -2225,8 +2299,13 @@ describe('scope', () => {
     );
 
     // A pool that has begun moving is a commitment to the passengers already in
-    // it, so it leaves the candidate set the moment it leaves FORMING.
-    await pool.query(`UPDATE ride_pools SET status = 'DRIVER_EN_ROUTE' WHERE id = $1::uuid`, [poolId]);
+    // it, so it leaves the candidate set the moment it leaves FORMING. The
+    // departure instant comes with the status: a pool cannot be under way without
+    // having set off.
+    await pool.query(
+      `UPDATE ride_pools SET status = 'DRIVER_EN_ROUTE', departed_at = now() WHERE id = $1::uuid`,
+      [poolId],
+    );
 
     assert.strictEqual((await candidatesFor(rafiqRequest.id)).length, 0);
 
@@ -2240,3 +2319,4 @@ describe('scope', () => {
     assert.strictEqual(await requestStatus(rafiqRequest.id), 'WAITING');
   });
 });
+

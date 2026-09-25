@@ -86,6 +86,23 @@ export const env = {
      * effective at the journey's departure instant.
      */
     pricingCode: process.env.FARE_PRICING_CODE ?? 'dhaka-solo',
+
+    /**
+     * Pool-fare settings. The shared-fare *rule version* is deliberately not
+     * here: it is a constant in the code (`SHARED_FARE_RULE_VERSION`) so that
+     * changing the arithmetic is a code change that has to be published, not a
+     * deployment setting that could silently re-price a stored calculation.
+     */
+    pool: {
+      /**
+       * Ceiling for a shared-fare recalculation run on its own, outside an
+       * acceptance transaction. It has to cover routing every leg of the plan,
+       * which is a handful of short pgRouting queries.
+       */
+      transactionTimeoutMs: toNumber(process.env.POOL_FARE_TRANSACTION_TIMEOUT_MS, 20_000),
+      /** Most pools one sweep will recalculate, so a repair run stays bounded. */
+      maxPoolsPerSweep: toNumber(process.env.POOL_FARE_MAX_POOLS_PER_SWEEP, 200),
+    },
   },
 
   // --- Ride requests ----------------------------------------------------
@@ -195,6 +212,17 @@ export const env = {
     maxCandidatePools: toNumber(process.env.MATCHING_MAX_CANDIDATE_POOLS, 10),
     /** Ceiling for a pool-join acceptance transaction. */
     transactionTimeoutMs: toNumber(process.env.MATCHING_TRANSACTION_TIMEOUT_MS, 15_000),
+  },
+
+  // --- The driver's trip -------------------------------------------------
+  trip: {
+    /**
+     * Ceiling for a trip command (depart, arrive, pickup, start, drop-off,
+     * complete). Every one of them is a handful of row writes under locks the
+     * command itself takes, so this only has to cover a slow database -- unlike
+     * an acceptance, nothing here routes or prices anything.
+     */
+    transactionTimeoutMs: toNumber(process.env.TRIP_TRANSACTION_TIMEOUT_MS, 10_000),
   },
 };
 

@@ -32,6 +32,9 @@ const AVAILABILITY_KEYS = [
   'currentServicePoint',
   'driverProfileId',
   'lastSeenAt',
+  'online',
+  'operationalStatus',
+  'servicePoint',
   'status',
   'updatedAt',
   'vehicle',
@@ -79,6 +82,10 @@ const online = (code, extra = {}) =>
     method: 'POST',
     body: { currentServicePointCode: code, ...(extra.body ?? {}) },
   });
+
+/** The unified availability write. */
+const patchAvailability = (body, extra = {}) =>
+  asDriver('/drivers/me/availability', { ...extra, method: 'PATCH', body });
 
 const statusOf = async (driverProfileId) => {
   const { rows } = await pool.query(
@@ -497,5 +504,235 @@ describe('reading availability', () => {
 
     assert.strictEqual(response.status, 400);
     assert.match(response.body.error.message, /Unsupported query parameter/);
+  });
+});
+
+/**
+ * `PATCH /drivers/me/availability` — one endpoint for the whole toggle.
+ *
+ * The point of these tests is that it is the *same* operation as the two
+ * dedicated endpoints rather than a second implementation: same state machine,
+ * same refusals, same lock. Where a rule is asserted here it is asserted through
+ * the unified path specifically, because the way two spellings of one operation
+ * drift apart is by one of them gaining a rule the other does not have.
+ */
+describe('the unified availability write', () => {
+  const pointIdOf = async (code) => {
+    const { rows } = await pool.query(`SELECT id FROM service_points WHERE code = $1`, [code]);
+    assert.ok(rows[0], `the seed must contain ${code}`);
+    return rows[0].id;
+  };
+
+  it('takes a driver online from a code, and answers in the documented shape', async () => {
+    const response = await patchAvailability({ online: true, servicePointCode: POINTS.NEAR });
+
+    assert.strictEqual(response.status, 200, JSON.stringify(response.body));
+    assert.deepStrictEqual(Object.keys(response.body).sort(), AVAILABILITY_KEYS);
+
+    assert.strictEqual(response.body.online, true);
+    assert.strictEqual(response.body.operationalStatus, 'AVAILABLE');
+    assert.strictEqual(response.body.status, 'AVAILABLE');
+    assert.strictEqual(response.body.servicePoint.code, POINTS.NEAR);
+    assert.strictEqual(response.body.servicePoint.name, 'Banani Kakoli');
+    assert.ok(response.body.servicePoint.id, 'the id a client sends back');
+    assert.strictEqual(response.body.currentServicePoint.code, POINTS.NEAR);
+    assert.ok(response.body.availableSince);
+    assert.ok(response.body.lastSeenAt);
+    assert.strictEqual(response.body.canGoOffline, true);
+
+    const row = await statusOf(jashim.driverProfile.id);
+    assert.strictEqual(row.status, 'AVAILABLE');
+    assert.strictEqual(row.current_service_point_id, response.body.servicePoint.id);
+  });
+
+  it('takes a driver online from a service point id', async () => {
+    const servicePointId = await pointIdOf(POINTS.MID);
+    const response = await patchAvailability({ online: true, servicePointId });
+
+    assert.strictEqual(response.status, 200, JSON.stringify(response.body));
+    assert.strictEqual(response.body.servicePoint.id, servicePointId);
+    assert.strictEqual(response.body.servicePoint.code, POINTS.MID);
+    assert.strictEqual((await statusOf(jashim.driverProfile.id)).status, 'AVAILABLE');
+  });
+
+  it('takes a driver offline, clearing the clock and keeping where they are', async () => {
+    const before = await patchAvailability({ online: true, servicePointCode: POINTS.NEAR });
+
+    const response = await patchAvailability({ online: false });
+
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(response.body.online, false);
+    assert.strictEqual(response.body.operationalStatus, 'OFFLINE');
+    assert.strictEqual(response.body.availableSince, null);
+    assert.ok(response.body.lastSeenAt, 'going offline is still being seen');
+    assert.strictEqual(response.body.canGoOnline, true);
+
+    // The point is kept on purpose: it is where the driver is, and where they will
+    // come back online from. Being offline is not the same as being nowhere -- and
+    // it is not what excludes them from dispatch. `OFFLINE` is.
+    assert.deepStrictEqual(response.body.servicePoint, before.body.servicePoint);
+    assert.equal(
+      (await statusOf(jashim.driverProfile.id)).status,
+      'OFFLINE',
+      'the status, not the missing point, is what removes a driver from search',
+    );
+  });
+
+  it('reports no point at all for a driver who has never been online', async () => {
+    const response = await patchAvailability({ online: false });
+
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(response.body.servicePoint, null);
+    assert.strictEqual(response.body.currentServicePoint, null);
+  });
+
+  it('is idempotent in both directions', async () => {
+    const first = await patchAvailability({ online: false });
+    const second = await patchAvailability({ online: false });
+
+    assert.strictEqual(first.status, 200);
+    assert.strictEqual(second.status, 200);
+    assert.strictEqual(second.body.operationalStatus, 'OFFLINE');
+
+    await patchAvailability({ online: true, servicePointCode: POINTS.NEAR });
+    const again = await patchAvailability({ online: true, servicePointCode: POINTS.NEAR });
+
+    assert.strictEqual(again.status, 200);
+    assert.strictEqual(again.body.operationalStatus, 'AVAILABLE');
+  });
+
+  it('refuses to be told what the operational status is', async () => {
+    // The rule the endpoint exists to enforce. A device may say "I am online";
+    // it may never say "I am ON_RIDE", because that is a fact established by
+    // accepting a ride and departing.
+    for (const field of ['operationalStatus', 'status']) {
+      const response = await patchAvailability({
+        online: true,
+        servicePointCode: POINTS.NEAR,
+        [field]: 'ON_RIDE',
+      });
+
+      assert.strictEqual(response.status, 400, field);
+      assert.match(response.body.error.message, new RegExp(`Unsupported body field.*${field}`));
+    }
+
+    assert.strictEqual((await statusOf(jashim.driverProfile.id)).status, 'OFFLINE');
+  });
+
+  it('refuses a body that does not say which way the toggle goes', async () => {
+    for (const body of [{}, { servicePointCode: POINTS.NEAR }, { online: 'yes' }, { online: 1 }]) {
+      const response = await patchAvailability(body);
+
+      assert.strictEqual(response.status, 400, JSON.stringify(body));
+      assert.match(response.body.error.message, /online must be true or false/);
+    }
+  });
+
+  it('requires a place to be when going online, and refuses to guess between two', async () => {
+    const missing = await patchAvailability({ online: true });
+
+    assert.strictEqual(missing.status, 400);
+    assert.match(missing.body.error.message, /servicePointCode or servicePointId is required/);
+
+    const both = await patchAvailability({
+      online: true,
+      servicePointCode: POINTS.NEAR,
+      servicePointId: await pointIdOf(POINTS.MID),
+    });
+
+    assert.strictEqual(both.status, 400);
+    assert.match(both.body.error.message, /not both/);
+
+    // Neither attempt moved the driver, so nothing was guessed.
+    assert.strictEqual((await statusOf(jashim.driverProfile.id)).status, 'OFFLINE');
+  });
+
+  it('accepts no place at all when going offline', async () => {
+    const response = await patchAvailability({ online: false, servicePointCode: POINTS.NEAR });
+
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(response.body.operationalStatus, 'OFFLINE');
+  });
+
+  it('rejects an unknown place as a 404 and an inactive one as a 409', async () => {
+    const unknown = await patchAvailability({ online: true, servicePointCode: 'nowhere-at-all' });
+
+    assert.strictEqual(unknown.status, 404);
+    assert.match(unknown.body.error.message, /nowhere-at-all/);
+
+    const unknownId = await patchAvailability({
+      online: true,
+      servicePointId: '00000000-0000-4000-8000-000000000000',
+    });
+
+    assert.strictEqual(unknownId.status, 404);
+
+    await pool.query(`UPDATE service_points SET active = false WHERE code = $1`, [POINTS.NEAR]);
+    try {
+      const inactive = await patchAvailability({ online: true, servicePointCode: POINTS.NEAR });
+
+      assert.strictEqual(inactive.status, 409);
+      assert.match(inactive.body.error.message, /not accepting rides/);
+    } finally {
+      await pool.query(`UPDATE service_points SET active = true WHERE code = $1`, [POINTS.NEAR]);
+    }
+  });
+
+  it('will not let a committed driver go offline, whichever URL is used', async () => {
+    // Reserved for a passenger: the same refusal the dedicated endpoint gives,
+    // because it is the same operation.
+    await patchAvailability({ online: true, servicePointCode: POINTS.NEAR });
+    await pool.query(`UPDATE driver_profiles SET status = 'RESERVED' WHERE id = $1::uuid`, [
+      jashim.driverProfile.id,
+    ]);
+
+    const response = await patchAvailability({ online: false });
+
+    assert.strictEqual(response.status, 409);
+    assert.match(response.body.error.message, /RESERVED cannot go offline/);
+    assert.strictEqual((await statusOf(jashim.driverProfile.id)).status, 'RESERVED');
+
+    await pool.query(`UPDATE driver_profiles SET status = 'ON_RIDE' WHERE id = $1::uuid`, [
+      jashim.driverProfile.id,
+    ]);
+
+    const onRide = await patchAvailability({ online: false });
+
+    assert.strictEqual(onRide.status, 409);
+    assert.strictEqual((await statusOf(jashim.driverProfile.id)).status, 'ON_RIDE');
+  });
+
+  it('answers 403 for a passenger, and 401 with no session', async () => {
+    const asPassenger = await asDriver('/drivers/me/availability', {
+      method: 'PATCH',
+      body: { online: false },
+      cookie: nusratCookie,
+    });
+
+    assert.strictEqual(asPassenger.status, 403);
+
+    const anonymous = await api.request('/drivers/me/availability', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ online: false }),
+    });
+
+    assert.strictEqual(anonymous.status, 401);
+  });
+
+  it('agrees with the dedicated endpoints about the result', async () => {
+    // The two spellings must be one operation. Sending one through each and
+    // comparing the effect is the cheapest way to keep that true.
+    const viaPatch = await patchAvailability({ online: true, servicePointCode: POINTS.NEAR });
+    const afterPatch = await statusOf(jashim.driverProfile.id);
+
+    await asDriver('/drivers/me/offline', { method: 'POST' });
+    await online(POINTS.NEAR);
+    const viaPost = await asDriver('/drivers/me/availability');
+    const afterPost = await statusOf(jashim.driverProfile.id);
+
+    assert.strictEqual(viaPatch.body.operationalStatus, viaPost.body.operationalStatus);
+    assert.strictEqual(afterPatch.status, afterPost.status);
+    assert.strictEqual(afterPatch.current_service_point_id, afterPost.current_service_point_id);
   });
 });

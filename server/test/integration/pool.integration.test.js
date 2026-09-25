@@ -136,6 +136,8 @@ const counts = async () => {
 
 /** Inserts a pool directly, so the constraint tests can reach past the service. */
 const insertPool = async (tx, overrides = {}) => {
+  const { fillImpliedTimestamps = true, ...columns } = overrides;
+
   const row = {
     driverProfileId: jashim.driverProfile.id,
     vehicleId: jashim.driverProfile.vehicles[0].id,
@@ -144,17 +146,35 @@ const insertPool = async (tx, overrides = {}) => {
     plannedDistanceMeters: 2214,
     plannedDurationSeconds: 569,
     version: 1,
+    departedAt: null,
+    driverArrivedAt: null,
+    startedAt: null,
     completedAt: null,
     cancelledAt: null,
-    startedAt: null,
-    ...overrides,
+    ...columns,
   };
+
+  // A pool's status and its timestamps have to agree (`ride_pools_lifecycle_consistent`),
+  // so a fixture that writes a status by hand fills in what that status implies:
+  // anything past FORMING has departed, and a started or finished trip says when.
+  // `fillImpliedTimestamps: false` is for the tests that want the disagreement.
+  if (fillImpliedTimestamps) {
+    if (row.status !== 'FORMING' && row.departedAt === null) row.departedAt = new Date();
+    if (['ARRIVED', 'IN_PROGRESS', 'COMPLETED'].includes(row.status) && row.driverArrivedAt === null) {
+      row.driverArrivedAt = new Date();
+    }
+    if (['IN_PROGRESS', 'COMPLETED'].includes(row.status) && row.startedAt === null) {
+      row.startedAt = new Date();
+    }
+    if (row.status === 'COMPLETED' && row.completedAt === null) row.completedAt = new Date();
+    if (row.status === 'CANCELLED' && row.cancelledAt === null) row.cancelledAt = new Date();
+  }
 
   const { rows } = await tx.query(
     `INSERT INTO ride_pools (driver_profile_id, vehicle_id, status, capacity_snapshot,
                              planned_distance_meters, planned_duration_seconds, version,
-                             completed_at, cancelled_at, started_at)
-     VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
+                             departed_at, driver_arrived_at, completed_at, cancelled_at, started_at)
+     VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
     [
       row.driverProfileId,
       row.vehicleId,
@@ -163,6 +183,8 @@ const insertPool = async (tx, overrides = {}) => {
       row.plannedDistanceMeters,
       row.plannedDurationSeconds,
       row.version,
+      row.departedAt,
+      row.driverArrivedAt,
       row.completedAt,
       row.cancelledAt,
       row.startedAt,
@@ -345,7 +367,15 @@ describe('accepting an offer', () => {
     const rideEvents = await listRideEvents(request.id);
     assert.deepStrictEqual(
       rideEvents.map((event) => event.eventType),
-      ['RIDE_REQUESTED', 'DRIVER_OFFERED', 'PASSENGER_MATCHED', 'DRIVER_ACCEPTED'],
+      [
+        'RIDE_REQUESTED',
+        'DRIVER_OFFERED',
+        'PASSENGER_MATCHED',
+        'DRIVER_ACCEPTED',
+        // The pool has a plan, so it has a fare: the passenger's own allocation is
+        // recorded on their timeline in the same transaction as the match.
+        'PASSENGER_FARE_ALLOCATED',
+      ],
     );
 
     const matched = rideEvents[2];
@@ -357,6 +387,13 @@ describe('accepting an offer', () => {
     assert.strictEqual(accepted.metadata.ridePoolId, created.id);
     assert.strictEqual(accepted.metadata.driverProfileId, jashim.driverProfile.id);
 
+    const allocated = rideEvents[4];
+    assert.strictEqual(allocated.metadata.poolVersion, 1);
+    // This suite quotes at 08:41, so the accepted solo fare is the rush-hour
+    // reference fare for Banani Road 11 -> Mohakhali Bus Terminal.
+    assert.strictEqual(allocated.metadata.acceptedSoloFare, '130.63');
+    assert.ok(allocated.metadata.fareCalculationId);
+
     const poolEvents = await listPoolEvents(created.id);
     assert.deepStrictEqual(
       poolEvents.map((event) => [event.sequence, event.eventType, event.actorType]),
@@ -364,6 +401,7 @@ describe('accepting an offer', () => {
         [1, 'POOL_CREATED', 'DRIVER'],
         [2, 'MEMBER_ADDED', 'DRIVER'],
         [3, 'ROUTE_PLAN_CREATED', 'SYSTEM'],
+        [4, 'SHARED_FARE_CALCULATED', 'SYSTEM'],
       ],
     );
     assert.strictEqual(poolEvents[0].actorUserId, jashim.id);
@@ -665,8 +703,9 @@ describe('concurrency', () => {
     assert.strictEqual(all.stops, 2);
     assert.strictEqual((await stateOf(request.id)).request.status, 'MATCHED');
 
-    // The pool events are written once, by the winner.
-    assert.strictEqual(all.events, 3);
+    // The pool events are written once, by the winner -- including the fare
+    // calculation, which is part of the same acceptance.
+    assert.strictEqual(all.events, 4);
   });
 
   it('never produces both a pool and a cancelled request, however it interleaves', async () => {
@@ -836,16 +875,43 @@ describe('the pool is checked as a whole', () => {
 
   it('refuses a pool whose timestamps disagree with its status', async () => {
     await withRollback(async (tx) => {
+      const raw = (overrides) => insertPool(tx, { fillImpliedTimestamps: false, ...overrides });
+
       // COMPLETED without a completion time is not a finished pool...
-      await expectPgError(tx, () => insertPool(tx, { status: 'COMPLETED' }), '23514');
+      await expectPgError(tx, () => raw({ status: 'COMPLETED' }), '23514');
       // ...CANCELLED without one is not a cancelled pool...
-      await expectPgError(tx, () => insertPool(tx, { status: 'CANCELLED' }), '23514');
+      await expectPgError(tx, () => raw({ status: 'CANCELLED' }), '23514');
       // ...and an unfinished pool cannot already have started.
+      await expectPgError(tx, () => raw({ status: 'FORMING', startedAt: new Date() }), '23514');
+
+      // The trip's own instants are checked the same way: a pool that has left
+      // FORMING has departed, an ARRIVED pool has an arrival, and a trip that is
+      // under way says when it started.
+      await expectPgError(tx, () => raw({ status: 'DRIVER_EN_ROUTE' }), '23514');
+      await expectPgError(tx, () => raw({ status: 'ARRIVED', departedAt: new Date() }), '23514');
       await expectPgError(
         tx,
-        () => insertPool(tx, { status: 'FORMING', startedAt: new Date() }),
+        () => raw({ status: 'IN_PROGRESS', departedAt: new Date(), driverArrivedAt: new Date() }),
         '23514',
       );
+
+      // The same rows are accepted once they agree with themselves, so the
+      // assertions above are about the disagreement and not about the insert. One
+      // status at a time: a driver may hold only one active pool at once.
+      const ridePoolId = await insertPool(tx, { status: 'IN_PROGRESS' });
+      const { rows } = await tx.query(
+        `SELECT status, departed_at IS NOT NULL AS departed,
+                driver_arrived_at IS NOT NULL AS arrived,
+                started_at IS NOT NULL AS started
+           FROM ride_pools WHERE id = $1::uuid`,
+        [ridePoolId],
+      );
+      assert.deepStrictEqual(rows[0], {
+        status: 'IN_PROGRESS',
+        departed: true,
+        arrived: true,
+        started: true,
+      });
     });
   });
 

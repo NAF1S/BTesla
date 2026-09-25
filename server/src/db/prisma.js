@@ -13,7 +13,20 @@ import { env } from '../config/env.js';
  */
 const adapter = new PrismaPg({ connectionString: env.databaseUrl });
 
-export const prisma = new PrismaClient({ adapter });
+/**
+ * The client.
+ *
+ * In tests the queries are emitted as events so a suite can *count* them, which
+ * is the only honest way to assert that a page read is not an N+1: a test that
+ * merely checked the response shape would pass just as happily against a loop of
+ * one query per row. Emitting events is not free, so it is off everywhere else --
+ * `env.nodeEnv` is already `test` under `node --test`, and the switch is here
+ * rather than in the suite because the client is a module singleton.
+ */
+export const prisma = new PrismaClient({
+  adapter,
+  ...(env.nodeEnv === 'test' ? { log: [{ emit: 'event', level: 'query' }] } : {}),
+});
 
 /** Runs `SELECT 1` and reports whether the database is reachable. */
 export const checkDatabase = async () => {

@@ -36,15 +36,28 @@ const POOL = {
   createdAt: new Date('2026-09-25T03:01:40.645Z'),
   acceptedAt: new Date('2026-09-25T03:01:40.645Z'),
   driverArrivedAt: null,
+  departedAt: null,
   startedAt: null,
   completedAt: null,
   cancelledAt: null,
+  // The fare, for its status only: the DTO says whether it is settled, never what
+  // it is worth.
+  fareCalculations: [
+    {
+      id: '99999999-1111-1111-1111-111111111111',
+      status: 'CURRENT',
+      poolVersion: 1,
+      finalizedAt: null,
+    },
+  ],
   vehicle: { name: 'Bullet', seatCapacity: 3 },
   members: [
     {
       id: 'bbbbbbbb-1111-1111-1111-111111111111',
       status: 'ASSIGNED',
       matchedAt: new Date('2026-09-25T03:01:40.645Z'),
+      pickedUpAt: null,
+      droppedOffAt: null,
       rideRequestId: 'cccccccc-1111-1111-1111-111111111111',
       rideRequest: {
         id: 'cccccccc-1111-1111-1111-111111111111',
@@ -63,6 +76,7 @@ const POOL = {
       status: 'PENDING',
       plannedArrivalAt: new Date('2026-09-25T03:13:03.645Z'),
       actualArrivalAt: null,
+      completedAt: null,
       servicePoint: { code: 'mohakhali-bus-terminal', name: 'Mohakhali Bus Terminal' },
       poolMemberId: 'bbbbbbbb-1111-1111-1111-111111111111',
     },
@@ -73,6 +87,7 @@ const POOL = {
       status: 'PENDING',
       plannedArrivalAt: new Date('2026-09-25T03:03:34.645Z'),
       actualArrivalAt: null,
+      completedAt: null,
       servicePoint: { code: 'banani-road-11', name: 'Banani Road 11' },
       poolMemberId: 'bbbbbbbb-1111-1111-1111-111111111111',
     },
@@ -99,19 +114,83 @@ describe('toPoolDto', () => {
   it('returns exactly the documented fields', () => {
     assert.deepStrictEqual(Object.keys(toPoolDto(POOL)).sort(), [
       'acceptedAt',
+      'allowedActions',
       'cancelledAt',
       'capacity',
       'completedAt',
+      'departedAt',
       'driverArrivedAt',
       'events',
       'members',
+      'nextStop',
       'plan',
       'poolId',
+      'pricing',
       'startedAt',
       'status',
+      'stops',
       'vehicle',
       'version',
     ]);
+  });
+
+  it('tells the driver what they may do next, and where', () => {
+    const dto = toPoolDto(POOL);
+
+    // A forming pool with a plan can depart, and nothing else: there is no stop
+    // to reach yet.
+    assert.deepStrictEqual(dto.allowedActions, ['DEPART']);
+    // The next actionable stop is the lowest-sequence one that is not done, which
+    // is the pickup -- even though the rows arrived drop-off first.
+    assert.strictEqual(dto.nextStop.stopId, 'eeeeeeee-1111-1111-1111-111111111111');
+    assert.strictEqual(dto.nextStop.stopType, 'PICKUP');
+    assert.deepStrictEqual(
+      dto.stops.map((stop) => stop.sequence),
+      [1, 2],
+      'the plan is reported in the order it is driven',
+    );
+
+    // The fare status travels with the pool; the amounts never do.
+    assert.deepStrictEqual(dto.pricing, {
+      finalized: false,
+      finalizedAt: null,
+      poolVersion: 1,
+    });
+  });
+
+  it('offers no action at all once the pool is finished', () => {
+    const finished = {
+      ...POOL,
+      status: 'COMPLETED',
+      departedAt: new Date('2026-09-25T03:02:00.000Z'),
+      driverArrivedAt: new Date('2026-09-25T03:03:00.000Z'),
+      startedAt: new Date('2026-09-25T03:04:00.000Z'),
+      completedAt: new Date('2026-09-25T03:20:00.000Z'),
+      fareCalculations: [
+        { id: '99999999-1111-1111-1111-111111111111', status: 'FINALIZED', poolVersion: 1, finalizedAt: new Date('2026-09-25T03:02:00.000Z') },
+      ],
+      members: [
+        {
+          ...POOL.members[0],
+          status: 'DROPPED_OFF',
+          pickedUpAt: new Date('2026-09-25T03:05:00.000Z'),
+          droppedOffAt: new Date('2026-09-25T03:20:00.000Z'),
+          rideRequest: { ...POOL.members[0].rideRequest, status: 'COMPLETED' },
+        },
+      ],
+      stops: POOL.stops.map((stop) => ({
+        ...stop,
+        status: 'COMPLETED',
+        actualArrivalAt: new Date('2026-09-25T03:04:00.000Z'),
+        completedAt: new Date('2026-09-25T03:20:00.000Z'),
+      })),
+    };
+
+    const dto = toPoolDto(finished);
+
+    assert.deepStrictEqual(dto.allowedActions, []);
+    assert.strictEqual(dto.nextStop, null);
+    assert.strictEqual(dto.pricing.finalized, true);
   });
 
   it('reports the plan, the vehicle and the capacity the pool was built with', () => {
@@ -175,6 +254,7 @@ describe('toPoolDto', () => {
     );
     assert.deepStrictEqual(Object.keys(member.stops[0]).sort(), [
       'actualArrivalAt',
+      'completedAt',
       'plannedArrivalAt',
       'sequence',
       'servicePoint',

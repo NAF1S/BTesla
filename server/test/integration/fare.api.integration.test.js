@@ -804,13 +804,15 @@ describe('phase boundary', () => {
       [
         'dispatch_offers',
         'pool_events',
+        'pool_fare_calculations',
+        'pool_fare_legs',
         'pool_members',
         'pool_stops',
         'ride_events',
         'ride_pools',
         'ride_requests',
       ],
-      'pricing, ride and dispatch tables exist; nothing shared, seated or paid does',
+      'pricing, ride, pool and shared-fare tables exist; nothing shared, seated or paid does',
     );
   });
 

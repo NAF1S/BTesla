@@ -116,8 +116,11 @@ export class FareCalculationError extends Error {
  *
  * `number` is refused rather than converted: by the time a money value is a
  * JavaScript number, the precision is already gone.
+ *
+ * Exported because the shared-fare calculation is exact money too, and it must
+ * refuse a float in exactly the same places this does.
  */
-const toExactDecimal = (value, label) => {
+export const toExactDecimal = (value, label) => {
   if (value instanceof Decimal) {
     if (!value.isFinite()) throw new FareCalculationError(`${label} is not a finite decimal`);
     return value;
@@ -143,9 +146,13 @@ const toExactDecimal = (value, label) => {
   throw new FareCalculationError(`${label} is missing`);
 };
 
-const roundTo = (value, scale) => value.toDecimalPlaces(scale, ROUNDING_MODE);
+/** The project's money rounding rule, in one place. */
+export const roundTo = (value, scale) => value.toDecimalPlaces(scale, ROUNDING_MODE);
 
-const requirePositiveInteger = (value, label) => {
+/** Rounds toward zero, which is what "the share before the residual" means. */
+export const roundDown = (value, scale) => value.toDecimalPlaces(scale, Decimal.ROUND_DOWN);
+
+export const requirePositiveInteger = (value, label) => {
   const number = Number(value);
   if (!Number.isInteger(number) || number <= 0) {
     throw new FareCalculationError(`${label} must be a positive integer (got ${JSON.stringify(value)})`);
@@ -153,8 +160,14 @@ const requirePositiveInteger = (value, label) => {
   return number;
 };
 
-/** Reads and validates everything the calculation needs from a policy row. */
-const readPolicy = (policy) => {
+/**
+ * Reads and validates everything the calculation needs from a policy row.
+ *
+ * Exported so the pool-fare calculation prices with the *same* rates, the same
+ * rounding scale and the same validation as a solo quote: two readers would be
+ * two chances to disagree about what a policy says.
+ */
+export const readPolicy = (policy) => {
   if (!policy) throw new FareCalculationError('no fare policy was supplied');
 
   const label = `fare policy ${policy.code ?? '?'} v${policy.version ?? '?'}`;
