@@ -207,6 +207,232 @@ export const createPoolForAcceptedOffer = async (
   return { pool, member, stops: [pickupStop, dropoffStop] };
 };
 
+/**
+ * Locks every stop of a pool for the rest of the transaction.
+ *
+ * Taken before a join rewrites the sequence numbers: without it, two joins into
+ * the same pool would compute their final orders against stops the other is about
+ * to move.
+ */
+export const lockPoolStops = async (tx, ridePoolId) => {
+  await tx.$queryRawUnsafe(
+    `SELECT id FROM pool_stops WHERE ride_pool_id = $1::uuid ORDER BY sequence FOR UPDATE`,
+    ridePoolId,
+  );
+
+  return tx.poolStop.findMany({
+    where: { ridePoolId },
+    orderBy: { sequence: 'asc' },
+    select: {
+      id: true,
+      sequence: true,
+      stopType: true,
+      servicePointId: true,
+      rideRequestId: true,
+      poolMemberId: true,
+      status: true,
+      plannedArrivalAt: true,
+    },
+  });
+};
+
+/**
+ * The offset applied to existing sequences while a plan is being written.
+ *
+ * `pool_stops_pool_sequence_unique` is a plain unique constraint, so the final
+ * sequence numbers cannot be assigned while the old ones are still in the way:
+ * moving the stop at position 1 to position 3 collides with the stop currently at
+ * position 3. Offsetting everything by a constant first -- and the offset is
+ * comfortably larger than any plan this milestone can produce -- makes the whole
+ * rewrite collision-free without needing deferrable constraints.
+ *
+ * The order the final values are then assigned in matters twice over: ascending
+ * by final sequence means a passenger's pickup is always placed before their
+ * drop-off, which is what the `enforce_pool_stop_consistency` trigger checks
+ * whenever a drop-off is written.
+ */
+const SEQUENCE_OFFSET = 1000;
+
+/**
+ * Adds one passenger to a pool: the member, the two stops, the new plan and the
+ * version bump, in the caller's transaction.
+ *
+ * `proposal` is the snapshot the driver accepted. Its stop order is authoritative
+ * -- re-planned inside the transaction would mean routing every leg again, and the
+ * plan was already validated against the pool version this transaction has just
+ * confirmed is still current. What is recomputed here is everything that depends
+ * on *when* it is applied: the arrivals are re-anchored to `now`, using the leg
+ * durations the proposal stored.
+ *
+ * Must be called with the pool, its members and its stops locked.
+ */
+export const addMemberToPool = async (
+  tx,
+  { pool, request, proposal, actorUserId, now },
+) => {
+  const existingStops = await lockPoolStops(tx, pool.id);
+
+  if (existingStops.some((stop) => stop.status !== POOL_STOP_STATUS.PENDING)) {
+    throw new ApiError(409, 'This pool already has a stop in progress and cannot be changed');
+  }
+
+  const expectedVersion = proposal.poolVersion;
+
+  // Re-anchor the accepted plan to the instant it is actually applied. The first
+  // stop is reached after the approach, and each later stop after the legs before
+  // it -- the same rule that planned it, evaluated against a later clock.
+  let elapsed = proposal.approach.durationSeconds;
+  const arrivals = proposal.stops.map((stop, index) => {
+    if (index > 0) elapsed += proposal.legs[index - 1].durationSeconds;
+    return new Date(now.getTime() + elapsed * 1000);
+  });
+
+  // 1. Move the existing stops out of the way of the sequences about to be used.
+  await tx.$executeRawUnsafe(
+    `UPDATE pool_stops SET sequence = sequence + $2::int WHERE ride_pool_id = $1::uuid`,
+    pool.id,
+    SEQUENCE_OFFSET,
+  );
+
+  // 2. The member. One row per passenger, and `ride_request_id` is unique, so the
+  // database refuses a second membership even if two acceptances race.
+  const member = await tx.poolMember.create({
+    data: {
+      ridePoolId: pool.id,
+      rideRequestId: request.id,
+      status: POOL_MEMBER_STATUS.ASSIGNED,
+      matchedAt: now,
+      createdAt: now,
+    },
+    select: { id: true, status: true, rideRequestId: true, matchedAt: true },
+  });
+
+  // 3. The two new stops, at the positions the proposal chose. Pickup first, so
+  // the drop-off's consistency check finds its sibling already in place.
+  const newStops = proposal.stops.filter((stop) => stop.isNew);
+  const inserted = [];
+
+  for (const stop of [...newStops].sort((a, b) => a.sequence - b.sequence)) {
+    const created = await tx.poolStop.create({
+      data: {
+        ridePoolId: pool.id,
+        rideRequestId: request.id,
+        poolMemberId: member.id,
+        servicePointId: stop.servicePointId,
+        stopType: stop.stopType,
+        sequence: stop.sequence,
+        status: POOL_STOP_STATUS.PENDING,
+        plannedArrivalAt: arrivals[stop.sequence - 1],
+      },
+      select: { id: true, sequence: true, stopType: true, servicePointId: true },
+    });
+
+    inserted.push(created);
+  }
+
+  // 4. Put the existing stops back, in ascending final order: a passenger's
+  // pickup is always written before their drop-off, and never collides with a
+  // sequence another stop still holds.
+  const existingByPosition = new Map(
+    proposal.stops
+      .map((stop, index) => ({ stop, position: index + 1 }))
+      .filter(({ stop }) => !stop.isNew)
+      .map(({ stop, position }) => [position, stop]),
+  );
+
+  for (const position of [...existingByPosition.keys()].sort((a, b) => a - b)) {
+    const stop = existingByPosition.get(position);
+
+    await tx.poolStop.update({
+      where: { id: stop.stopId },
+      data: { sequence: position, plannedArrivalAt: arrivals[position - 1] },
+      select: { id: true },
+    });
+  }
+
+  // 5. The pool's plan and its version. The version is part of the WHERE clause,
+  // so a proposal planned against a version that is no longer current cannot be
+  // applied even if a caller forgot to check it first.
+  if (proposal.routeGeometry) {
+    await tx.$executeRawUnsafe(
+      `UPDATE ride_pools
+          SET planned_route_geometry = ST_SetSRID(ST_GeomFromGeoJSON($2::json), 4326),
+              planned_distance_meters = $3,
+              planned_duration_seconds = $4,
+              version = version + 1
+        WHERE id = $1::uuid AND version = $5`,
+      pool.id,
+      JSON.stringify(proposal.routeGeometry),
+      proposal.totalDistanceMeters,
+      proposal.totalDurationSeconds,
+      expectedVersion,
+    );
+  } else {
+    const updated = await tx.ridePool.updateMany({
+      where: { id: pool.id, version: expectedVersion },
+      data: {
+        plannedDistanceMeters: proposal.totalDistanceMeters,
+        plannedDurationSeconds: proposal.totalDurationSeconds,
+        version: { increment: 1 },
+      },
+    });
+
+    if (updated.count !== 1) {
+      throw new ApiError(409, 'This pool has changed since the offer was made');
+    }
+  }
+
+  // `$queryRawUnsafe` returns the rows themselves, not a `{ rows }` envelope --
+  // only the test helper wraps it that way.
+  const rows = await tx.$queryRawUnsafe(
+    `SELECT version, planned_distance_meters::text AS distance, planned_duration_seconds
+       FROM ride_pools WHERE id = $1::uuid`,
+    pool.id,
+  );
+
+  if (!rows[0] || Number(rows[0].version) !== expectedVersion + 1) {
+    throw new ApiError(409, 'This pool has changed since the offer was made');
+  }
+
+  await appendPoolEvent(tx, {
+    ridePoolId: pool.id,
+    eventType: POOL_EVENT_TYPE.MEMBER_ADDED,
+    actorType: POOL_ACTOR_TYPE.DRIVER,
+    actorUserId,
+    metadata: {
+      rideRequestId: request.id,
+      poolMemberId: member.id,
+      ruleVersion: proposal.ruleVersion,
+      stopOrderSignature: proposal.stopOrderSignature,
+    },
+    now,
+  });
+
+  await appendPoolEvent(tx, {
+    ridePoolId: pool.id,
+    eventType: POOL_EVENT_TYPE.ROUTE_PLAN_UPDATED,
+    actorType: POOL_ACTOR_TYPE.SYSTEM,
+    metadata: {
+      ruleVersion: proposal.ruleVersion,
+      poolVersionBefore: expectedVersion,
+      poolVersionAfter: Number(rows[0].version),
+      addedDistanceMeters: proposal.addedDistanceMeters,
+      addedDurationSeconds: proposal.addedDurationSeconds,
+      peakOccupancy: proposal.peakOccupancy,
+      stopOrder: proposal.stops.map((stop) => `${stop.sequence}:${stop.stopType}`),
+    },
+    now,
+  });
+
+  return {
+    member,
+    stops: inserted,
+    version: Number(rows[0].version),
+    plannedDistanceMeters: rows[0].distance,
+    plannedDurationSeconds: rows[0].planned_duration_seconds,
+  };
+};
+
 /** The driver's active pool, if they have one. A driver can have at most one. */
 export const findActivePoolForDriver = (driverProfileId) =>
   prisma.ridePool.findFirst({

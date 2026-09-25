@@ -74,6 +74,13 @@ export const RIDE_EVENT_TYPE = Object.freeze({
   DRIVER_OFFER_EXPIRED: 'DRIVER_OFFER_EXPIRED',
   DRIVER_OFFER_CANCELLED: 'DRIVER_OFFER_CANCELLED',
   DRIVER_ACCEPTED: 'DRIVER_ACCEPTED',
+  // Shared matching: a pool was considered, offered, refused, joined, or given up
+  // on in favour of finding the passenger a driver of their own.
+  POOL_CANDIDATE_EVALUATED: 'POOL_CANDIDATE_EVALUATED',
+  POOL_JOIN_OFFERED: 'POOL_JOIN_OFFERED',
+  POOL_JOIN_REJECTED: 'POOL_JOIN_REJECTED',
+  POOL_JOIN_ACCEPTED: 'POOL_JOIN_ACCEPTED',
+  INITIAL_DISPATCH_FALLBACK: 'INITIAL_DISPATCH_FALLBACK',
   // The match. The name already existed and is reused rather than duplicated
   // under a second name -- it is the moment a request stops waiting.
   PASSENGER_MATCHED: 'PASSENGER_MATCHED',

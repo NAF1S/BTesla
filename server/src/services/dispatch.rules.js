@@ -110,7 +110,12 @@ export const OFFER_TYPE = Object.freeze({
   ADD_PASSENGER: 'ADD_PASSENGER',
 });
 
-/** The only offer type this milestone creates. */
+/**
+ * The offer type *dispatch* creates: finding a driver for a passenger who has no
+ * pool of their own. A join offer (`ADD_PASSENGER`, proposing that an existing
+ * pool take another passenger) is created by matching.service.js, and accepting
+ * one changes a pool that already exists instead of starting one.
+ */
 export const IMPLEMENTED_OFFER_TYPE = OFFER_TYPE.INITIAL_RIDE;
 
 export const OFFER_STATUS = Object.freeze({
@@ -221,6 +226,10 @@ export const POOL_EVENT_TYPE = Object.freeze({
   POOL_CREATED: 'POOL_CREATED',
   MEMBER_ADDED: 'MEMBER_ADDED',
   ROUTE_PLAN_CREATED: 'ROUTE_PLAN_CREATED',
+  // Shared matching: a join was proposed for the pool, and a proposed plan was
+  // adopted (which is also the moment the pool's version moves on).
+  JOIN_PLAN_CREATED: 'JOIN_PLAN_CREATED',
+  ROUTE_PLAN_UPDATED: 'ROUTE_PLAN_UPDATED',
   MEMBER_PICKED_UP: 'MEMBER_PICKED_UP',
   MEMBER_DROPPED_OFF: 'MEMBER_DROPPED_OFF',
   POOL_STATUS_CHANGED: 'POOL_STATUS_CHANGED',

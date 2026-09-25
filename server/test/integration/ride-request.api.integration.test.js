@@ -354,13 +354,25 @@ describe('creating a ride request', () => {
     const created = await requestRide(nusrat);
     const events = await listRideEvents(created.id);
 
-    assert.strictEqual(events.length, 1);
+    // Creating a request over HTTP also runs the first assignment attempt, so
+    // the timeline continues past the creation event; this test is about the
+    // creation event itself being written exactly once, first.
+    assert.strictEqual(
+      events.filter((event) => event.eventType === 'RIDE_REQUESTED').length,
+      1,
+    );
     assert.strictEqual(events[0].sequence, 1);
     assert.strictEqual(events[0].eventType, 'RIDE_REQUESTED');
     assert.strictEqual(events[0].actorType, 'PASSENGER');
     assert.strictEqual(events[0].previousStatus, null);
     assert.strictEqual(events[0].newStatus, 'WAITING');
     assert.strictEqual(events[0].metadata.fareQuoteId, created.acceptedQuote.fareQuoteId);
+
+    const tail = events.slice(1).map((event) => event.eventType);
+    assert.ok(
+      tail.every((type) => type === 'INITIAL_DISPATCH_FALLBACK'),
+      `nothing but an assignment attempt may follow creation, got: ${tail.join(', ')}`,
+    );
   });
 
   it('refuses a body field the passenger does not control', async () => {
@@ -887,17 +899,20 @@ describe('cancelling a ride request', () => {
     );
 
     const events = await listRideEvents(created.id);
+    const cancelled = events.at(-1);
 
-    assert.deepStrictEqual(
-      events.map((event) => [event.sequence, event.eventType, event.actorType]),
-      [
-        [1, 'RIDE_REQUESTED', 'PASSENGER'],
-        [2, 'RIDE_CANCELLED', 'PASSENGER'],
-      ],
-    );
-    assert.strictEqual(events[1].previousStatus, 'WAITING');
-    assert.strictEqual(events[1].newStatus, 'CANCELLED');
-    assert.strictEqual(events[1].metadata.reason, 'WAIT_TOO_LONG');
+    // The assignment attempt for a ride nobody can be matched to is recorded
+    // between the two lifecycle events, so this asserts about ordering rather
+    // than about a fixed timeline.
+    assert.strictEqual(events[0].sequence, 1);
+    assert.strictEqual(events[0].eventType, 'RIDE_REQUESTED');
+    assert.strictEqual(events[0].actorType, 'PASSENGER');
+    assert.strictEqual(cancelled.eventType, 'RIDE_CANCELLED');
+    assert.strictEqual(cancelled.actorType, 'PASSENGER');
+    assert.ok(cancelled.sequence > events[0].sequence, 'the cancellation comes after creation');
+    assert.strictEqual(cancelled.previousStatus, 'WAITING');
+    assert.strictEqual(cancelled.newStatus, 'CANCELLED');
+    assert.strictEqual(cancelled.metadata.reason, 'WAIT_TOO_LONG');
   });
 
   it('refuses a second cancellation', async () => {

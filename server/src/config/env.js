@@ -151,6 +151,51 @@ export const env = {
       idleCreditMaxSeconds: toNumber(process.env.DISPATCH_IDLE_CREDIT_MAX_SECONDS, 180),
     },
   },
+
+  // --- Pool matching (shared rides) --------------------------------------
+  matching: {
+    /**
+     * A request is only considered for an *existing* pool while it is inside
+     * this window. Once the passenger has been waiting longer than this, the
+     * dispatcher stops trying to fold them into somebody else's ride and looks
+     * for a driver to themselves -- a passenger who has already waited is not
+     * helped by a detour.
+     */
+    windowSeconds: toNumber(process.env.MATCHING_WINDOW_SECONDS, 300),
+    /**
+     * Stage 1 of pool matching: how near a new pickup has to be to a pool's
+     * planned route to be worth simulating. Straight-line metres, used only to
+     * shortlist -- the insertion simulation decides.
+     */
+    radiusMeters: toNumber(process.env.MATCHING_RADIUS_METERS, 1500),
+    /** How near the new destination has to be to the pool's route. */
+    destinationRadiusMeters: toNumber(process.env.MATCHING_DESTINATION_RADIUS_METERS, 3000),
+    /**
+     * The rules a proposed insertion has to satisfy.
+     *
+     * `maxPickupWaitSeconds` is measured from the passenger's own `requestedAt`,
+     * so it includes the matching delay and the driver's approach: it is the time
+     * the passenger actually spends waiting.
+     */
+    maxPickupWaitSeconds: toNumber(process.env.MATCHING_MAX_PICKUP_WAIT_SECONDS, 480),
+    maxAddedPoolDurationSeconds: toNumber(process.env.MATCHING_MAX_ADDED_DURATION_SECONDS, 600),
+    maxExistingPassengerDetourSeconds: toNumber(
+      process.env.MATCHING_MAX_DETOUR_SECONDS,
+      600,
+    ),
+    maxExistingPassengerDetourRatio: toNumber(process.env.MATCHING_MAX_DETOUR_RATIO, 1.25),
+    /**
+     * How much a second of pick-up wait and a second of somebody else's detour
+     * are worth against a second of extra driving. All ones by default, which
+     * makes the score read as "seconds of harm".
+     */
+    pickupWaitWeight: toNumber(process.env.MATCHING_PICKUP_WAIT_WEIGHT, 1),
+    detourWeight: toNumber(process.env.MATCHING_DETOUR_WEIGHT, 1),
+    /** Most candidate pools to simulate for one request, nearest first. */
+    maxCandidatePools: toNumber(process.env.MATCHING_MAX_CANDIDATE_POOLS, 10),
+    /** Ceiling for a pool-join acceptance transaction. */
+    transactionTimeoutMs: toNumber(process.env.MATCHING_TRANSACTION_TIMEOUT_MS, 15_000),
+  },
 };
 
 /**

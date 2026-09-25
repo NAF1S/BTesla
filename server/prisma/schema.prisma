@@ -469,7 +469,8 @@ enum RideRequestStatus {
 
 /// RIDE_REQUESTED, RIDE_CANCELLED, RIDE_EXPIRED and the DRIVER_* dispatch events
 /// are written today; PASSENGER_MATCHED is the match event (it already existed,
-/// so it is reused rather than duplicated); the rest are reserved for the trip.
+/// so it is reused rather than duplicated); the POOL_JOIN_* events and the
+/// fallback belong to shared matching; the rest are reserved for the trip.
 enum RideEventType {
   RIDE_REQUESTED
   RIDE_CANCELLED
@@ -484,6 +485,11 @@ enum RideEventType {
   DRIVER_OFFER_EXPIRED
   DRIVER_OFFER_CANCELLED
   DRIVER_ACCEPTED
+  POOL_CANDIDATE_EVALUATED
+  POOL_JOIN_OFFERED
+  POOL_JOIN_REJECTED
+  POOL_JOIN_ACCEPTED
+  INITIAL_DISPATCH_FALLBACK
 
   @@map("ride_event_type")
 }
@@ -526,8 +532,13 @@ model DispatchOffer {
   rideRequestId           String                   @map("ride_request_id") @db.Uuid
   driverProfileId         String                   @map("driver_profile_id") @db.Uuid
   vehicleId               String                   @map("vehicle_id") @db.Uuid
-  /// Set by acceptance, to the pool that acceptance created.
+  /// Set by acceptance, to the pool that acceptance created. For an
+  /// ADD_PASSENGER offer it is set at creation: the pool *is* the proposal.
   ridePoolId              String?                  @map("ride_pool_id") @db.Uuid
+  /// The `RidePool.version` an ADD_PASSENGER proposal was planned against.
+  /// Acceptance refuses an offer whose version is no longer current, which is
+  /// what stops a stale plan changing a pool that has moved on.
+  poolVersion             Int?                     @map("pool_version")
   offerType               DispatchOfferType        @default(INITIAL_RIDE) @map("offer_type")
   status                  DispatchOfferStatus      @default(PENDING)
   approachDistanceMeters  Decimal                  @map("approach_distance_meters") @db.Decimal(12, 2)
@@ -573,8 +584,8 @@ model RidePool {
   plannedRouteGeometry   Unsupported("geometry")? @map("planned_route_geometry")
   plannedDistanceMeters  Decimal                  @map("planned_distance_meters") @db.Decimal(12, 2)
   plannedDurationSeconds Int                      @map("planned_duration_seconds")
-  /// Bumped by future mutations (adding a passenger, re-planning), so a later
-  /// milestone can add optimistic concurrency without a migration.
+  /// Bumped by every accepted route-plan change (a passenger joining). A later
+  /// trip milestones can use the same column for optimistic concurrency.
   version                Int                      @default(1)
   createdAt              DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
   acceptedAt             DateTime                 @default(now()) @map("accepted_at") @db.Timestamptz(6)
@@ -728,6 +739,8 @@ enum PoolEventType {
   POOL_CREATED
   MEMBER_ADDED
   ROUTE_PLAN_CREATED
+  JOIN_PLAN_CREATED
+  ROUTE_PLAN_UPDATED
   MEMBER_PICKED_UP
   MEMBER_DROPPED_OFF
   POOL_STATUS_CHANGED

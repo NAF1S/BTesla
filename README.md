@@ -220,10 +220,10 @@ Base URL: `http://localhost:4000/api`
 | `POST` | `/drivers/me/online`       | Go online at a service point (**DRIVER only**) |
 | `POST` | `/drivers/me/offline`      | Go offline (**DRIVER only**) |
 | `PUT`  | `/drivers/me/current-service-point` | Move to another service point (**DRIVER only**) |
-| `GET`  | `/drivers/me/offers`       | The driver's own dispatch offers (**DRIVER only**) |
+| `GET`  | `/drivers/me/offers`       | The driver's own dispatch offers, of both kinds (**DRIVER only**) -- see [Pool-first shared matching](#pool-first-shared-matching) |
 | `GET`  | `/drivers/me/offers/:offerId` | One of the driver's own offers (**DRIVER only**) |
-| `POST` | `/drivers/me/offers/:offerId/accept` | Accept an offer; creates the pool (**DRIVER only**) |
-| `POST` | `/drivers/me/offers/:offerId/reject` | Refuse an offer (**DRIVER only**) |
+| `POST` | `/drivers/me/offers/:offerId/accept` | Accept an offer (no body); starts a pool, or adds the passenger to an existing one (**DRIVER only**) |
+| `POST` | `/drivers/me/offers/:offerId/reject` | Refuse an offer; the request moves on, the pool does not change (**DRIVER only**) |
 | `GET`  | `/drivers/me/pool`         | The pool the driver is committed to (**DRIVER only**) |
 
 The location endpoints are read-only and return DTOs (`server/src/serializers/location.serializer.js`) instead of raw rows, so database column names, routing vertices and audit timestamps never leak into responses. `/location` is only ever about places: there is deliberately no route, distance, ETA, quote or fare endpoint under it, and none should be added. Route estimation lives at `/routes/estimate` instead.
@@ -1102,10 +1102,10 @@ Alongside it, `driver_profiles` records the dispatcher's inputs: `current_servic
 | `POST /api/drivers/me/online` | `{ currentServicePointCode, vehicleId? }` - becomes `AVAILABLE` at that point |
 | `POST /api/drivers/me/offline` | Becomes `OFFLINE`; idempotent |
 | `PUT /api/drivers/me/current-service-point` | `{ currentServicePointCode }` - moves, and refreshes `last_seen_at` |
-| `GET /api/drivers/me/offers` | The driver's own offers (pending by default, `?status=ALL` for history) |
-| `GET /api/drivers/me/offers/:offerId` | One offer, if it is theirs |
-| `POST /api/drivers/me/offers/:offerId/accept` | Accept, and create the pool |
-| `POST /api/drivers/me/offers/:offerId/reject` | `{ reason? }` from `TOO_FAR`, `UNAVAILABLE`, `VEHICLE_ISSUE`, `OTHER` |
+| `GET /api/drivers/me/offers` | The driver's own offers, of both kinds: `INITIAL_RIDE` (start a ride) and `ADD_PASSENGER` (change the pool they are already committed to). Pending by default, `?status=ALL` for history |
+| `GET /api/drivers/me/offers/:offerId` | One offer, if it is theirs -- a join offer includes the proposed stop order, `currentStops` and the capacity it would use |
+| `POST /api/drivers/me/offers/:offerId/accept` | Accept. Takes **no body**: the plan is the one that was offered. Starts a pool, or adds the passenger to the pool in one transaction |
+| `POST /api/drivers/me/offers/:offerId/reject` | `{ reason? }` from `TOO_FAR`, `UNAVAILABLE`, `VEHICLE_ISSUE`, `OTHER`. The pool is left exactly as it was, and the request is passed to the next candidate |
 | `GET /api/drivers/me/pool` | The pool they are committed to, or null |
 
 Going online requires all four of: an active driver profile, an active vehicle **with positive capacity**, an active service point, and a status that may become available. A driver with several usable vehicles must say which one (`vehicleId`), and one is never picked for them; if they went online before, the vehicle they used is reused. A vehicle belonging to somebody else is a `404`.
@@ -1253,8 +1253,8 @@ Application checks alone cannot decide a race, so every rule that two writers co
 | ---- | --------------- |
 | Two drivers accepting one request | the request's row lock plus `pool_members.ride_request_id` UNIQUE |
 | One driver accepting two offers | `driver_profiles` row lock plus `one_active_pool_per_driver` |
-| One driver offered two rides | `one_pending_initial_offer_per_driver` |
-| One request offered twice | `one_pending_initial_offer_per_request` |
+| One driver offered two rides | `one_pending_offer_per_driver` (was `one_pending_initial_offer_per_driver` until shared matching widened it) |
+| One request offered twice | `one_pending_offer_per_request` |
 | Accepting after expiry | the offer is re-read under its lock and the deadline re-checked |
 | Acceptance vs passenger cancellation | the ride request's row lock, taken **first** by both |
 | Acceptance vs vehicle deactivation | the vehicle's row lock, re-read before the pool is written |
@@ -1283,9 +1283,199 @@ The dispatch tests are explicit about the parts that are easy to get quietly wro
 
 ### What is deliberately not here
 
-There is **no** search for an existing pool to join, no `ADD_PASSENGER` offer, no shared matching, no pickup or drop-off insertion, no detour or route re-planning, no shared fare or pooling discount, and no trip operations at all -- no driver arrival, trip start, passenger pickup, drop-off or completion. No live GPS, no WebSockets and no notifications. A pool therefore has exactly one member and two stops, and `version` is never incremented. Each of those is the next milestone, and the schema, the enums and the constraints are already shaped for it: `ride_pool_status` and `pool_stop_status` carry the states, `driver_status.RESERVED` exists, and the active-pool index already covers the trip.
+There is **no** shared fare or pooling discount, and no trip operations at all -- no driver arrival, trip start, passenger pickup, drop-off or completion. No live GPS, no WebSockets and no notifications. Everything about *matching a second passenger into a pool* is in the [next section](#pool-first-shared-matching); what is still missing is what happens once the car is moving, and what sharing is worth in money. The schema, the enums and the constraints are already shaped for the trip: `ride_pool_status` and `pool_stop_status` carry the states, `driver_status.RESERVED` exists, and the active-pool index already covers an in-progress pool.
 
 Two operational notes: the sweep is a command nobody calls yet, so an expired offer is cleaned up when something runs it; and because `dispatch_offers.vehicle_id` and `ride_pools.vehicle_id` are `ON DELETE RESTRICT`, a vehicle that appears in dispatch history cannot be deleted while that history exists.
+
+
+## Pool-first shared matching
+
+A second passenger in a car that is already going that way is cheaper for everybody than a second car -- so every new `WAITING` request now tries to join a ride that is already forming **before** it is offered a driver of its own.
+
+```text
+search compatible existing pools
+  -> one ADD_PASSENGER offer for the best pool
+  -> the pool's driver accepts or refuses
+  -> acceptance adds the passenger to the pool
+  -> a refusal (or an expiry) tries the next compatible pool
+  -> when no pool will take them, fall back to initial driver dispatch
+```
+
+The passenger stays `WAITING` for the whole attempt. Offering is not assigning: a pending offer changes nothing, a refusal changes nothing, and an expired offer changes nothing -- which is what keeps `cancellable` honest until a driver says yes.
+
+```bash
+# The whole flow, over HTTP: the pool is created by an accepted initial offer...
+curl -X POST localhost:3001/api/ride-requests -H 'content-type: application/json' \
+  -H "cookie: $PASSENGER" -d '{"fareQuoteId":"...","idempotencyKey":"..."}'
+# ...and a later compatible request is folded into it. The driver sees this
+# instead of a new ride, and answers it:
+curl localhost:3001/api/drivers/me/offers -H "cookie: $DRIVER"
+curl -X POST localhost:3001/api/drivers/me/offers/$OFFER_ID/accept -H "cookie: $DRIVER"
+```
+
+### The assignment orchestrator
+
+`assignWaitingRequest(rideRequestId)` in `src/services/assignment.service.js` is the one entry point, and it is idempotent by construction:
+
+1. load the request; stop unless it is `WAITING`, unless its search window is still open, unless it has no pool member, and unless it has no pending offer **of either kind** (an initial offer is never created while a pool is considering a join, and vice versa);
+2. while inside `MATCHING_WINDOW_SECONDS` of the request, shortlist and evaluate existing pools, and offer the best plan;
+3. otherwise -- or when no pool can take them -- call the existing `dispatchWaitingRequest` for a driver of their own.
+
+The fallback is the *same* `RideRequest`, still `WAITING`, and no pool is created while an offer is pending. Nothing about a failed join -- a refusal, an expiry, a stale plan -- can move a request to `MATCHED`; only an accepted offer can, in one transaction.
+
+Re-running it (or the sweeper, or three callers at once) produces one offer and one controlled skip, because the offer inserts are guarded by partial unique indexes and a losing insert is reported as a skip rather than as an error.
+
+### Eligible pools: `FORMING` only
+
+A pool whose driver is on the way, arrived or driving is a commitment to the passengers already in it, and a new stop cannot be inserted into a car that is already elsewhere. So `ELIGIBLE_POOL_STATUSES` is exactly `['FORMING']`, and the rest is a database filter rather than a service check, so the candidate list *is* the eligible list:
+
+| The pool | The driver | The request |
+| -------- | ---------- | ----------- |
+| `status = 'FORMING'` | account active, profile `RESERVED` for this pool | not already a member of it |
+| has a planned route geometry | still at a service point, which is where the approach is measured from | this driver has not already refused, or let an offer for it expire |
+| member count `< capacitySnapshot` | vehicle active, capacity > 0 | -- |
+| every stop still `PENDING` | -- | -- |
+| no route change already pending | -- | -- |
+
+### The PostGIS prefilter
+
+Stage one is one query. The new pickup -- and optionally the new destination -- must be near the pool's *planned route*, not near its driver:
+
+```sql
+ST_DWithin(pickup.location, rp.planned_route_geometry::geography, $3::float8)
+```
+
+`ride_pools_planned_route_geometry_idx` (GiST) makes it a spatial lookup, and two managed indexes keep the rest of the filter cheap: `ride_pools_forming_idx` and the partial `one_pending_route_change_offer_per_pool`. The radius is configuration (`MATCHING_RADIUS_METERS`, default **1500 m**), and so is the candidate limit (`MATCHING_MAX_CANDIDATE_POOLS`, default **10**; nearest-first, with `created_at` and `id` breaking ties so the list is reproducible).
+
+Proximity is a **shortlist and nothing more**. A pool metres from the pickup is still refused if no insertion of the new stops can satisfy the waiting, duration and detour rules -- the tests assert both halves of that.
+
+### Stop insertion
+
+For each shortlisted pool, every legal way of putting the new pickup and drop-off into the existing stop order is routed, measured and judged:
+
+1. load the pool's stops in sequence order;
+2. every ordered pair of positions `(pickup, dropoff)` with `pickup < dropoff` -- `n + 2` positions choose 2, so a one-member pool gives six plans and a three-member pool gives fifteen. The new passenger is always collected before being delivered, and the existing stops keep their relative order;
+3. route the driver's approach to the first stop, then every consecutive pair; a pair the router cannot connect makes that plan infeasible rather than a failure;
+4. measure: total and added distance and duration, planned arrival time at every stop, the new passenger's wait, and each existing passenger's own ride;
+5. simulate occupancy segment by segment;
+6. refuse the plan by name (`OCCUPANCY`, `PICKUP_WAIT`, `ADDED_DURATION`, `DETOUR`, `DETOUR_RATIO`, `UNROUTABLE`), score the survivors, and keep the best one for that pool;
+7. keep the best plan across all pools.
+
+The router is memoised per pool evaluation, which is what makes a quadratic number of insertion positions affordable: a four-stop pool has fifteen plans but only a handful of distinct place-to-place pairs.
+
+**Why the pool's own plan is measured again.** The plan a proposal is compared against is the pool's *current* stop order, routed at the same instant the proposal is routed. Using the pool's stored duration instead would compare two departure instants: a pool priced at 08:41 and re-measured at noon would make every later join look like it *saved* time. `addedDistanceMeters` and `addedDurationSeconds` therefore mean "what this insertion costs on top of what the car was already going to do", and the score never rewards a negative.
+
+**Why arrivals are re-anchored instead of re-routed.** A proposal stores its legs as numbers, so acceptance can move the whole plan to a later instant by adding the same offset to every arrival -- no pgRouting call inside the acceptance transaction, and no re-planning that a driver did not agree to.
+
+### Capacity, waiting and detour rules
+
+Capacity is checked on **every segment**, not by counting members: `PICKUP` is `+1`, `DROPOFF` is `-1`, and a plan is refused if occupancy goes negative, exceeds `capacitySnapshot` at any point, delivers somebody who was never collected, collects or delivers the same passenger twice, or does not end at zero. That is what makes "a drop-off releases a seat" true rather than assumed.
+
+Every limit is configuration, and each one that fires is recorded on the request's timeline by name:
+
+| Limit | Default | Measured from |
+| ----- | ------- | ------------- |
+| `MATCHING_WINDOW_SECONDS` | 300 s | the request's `requestedAt` -- after this, no existing pool is even considered |
+| `MATCHING_MAX_PICKUP_WAIT_SECONDS` | 480 s | the request's `requestedAt`, so it includes the matching delay and the approach |
+| `MATCHING_MAX_ADDED_DURATION_SECONDS` | 600 s | the pool's current plan, routed at the same instant |
+| `MATCHING_MAX_DETOUR_SECONDS` | 600 s | each existing passenger's `acceptedDurationSeconds` -- the promise their own quote froze |
+| `MATCHING_MAX_DETOUR_RATIO` | 1.25 | the same baseline, as a multiple |
+
+The clock is injectable and `requestedAt` is stored, so every number above is deterministic: the tests assert plan metrics with exact arithmetic on a fixture whose distances are literal.
+
+### Scoring and tie-breaking
+
+```text
+score = addedPoolDurationSeconds
+      + newPassengerPickupWaitSeconds  x MATCHING_PICKUP_WAIT_WEIGHT   (default 1)
+      + worstExistingPassengerDetourSeconds x MATCHING_DETOUR_WEIGHT   (default 1)
+```
+
+All three terms are seconds, so with the default weights the score reads as *"seconds of harm this insertion does"* and the weights are a way of saying whose seconds matter more -- not arbitrary multipliers. The components are stored separately on the offer so a decision can be explained after the fact.
+
+Plans are ordered by: lowest score, lowest added duration, shortest wait, **oldest pool**, stable pool id, stable stop-order signature. The last two are what make matching reproducible: two genuinely equivalent pools are ordered by an id rather than by whichever rows a query happened to return, so the same situation always produces the same offer. Nothing is random, and nothing depends on row order.
+
+### The `ADD_PASSENGER` offer
+
+| Column | Meaning |
+| ------ | ------- |
+| `offer_type` | `ADD_PASSENGER`. A `CHECK` requires `ride_pool_id` and a positive `pool_version` with it |
+| `ride_pool_id` | the pool being changed |
+| `pool_version` | the version the plan was built from -- the promise acceptance later checks |
+| `proposal_snapshot` | the whole plan: stops in order with ids and planned arrivals, legs, approach, totals, added distance and duration, the new passenger's wait and ETA, per-existing-passenger detour seconds and ratio, peak occupancy and the occupancy timeline, the score and its components, the limits it was judged by, the route geometry and the rule version |
+
+The row is **immutable** after it is written (`enforce_dispatch_offer_update`): driver, request, vehicle, approach, score, proposal and pool version cannot change, and only the status, the response and the timestamps can. A driver client can read the proposal and cannot submit one -- `POST /drivers/me/offers/:id/accept` takes no body at all, and any field a client sends is a `400`.
+
+One request may have at most one pending offer of either kind, one pool at most one pending route change (`one_pending_route_change_offer_per_pool`), and one driver at most one pending offer (`one_pending_offer_per_driver`, which supersedes the initial-offer-only index of the previous milestone). A pool's driver stays `RESERVED` while holding a join offer: they were committed to the pool before it and they still are.
+
+`GET /api/drivers/me/offers` returns both kinds, and a join offer carries what a driver needs to decide: the new passenger's pickup and destination, the vehicle capacity with the peak occupancy this plan would reach, the added distance and duration, the wait and the driver's ETA to the new pickup, the worst detour an existing passenger would take, and `currentStops` beside `proposedStops` (with `isNew` marking the two that would be added). No fare, and no identity beyond an id a driver never sees elsewhere.
+
+### Acceptance
+
+One transaction, in this order:
+
+1. lock the request, then the offer -- the same order every other path uses;
+2. refuse if the offer is not this driver's, is not `PENDING`, or has expired (expiring it and reporting `409`);
+3. confirm the request is still `WAITING` and has no member;
+4. lock the pool: it must be the driver's, still `FORMING`, and **still the version the offer named** -- otherwise the offer is `CANCELLED` with a `stale_pool_version` event and nothing is written;
+5. confirm the driver is still `RESERVED` for it and the member count is still below capacity -- recomputed here, never trusted from the offer;
+6. lock the stops and confirm every one is still `PENDING`;
+7. confirm the stored plan is still *this* pool's plan: same rule version, same pool, and the existing stops in the snapshot are exactly the stops that exist now, in order;
+8. re-simulate occupancy on the stored plan, re-anchor the arrivals to now, and re-validate the wait and the detour limits against the acceptance clock;
+9. resequence the stops safely, insert the member (`ASSIGNED`) and its two stops, and update the pool's route, distances and **version**;
+10. move the request `WAITING -> MATCHED`, mark the offer `ACCEPTED`, and append `PASSENGER_MATCHED`, `POOL_JOIN_ACCEPTED`, `MEMBER_ADDED` and `ROUTE_PLAN_UPDATED`.
+
+**Resequencing is offset-based.** `UNIQUE (ride_pool_id, sequence)` is checked per statement, so numbered stops cannot be shifted one at a time -- an intermediate state would collide. Existing sequences are moved by `+1000` first, then the new stops are inserted and every stop is given its final number. The existing rows keep their ids, so their arrival history stays attached.
+
+The driver remains `RESERVED`, the existing passengers' requests and stops are untouched, and **no fare is recalculated**: each passenger keeps the solo fare their own quote froze. Sharing is not priced in this milestone.
+
+### Pool versioning and the last seat
+
+`ride_pools.version` is optimistic concurrency for plans. A proposal records the version it was built from, every accepted plan change increments it, a refusal or an expiry leaves it alone, and a conditional update (`WHERE id = $1 AND version = $2`) is what actually moves it -- so two writers cannot both apply a plan to the same version.
+
+The last seat is protected by refusing the race, not by detecting it:
+
+| Race | What settles it |
+| ---- | --------------- |
+| Two requests for one pool's last seat | `one_pending_route_change_offer_per_pool`: only one can hold the offer, and the loser is told to wait rather than being handed a seat that is about to be taken |
+| One join offer accepted twice | the request's row lock, then the offer's, then a conditional status update |
+| A stale plan accepted | the pool's version, compared under the pool's row lock |
+| Capacity reduced or a member added since the offer | the member count is recomputed inside the transaction |
+| Acceptance vs cancellation | the request's row lock, taken first by both |
+| Acceptance vs expiry | the offer is re-read under its lock and the deadline re-checked |
+| Two pools, one request | `one_pending_offer_per_request` |
+| Stop sequences during resequencing | the offset pass, plus `UNIQUE (ride_pool_id, sequence)` |
+
+The concurrency tests assert an invariant rather than a winner: after a cancellation racing an acceptance the request is either `MATCHED` with a two-member pool or `CANCELLED` with a one-member pool, and after an expiry racing an acceptance the offer is either `ACCEPTED` or `EXPIRED` -- never both, and never a pool that grew without a match.
+
+### Refusal, expiry and fallback
+
+A refused join changes nothing: no member, no stops, no version, no route. The offer goes to `REJECTED` with its reason, a `POOL_JOIN_REJECTED` event is appended, and the request is re-assigned -- so the *next* compatible pool is tried, and the pool that refused is excluded for that request (and that driver) from then on. The same applies to expiry, which is the existing sweeper: mark it `EXPIRED`, leave the pool alone, try the next candidate.
+
+When nothing is left, the fallback is the dispatcher that was already there: the same request, still `WAITING`, one `INITIAL_RIDE` offer to the best eligible driver, no pool while the offer is pending, and `EXPIRED` only when `searchExpiresAt` passes. The request's timeline records why each stage happened -- `POOL_CANDIDATE_EVALUATED` with the candidates and their rejection reasons, then `INITIAL_DISPATCH_FALLBACK` with `no_candidate_pools`, `no_feasible_plan`, `matching_window_closed` or the stale-offer reason.
+
+### Events
+
+Ride timeline: `POOL_CANDIDATE_EVALUATED`, `POOL_JOIN_OFFERED`, `POOL_JOIN_REJECTED`, `POOL_JOIN_ACCEPTED`, `INITIAL_DISPATCH_FALLBACK` -- and `PASSENGER_MATCHED`, the existing match event, which is reused rather than duplicated so a matched request has exactly one "this is the ride you got" event whichever way it was matched.
+
+Pool timeline: `JOIN_PLAN_CREATED` when a join is proposed, then `MEMBER_ADDED` and `ROUTE_PLAN_UPDATED` when one is accepted. Metadata carries the rule version, the score, added distance and duration, the wait and detour metrics, occupancy before and after, the pool version before and after, and the accepted stop order -- and never a passenger's name or a price.
+
+### Commands
+
+```bash
+npm run db:migrate                                 # applies 10-pool-matching.sql (idempotent)
+npm run db:seed                                    # the demo cast
+npm test                                            # unit + integration
+npm run test:unit --workspace server                # the matching rules, with no database
+npm run test:integration --workspace server         # candidates, insertion, offers, acceptance, races
+npm run dispatch:sweep --workspace server           # also tries the next pool after an expiry
+```
+
+### What is deliberately not here
+
+There is **no shared fare or pooling discount**, no fare redistribution, and no trip operations: no driver arrival, trip start, passenger pickup, drop-off or completion, and no matching into a pool that has started. No live GPS, no WebSockets, no notifications, no payments. Passengers keep the solo fares their own quotes froze, and `match` never reads one.
+
+Two assumptions worth stating. The occupancy simulation is plan-level, so it proves a *plan* is legal, not that a car was never overfull; the trip milestones are what turn stops into facts. And a pool's stored duration is priced at its own creation instant while proposals are measured at match time, so `addedDurationSeconds` can be negative after a traffic-profile change -- the score clamps it to zero rather than letting a join be rewarded for a clock change, and the limits are checked against the same clamped numbers.
 
 
 ## Tests
@@ -1298,15 +1488,18 @@ npm run test:integration --workspace server
 
 Tests use Node's built-in runner (`node --test`) — no extra dependencies. The integration suites run against the real PostgreSQL database from `DATABASE_URL`, apply `server/db/*.sql` and the seed themselves, and clean up after themselves; the database must be reachable (`npm run db:up`). Constraint tests run inside rolled-back transactions.
 
-Coverage highlights: the PostGIS extension and the real spatial column types; the GiST spatial indexes; that coordinates are stored longitude-first; `ST_DWithin` proximity answering in metres with a distant point correctly excluded; the seed totals, per-zone point counts, correct zone membership and idempotency; the coordinate bounds; and -- for the graph -- no isolated vertex, one weakly connected component, every zone linked to another, edge endpoints aligned with their vertices, edge distance matching `ST_Length`, and the direction / duration / fare-weight invariants. It also asserts that the superseded `/api/transport/*` endpoints are gone, and that `/api/location/*` still exposes no routing of its own. Routing, pricing, ride requests and dispatch are covered by their own suites -- see [Routing](#routing), [Fare quotes](#fare-quotes), [Ride requests](#ride-requests) and [Driver dispatch and pools](#driver-dispatch-and-pools) for the lists.
+Coverage highlights: the PostGIS extension and the real spatial column types; the GiST spatial indexes; that coordinates are stored longitude-first; `ST_DWithin` proximity answering in metres with a distant point correctly excluded; the seed totals, per-zone point counts, correct zone membership and idempotency; the coordinate bounds; and -- for the graph -- no isolated vertex, one weakly connected component, every zone linked to another, edge endpoints aligned with their vertices, edge distance matching `ST_Length`, and the direction / duration / fare-weight invariants. It also asserts that the superseded `/api/transport/*` endpoints are gone, and that `/api/location/*` still exposes no routing of its own. Routing, pricing, ride requests, dispatch and shared matching are covered by their own suites -- see [Routing](#routing), [Fare quotes](#fare-quotes), [Ride requests](#ride-requests), [Driver dispatch and pools](#driver-dispatch-and-pools) and [Pool-first shared matching](#pool-first-shared-matching) for the lists.
 
-Each milestone's suite also pins the boundary of the next one: the fare suite asserts which tables exist and that nothing shared, seated or paid does, and the dispatch suite asserts that no pool search, no `ADD_PASSENGER` offer and no trip operation is reachable.
+Each milestone's suite also pins the boundary of the next one: the fare suite asserts which tables exist and that nothing shared, seated or paid does, and the matching suite asserts that no shared fare and no trip operation is reachable, and that a pool that has started is never matched into.
+
+The matching suites are split the way the rules are. `test/unit/matching.rules.test.js` covers insertion positions, stop orders, occupancy, arrival arithmetic, the limits, scoring and the full tie-break, with a fixture whose distances are literal metres so the numbers can be checked by hand. `test/integration/matching.integration.test.js` covers the candidate query and its exclusions, the PostGIS shortlist and what proximity does *not* buy, the offer lifecycle over HTTP, the acceptance transaction, and the races -- including a pool's last seat contended by two requests at once.
 
 ## Next steps
 
 - Decide how schema changes are reviewed now that Prisma is in place: keep the idempotent `server/db/*.sql` files as the source of truth (the current setup, and what preserves the `CHECK` constraints, the partial unique index and the GiST indexes Prisma cannot model), or move fully to Prisma Migrate and express those another way.
-- Build the next milestone on top of pools: **shared matching**. A second waiting request joins an existing pool as a new member with its own two stops, and the plan is re-ordered with the detour that costs least. `ADD_PASSENGER` already exists as an offer type, `ride_pool_status` and `pool_stop_status` already carry the states, `version` is there for optimistic concurrency, and `one_active_pool_per_driver` already covers an in-progress trip -- so that milestone adds operations rather than reworking the schema.
-- Add the trip: driver arrival, trip start, passenger pickup and drop-off, trip completion. The transitions (`MATCHED -> IN_PROGRESS -> COMPLETED`, `ASSIGNED -> PICKED_UP -> DROPPED_OFF`) and the events are defined and enforced already; what is missing is the endpoints and the rules about who may call them.
+- Build the trip on top of matched pools: driver arrival, trip start, passenger pickup and drop-off, trip completion. The transitions (`MATCHED -> IN_PROGRESS -> COMPLETED`, `ASSIGNED -> PICKED_UP -> DROPPED_OFF`) and the events are defined and enforced already, and a pool whose stops are collected can move out of `FORMING`; what is missing is the endpoints, the rules about who may call them, and the matching cut-off that a started pool implies. The eligibility rule is already in one place (`ELIGIBLE_POOL_STATUSES`).
+- Price sharing. Every passenger currently keeps the solo fare their own quote froze, and `match` never reads a price. Shared fares need a policy (how the saving is split, what happens when somebody is delayed, what a cancellation in a pool costs) before they need code, and a pool is the natural scope for the ledger.
+- Decide what happens to a pool when one of its members cancels after being matched. Cancelling a matched request is refused today, which is the honest answer while a pool has no trip, but it cannot stay that way once a driver is driving towards somebody.
 - Run the sweeps on a schedule. `npm run ride-requests:expire --workspace server` and `npm run dispatch:sweep --workspace server` are the operations; nothing calls them yet, so requests and offers are cleaned up when someone runs them.
 - Consider time-dependent profiles *within* a journey (the current router picks one profile from the departure instant and applies it to the whole route), which needs per-second costs and a time-dependent router.
 - Authenticate the client: send the auth cookie from the Next.js app, then tighten `GET /api/users`, which is still public so the demo page keeps rendering. `POST /api/routes/estimate` already requires a session, so the client needs to carry the cookie before it can call it.

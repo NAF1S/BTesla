@@ -194,8 +194,10 @@ describe('driver availability', () => {
 });
 
 describe('offers', () => {
-  it('has exactly the two offer types, and implements only the initial one', () => {
+  it('has exactly the two offer types, and dispatch creates only the initial one', () => {
     assert.deepStrictEqual(Object.values(OFFER_TYPE).sort(), ['ADD_PASSENGER', 'INITIAL_RIDE']);
+    // ADD_PASSENGER is real, and it is not dispatch's: matching.service.js proposes
+    // one for a pool that already exists.
     assert.strictEqual(IMPLEMENTED_OFFER_TYPE, 'INITIAL_RIDE');
   });
 

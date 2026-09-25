@@ -1,6 +1,6 @@
 import { env } from '../config/env.js';
 import { currentUser } from '../middleware/auth.js';
-import * as dispatch from '../services/dispatch.service.js';
+import * as assignment from '../services/assignment.service.js';
 import * as rides from '../services/ride-request.service.js';
 import * as dto from '../serializers/ride-request.serializer.js';
 import { CANCELLATION_REASONS, DEFAULT_CANCELLATION_REASON, RIDE_REQUEST_STATUSES } from '../services/ride.status.js';
@@ -60,17 +60,21 @@ export const createRideRequest = async (req, res) => {
     idempotencyKey,
   });
 
-  // Dispatch runs *after* the creation transaction has committed, so the
+  // Assignment runs *after* the creation transaction has committed, so the
   // passenger's response never waits on a routing search, and nothing that
   // happens here can roll the request back: a request with no offer is still a
   // valid request, and `npm run dispatch:sweep` -- or the next driver's refusal --
-  // will offer it. It is awaited rather than fired and forgotten so the caller
+  // will assign it. It is awaited rather than fired and forgotten so the caller
   // learns whether the ride was offered, and so a test does not have to race it.
+  //
+  // This is the orchestrator rather than the dispatcher: a new request tries to
+  // join a pool that is already forming first, and only falls back to finding a
+  // driver of its own.
   if (!replay) {
     try {
-      await dispatch.dispatchWaitingRequest({ rideRequestId: request.id });
+      await assignment.assignWaitingRequest({ rideRequestId: request.id });
     } catch (err) {
-      console.error(`[dispatch] could not offer ride request ${request.id}:`, err.message);
+      console.error(`[assignment] could not assign ride request ${request.id}:`, err.message);
     }
   }
 

@@ -7,12 +7,28 @@ import {
   ACTIVE_POOL_STATUSES,
   DEFAULT_REJECTION_REASON,
   DRIVER_AVAILABILITY,
-  IMPLEMENTED_OFFER_TYPE,
   isOfferExpired,
   OFFER_STATUS,
+  OFFER_TYPE,
+  POOL_STATUS,
+  POOL_STOP_STATUS,
   REJECTION_REASONS,
 } from './dispatch.rules.js';
-import { createPoolForAcceptedOffer, findActivePoolForDriver, loadPoolForDto } from './pool.service.js';
+import {
+  MATCHING_RULE_VERSION,
+  PLAN_REJECTION,
+  simulateOccupancy,
+  STOP_TYPE,
+  validatePlan,
+} from './matching.rules.js';
+import {
+  addMemberToPool,
+  createPoolForAcceptedOffer,
+  findActivePoolForDriver,
+  loadPoolForDto,
+  lockPool,
+  lockPoolStops,
+} from './pool.service.js';
 import { appendRideEvent, applyRideRequestTransition, lockRideRequest } from './ride-request.service.js';
 import { RIDE_ACTOR_TYPE, RIDE_EVENT_TYPE, RIDE_REQUEST_STATUS } from './ride.status.js';
 
@@ -60,20 +76,31 @@ const lockVehicle = async (tx, vehicleId) => {
 /**
  * The offer shape a driver may see.
  *
- * `proposalSnapshot` was written at offer time and holds no passenger identity,
- * so it is safe to return as-is. The passenger's *display name* is looked up live
- * rather than stored: a driver needs something to greet the rider with, and
- * keeping it out of the snapshot means a renamed or deleted account does not
- * leave a stale name in dispatch history.
+ * Two kinds of offer, two shapes, and only ever one of them:
  *
- * Never exposed: the passenger's contact details, the candidate score, the
- * fingerprint or anything about another driver.
+ *   * an `INITIAL_RIDE` offer proposes a ride that does not exist yet, so it
+ *     shows the two places, the approach and the vehicle;
+ *   * an `ADD_PASSENGER` offer proposes changing a pool the driver is already
+ *     committed to, so it shows the whole plan: the stop order as it is and as it
+ *     would become, what the extra driving costs, how long the new passenger
+ *     waits, and how much longer the passengers already aboard would ride.
+ *
+ * `proposalSnapshot` was written at offer time and holds no passenger identity
+ * beyond ids a driver never sees, so it is safe to return -- the passenger's
+ * *display name* is looked up live rather than stored, so a renamed account does
+ * not leave a stale name in dispatch history.
+ *
+ * Never exposed, for either kind: contact details, the candidate score, the
+ * fingerprint, another passenger's fare, or anything about another driver. The
+ * proposal is read-only by construction -- acceptance takes an offer id and reads
+ * the stored plan, so a client has nothing to submit and nothing to edit.
  */
-export const toOfferDto = (offer, { now = new Date() } = {}) => {
+export const toOfferDto = (offer, { now = new Date(), pointCodes } = {}) => {
   const snapshot = offer.proposalSnapshot ?? {};
   const passengerName = offer.rideRequest?.passengerProfile?.user?.name ?? null;
+  const displayName = passengerName ? { displayName: passengerName.split(/\s+/)[0] } : null;
 
-  return {
+  const shared = {
     offerId: offer.id,
     status: offer.status,
     offerType: offer.offerType,
@@ -83,18 +110,67 @@ export const toOfferDto = (offer, { now = new Date() } = {}) => {
     respondedAt: offer.respondedAt ? new Date(offer.respondedAt).toISOString() : null,
     rejectionReason: offer.rejectionReason ?? null,
     rideRequestId: offer.rideRequestId,
-    pickup: snapshot.pickup ?? null,
-    destination: snapshot.destination ?? null,
-    passengerRoute: snapshot.passengerRoute ?? null,
-    approach: snapshot.approach
-      ? {
-          distanceMeters: snapshot.approach.distanceMeters,
-          durationSeconds: snapshot.approach.durationSeconds,
-        }
-      : null,
-    vehicle: snapshot.vehicle ?? null,
-    passenger: passengerName ? { displayName: passengerName.split(/\s+/)[0] } : null,
+    passenger: displayName,
     ridePoolId: offer.ridePoolId ?? null,
+  };
+
+  if (offer.offerType !== OFFER_TYPE.ADD_PASSENGER) {
+    return {
+      ...shared,
+      pickup: snapshot.pickup ?? null,
+      destination: snapshot.destination ?? null,
+      passengerRoute: snapshot.passengerRoute ?? null,
+      approach: snapshot.approach
+        ? {
+            distanceMeters: snapshot.approach.distanceMeters,
+            durationSeconds: snapshot.approach.durationSeconds,
+          }
+        : null,
+      vehicle: snapshot.vehicle ?? null,
+    };
+  }
+
+  const code = (pointId) => {
+    const found = pointCodes?.get(pointId);
+    return found ? { code: found.code, name: found.name } : null;
+  };
+  const stops = (list, { withNew }) =>
+    (list ?? []).map((stop) => ({
+      sequence: stop.sequence,
+      stopType: stop.stopType,
+      servicePoint: code(stop.servicePointId),
+      ...(withNew ? { isNew: Boolean(stop.isNew) } : {}),
+    }));
+
+  return {
+    ...shared,
+    poolVersion: offer.poolVersion ?? null,
+    // The new passenger's own two places, taken from the request rather than from
+    // the proposal, so a client can render the offer without parsing the plan.
+    pickup: code(offer.rideRequest?.pickupServicePointId) ?? null,
+    destination: code(offer.rideRequest?.dropoffServicePointId) ?? null,
+    vehicle: offer.ridePool?.vehicle
+      ? { name: offer.ridePool.vehicle.name, seatCapacity: offer.ridePool.vehicle.seatCapacity }
+      : null,
+    capacity: {
+      seats: offer.ridePool?.capacitySnapshot ?? null,
+      passengers: offer.ridePool?.members?.length ?? (snapshot.existingStops?.length ?? 0) / 2,
+      peakOccupancy: snapshot.peakOccupancy ?? null,
+    },
+    added: {
+      distanceMeters: snapshot.addedDistanceMeters ?? null,
+      durationSeconds: snapshot.addedDurationSeconds ?? null,
+    },
+    // The new passenger's wait: how long they will have waited in total by the
+    // time they are collected, and how long the driver takes to reach them.
+    pickupWaitSeconds: snapshot.newPassengerPickupWaitSeconds ?? null,
+    pickupEtaSeconds: snapshot.newPassengerDriverEtaSeconds ?? null,
+    plannedPickupArrivalAt: snapshot.newPassengerPickupArrivalAt ?? null,
+    maxExistingPassengerDetourSeconds: snapshot.worstExistingPassengerDetourSeconds ?? null,
+    // "What it is now" and "what it would become", which is the decision the
+    // driver is being asked to make.
+    currentStops: stops(snapshot.existingStops, { withNew: false }),
+    proposedStops: stops(snapshot.stops, { withNew: true }),
   };
 };
 
@@ -107,6 +183,7 @@ const OFFER_SELECT = {
   driverProfileId: true,
   vehicleId: true,
   ridePoolId: true,
+  poolVersion: true,
   approachDistanceMeters: true,
   approachDurationSeconds: true,
   score: true,
@@ -119,9 +196,55 @@ const OFFER_SELECT = {
     select: {
       id: true,
       status: true,
+      pickupServicePointId: true,
+      dropoffServicePointId: true,
       passengerProfile: { select: { user: { select: { name: true } } } },
     },
   },
+  // Only read for an ADD_PASSENGER offer, so the driver can see the pool they
+  // would be changing: its capacity and how full it currently is.
+  ridePool: {
+    select: {
+      id: true,
+      status: true,
+      version: true,
+      capacitySnapshot: true,
+      vehicle: { select: { name: true, seatCapacity: true } },
+      members: { select: { id: true } },
+    },
+  },
+};
+
+/**
+ * The service point codes a set of offers mentions.
+ *
+ * A join proposal is stored as point ids (they are what the plan is built from),
+ * so rendering it needs one lookup for the handful of places involved -- rather
+ * than denormalising names into an audit snapshot that would then be able to
+ * disagree with the table it came from.
+ */
+const loadPointCodes = async (offers) => {
+  const pointIds = new Set();
+
+  for (const offer of offers) {
+    const snapshot = offer.proposalSnapshot ?? {};
+
+    for (const stop of snapshot.stops ?? []) pointIds.add(stop.servicePointId);
+    for (const stop of snapshot.existingStops ?? []) pointIds.add(stop.servicePointId);
+
+    if (offer.rideRequest?.pickupServicePointId) pointIds.add(offer.rideRequest.pickupServicePointId);
+    if (offer.rideRequest?.dropoffServicePointId) pointIds.add(offer.rideRequest.dropoffServicePointId);
+  }
+
+  const ids = [...pointIds].filter(Boolean);
+  if (ids.length === 0) return new Map();
+
+  const points = await prisma.servicePoint.findMany({
+    where: { id: { in: ids } },
+    select: { id: true, code: true, name: true },
+  });
+
+  return new Map(points.map((point) => [point.id, point]));
 };
 
 /**
@@ -142,7 +265,6 @@ export const listOffersForDriver = async ({
 
   const where = {
     driverProfileId,
-    offerType: IMPLEMENTED_OFFER_TYPE,
     ...(status === 'ALL' ? {} : { status }),
   };
 
@@ -157,7 +279,9 @@ export const listOffersForDriver = async ({
   // still there, which is what keeps them eligible for the next one.
   await touchLastSeen(driverProfileId, now);
 
-  return offers.map((offer) => toOfferDto(offer, { now }));
+  const pointCodes = await loadPointCodes(offers);
+
+  return offers.map((offer) => toOfferDto(offer, { now, pointCodes }));
 };
 
 /** One of the driver's own offers. Somebody else's is a 404, not a 403. */
@@ -171,7 +295,9 @@ export const findOfferForDriver = async ({ driver, offerId, now = new Date() }) 
 
   if (!offer || offer.driverProfileId !== driverProfileId) throw offerNotFound(offerId);
 
-  return toOfferDto(offer, { now });
+  const pointCodes = await loadPointCodes([offer]);
+
+  return toOfferDto(offer, { now, pointCodes });
 };
 
 /**
@@ -201,10 +327,19 @@ export const rejectOffer = async ({
   // Read first, without a lock, only to learn which request to lock first.
   const located = await prisma.dispatchOffer.findUnique({
     where: { id: offerId },
-    select: { id: true, driverProfileId: true, rideRequestId: true },
+    select: {
+      id: true,
+      driverProfileId: true,
+      rideRequestId: true,
+      offerType: true,
+      ridePoolId: true,
+      poolVersion: true,
+    },
   });
 
   if (!located || located.driverProfileId !== driverProfileId) throw offerNotFound(offerId);
+
+  const isJoinOffer = located.offerType === OFFER_TYPE.ADD_PASSENGER;
 
   const outcome = await inTransaction(async (tx) => {
     // Request first, then offer: the one lock order the whole milestone uses.
@@ -218,6 +353,9 @@ export const rejectOffer = async ({
         expiresAt: true,
         driverProfileId: true,
         rideRequestId: true,
+        offerType: true,
+        ridePoolId: true,
+        poolVersion: true,
       },
     });
 
@@ -246,13 +384,15 @@ export const rejectOffer = async ({
           metadata: {
             offerId: offer.id,
             driverProfileId: offer.driverProfileId,
+            offerType: offer.offerType,
+            ridePoolId: offer.ridePoolId,
             expiresAt: offer.expiresAt.toISOString(),
           },
           now,
         });
       }
 
-      return { expired: true, rideRequestId: offer.rideRequestId };
+      return { expired: true, rideRequestId: offer.rideRequestId, offerType: offer.offerType };
     }
 
     await tx.dispatchOffer.update({
@@ -267,16 +407,37 @@ export const rejectOffer = async ({
     if (request) {
       await appendRideEvent(tx, {
         rideRequestId: offer.rideRequestId,
-        eventType: RIDE_EVENT_TYPE.DRIVER_REJECTED,
+        // A refused join and a refused ride are different facts: the first says
+        // "not in my car", the second "not my fare". The timeline keeps them
+        // apart so the next attempt can be explained.
+        eventType: isJoinOffer
+          ? RIDE_EVENT_TYPE.POOL_JOIN_REJECTED
+          : RIDE_EVENT_TYPE.DRIVER_REJECTED,
         actorType: RIDE_ACTOR_TYPE.SYSTEM,
         previousStatus: request.status,
         newStatus: request.status,
-        metadata: { offerId: offer.id, driverProfileId: offer.driverProfileId, reason },
+        metadata: {
+          offerId: offer.id,
+          driverProfileId: offer.driverProfileId,
+          reason: normalizedReason,
+          ...(isJoinOffer
+            ? {
+                ridePoolId: offer.ridePoolId,
+                poolVersion: offer.poolVersion,
+                ruleVersion: MATCHING_RULE_VERSION,
+              }
+            : {}),
+        },
         now,
       });
     }
 
-    return { expired: false, rideRequestId: offer.rideRequestId };
+    return {
+      expired: false,
+      rideRequestId: offer.rideRequestId,
+      offerType: offer.offerType,
+      ridePoolId: offer.ridePoolId,
+    };
   });
 
   await touchLastSeen(driverProfileId, now);
@@ -288,8 +449,10 @@ export const rejectOffer = async ({
   return {
     rejected: true,
     offerId,
-    reason: normalizedReason,
+    offerType: outcome.offerType,
     rideRequestId: outcome.rideRequestId,
+    ridePoolId: outcome.ridePoolId ?? null,
+    reason: normalizedReason,
   };
 };
 
@@ -313,14 +476,49 @@ export const acceptOffer = async ({ driver, offerId, now = new Date() }) => {
 
   const located = await prisma.dispatchOffer.findUnique({
     where: { id: offerId },
-    select: { id: true, driverProfileId: true, rideRequestId: true },
+    select: { id: true, driverProfileId: true, rideRequestId: true, offerType: true },
   });
 
   if (!located || located.driverProfileId !== driverProfileId) throw offerNotFound(offerId);
 
+  // Two kinds of offer, two very different transactions: one starts a pool, the
+  // other changes one. Both lock the request first, so they cannot deadlock
+  // against each other or against a passenger's cancellation.
+  if (located.offerType === OFFER_TYPE.ADD_PASSENGER) {
+    const outcome = await acceptAddPassengerOffer({ driver, driverProfileId, offerId, now });
+
+    if (outcome.expired) {
+      throw new ApiError(409, 'This offer has expired and can no longer be accepted');
+    }
+
+    const pool = await loadPoolForDto(outcome.ridePoolId);
+
+    return { pool, rideRequestId: outcome.rideRequestId, joined: true };
+  }
+
+  const outcome = await acceptInitialRideOffer({
+    driver,
+    driverProfileId,
+    offerId,
+    rideRequestId: located.rideRequestId,
+    now,
+  });
+
+  return { ...outcome, joined: false };
+};
+
+/**
+ * Accepts an initial offer: locks the request, then the offer, then the driver,
+ * the vehicle and the pool slot, and writes the pool, its member and its two
+ * stops in one transaction.
+ *
+ * Every check is re-read under a lock, because the offer was made from state that
+ * does not have to still be true.
+ */
+const acceptInitialRideOffer = async ({ driver, driverProfileId, offerId, rideRequestId, now }) => {
   const outcome = await inTransaction(async (tx) => {
     // 1-2. Lock the ride request, then the offer.
-    const request = await lockRideRequest(tx, located.rideRequestId);
+    const request = await lockRideRequest(tx, rideRequestId);
 
     const offer = await tx.dispatchOffer.findUnique({
       where: { id: offerId },
@@ -530,6 +728,331 @@ export const acceptOffer = async ({ driver, offerId, now = new Date() }) => {
   const pool = await loadPoolForDto(outcome.ridePoolId);
 
   return { pool, rideRequestId: outcome.rideRequestId };
+};
+
+/**
+ * Accepts an `ADD_PASSENGER` offer: inserts the passenger into a pool that is
+ * already forming.
+ *
+ * This is the milestone's largest transaction, and the checks are the whole point
+ * of it. Everything the plan was built from is re-read under a lock, because the
+ * plan was measured outside any transaction and *nothing* it assumed has to still
+ * be true:
+ *
+ *   1. the request is still `WAITING` and still unclaimed;
+ *   2. the pool is still `FORMING`, still this driver's, and still on the version
+ *      the plan was planned against;
+ *   3. the driver is still the one assigned to it;
+ *   4. capacity is recomputed from the members that exist now -- never trusted
+ *      from the offer, which is how two passengers could otherwise take the last
+ *      seat;
+ *   5. every stop is still `PENDING`, and the stops the plan described are
+ *      exactly the stops that exist, in the same order;
+ *   6. the plan still fits the vehicle, segment by segment;
+ *   7. the wait and detour limits still pass, with the wait re-measured against
+ *      the clock as it is *now* -- a plan can become unkind simply by being
+ *      accepted late.
+ *
+ * Nothing is re-routed: the stored proposal carries the leg durations, so the
+ * arrivals are re-anchored to this instant arithmetically. Re-routing every leg
+ * would put twenty pgRouting calls inside the critical section, and the version
+ * check plus the stop-identity check already prove the plan still describes this
+ * pool.
+ */
+const acceptAddPassengerOffer = async ({ driver, driverProfileId, offerId, now }) => {
+  const outcome = await inTransaction(async (tx) => {
+    const located = await tx.dispatchOffer.findUnique({
+      where: { id: offerId },
+      select: { rideRequestId: true },
+    });
+
+    if (!located) throw offerNotFound(offerId);
+
+    // Request first, then the offer -- the lock order every path shares.
+    const request = await lockRideRequest(tx, located.rideRequestId);
+
+    const offer = await tx.dispatchOffer.findUnique({
+      where: { id: offerId },
+      select: {
+        id: true,
+        status: true,
+        expiresAt: true,
+        offerType: true,
+        driverProfileId: true,
+        rideRequestId: true,
+        ridePoolId: true,
+        poolVersion: true,
+        vehicleId: true,
+        proposalSnapshot: true,
+      },
+    });
+
+    if (!offer || offer.driverProfileId !== driverProfileId) throw offerNotFound(offerId);
+
+    if (offer.offerType !== OFFER_TYPE.ADD_PASSENGER) {
+      throw new ApiError(409, 'This offer does not propose a pool change');
+    }
+
+    if (offer.status !== OFFER_STATUS.PENDING) {
+      throw new ApiError(
+        409,
+        `This offer is already ${offer.status.toLowerCase()} and cannot be accepted`,
+      );
+    }
+
+    if (isOfferExpired(offer, now)) {
+      await tx.dispatchOffer.update({
+        where: { id: offer.id },
+        data: { status: OFFER_STATUS.EXPIRED, respondedAt: now },
+      });
+
+      if (request) {
+        await appendRideEvent(tx, {
+          rideRequestId: offer.rideRequestId,
+          eventType: RIDE_EVENT_TYPE.DRIVER_OFFER_EXPIRED,
+          actorType: RIDE_ACTOR_TYPE.SYSTEM,
+          previousStatus: request.status,
+          newStatus: request.status,
+          metadata: {
+            offerId: offer.id,
+            offerType: offer.offerType,
+            ridePoolId: offer.ridePoolId,
+            expiresAt: offer.expiresAt.toISOString(),
+          },
+          now,
+        });
+      }
+
+      return { expired: true, rideRequestId: offer.rideRequestId };
+    }
+
+    if (!request) throw new ApiError(404, `Ride request "${offer.rideRequestId}" was not found`);
+
+    if (request.status !== RIDE_REQUEST_STATUS.WAITING) {
+      throw new ApiError(
+        409,
+        `This ride request is no longer waiting for a driver (${request.status})`,
+      );
+    }
+
+    const existingMember = await tx.poolMember.findUnique({
+      where: { rideRequestId: request.id },
+      select: { id: true },
+    });
+    if (existingMember) throw new ApiError(409, 'This ride request already belongs to a pool');
+
+    // --- The pool -----------------------------------------------------------
+    const pool = await lockPool(tx, offer.ridePoolId);
+    if (!pool) throw new ApiError(404, `Ride pool "${offer.ridePoolId}" was not found`);
+
+    if (pool.driverProfileId !== driverProfileId) {
+      throw new ApiError(409, 'This pool belongs to another driver');
+    }
+
+    if (pool.status !== POOL_STATUS.FORMING) {
+      throw new ApiError(409, `This pool is ${pool.status.toLowerCase()} and can no longer be joined`);
+    }
+
+    if (offer.poolVersion !== null && pool.version !== offer.poolVersion) {
+      // The pool has been re-planned since this offer was made, so the proposal
+      // describes a stop order that no longer exists. The offer is cancelled
+      // rather than left pending: nothing should keep waiting on a stale plan, and
+      // the orchestrator will offer the request its next option.
+      await tx.dispatchOffer.update({
+        where: { id: offer.id },
+        data: { status: OFFER_STATUS.CANCELLED, respondedAt: now },
+      });
+
+      await appendRideEvent(tx, {
+        rideRequestId: offer.rideRequestId,
+        eventType: RIDE_EVENT_TYPE.DRIVER_OFFER_CANCELLED,
+        actorType: RIDE_ACTOR_TYPE.SYSTEM,
+        previousStatus: request.status,
+        newStatus: request.status,
+        metadata: {
+          offerId: offer.id,
+          ridePoolId: pool.id,
+          reason: 'stale_pool_version',
+          offeredPoolVersion: offer.poolVersion,
+          currentPoolVersion: pool.version,
+        },
+        now,
+      });
+
+      return { expired: false, stale: true, rideRequestId: offer.rideRequestId };
+    }
+
+    const driverRow = await tx.driverProfile.findUnique({
+      where: { id: driverProfileId },
+      select: { id: true, status: true, currentServicePointId: true },
+    });
+
+    if (!driverRow || driverRow.status !== DRIVER_AVAILABILITY.RESERVED) {
+      throw new ApiError(409, 'You are no longer assigned to this pool');
+    }
+
+    // --- Capacity, recomputed from what exists now ---------------------------
+    const members = await tx.poolMember.count({ where: { ridePoolId: pool.id } });
+    if (members >= pool.capacitySnapshot) {
+      throw new ApiError(409, 'This pool is full');
+    }
+
+    const stops = await lockPoolStops(tx, pool.id);
+    if (stops.some((stop) => stop.status !== POOL_STOP_STATUS.PENDING)) {
+      throw new ApiError(409, 'This pool already has a stop in progress and cannot be changed');
+    }
+
+    // --- The stored plan must still describe the stops that exist ------------
+    const proposal = offer.proposalSnapshot;
+
+    if (!proposal || proposal.ruleVersion !== MATCHING_RULE_VERSION) {
+      throw new ApiError(409, 'This proposal was made under older matching rules and was refused');
+    }
+
+    if (proposal.poolId !== pool.id) {
+      throw new ApiError(409, 'This proposal is about another pool');
+    }
+
+    const currentStopIds = stops.map((stop) => stop.id);
+    const proposedExistingIds = proposal.stops
+      .filter((stop) => !stop.isNew)
+      .map((stop) => stop.stopId);
+
+    if (
+      proposedExistingIds.length !== currentStopIds.length ||
+      proposedExistingIds.some((stopId, index) => stopId !== currentStopIds[index])
+    ) {
+      throw new ApiError(409, 'This pool has changed since the offer was made');
+    }
+
+    // --- The plan must still fit, and still be kind --------------------------
+    const planStops = proposal.stops.map((stop) => ({
+      sequence: stop.sequence,
+      stopType: stop.stopType,
+      memberKey: stop.isNew ? 'new' : stop.poolMemberId,
+      servicePointId: stop.servicePointId,
+    }));
+
+    const occupancy = simulateOccupancy({ stops: planStops, capacity: pool.capacitySnapshot });
+
+    if (!occupancy.valid) {
+      throw new ApiError(409, 'This plan no longer fits the vehicle');
+    }
+
+    // Re-anchor the arrivals to now, exactly as the plan was built: the first stop
+    // after the approach, each later stop after the legs before it.
+    let elapsed = proposal.approach.durationSeconds;
+    const arrivals = proposal.stops.map((stop, index) => {
+      if (index > 0) elapsed += proposal.legs[index - 1].durationSeconds;
+      return new Date(now.getTime() + elapsed * 1000);
+    });
+
+    const newPickupIndex = proposal.stops.findIndex(
+      (stop) => stop.isNew && stop.stopType === STOP_TYPE.PICKUP,
+    );
+
+    const pickupWaitSeconds = Math.max(
+      0,
+      (arrivals[newPickupIndex].getTime() - new Date(request.requestedAt).getTime()) / 1000,
+    );
+
+    const verdict = validatePlan({
+      occupancy,
+      metrics: {
+        pickupWaitSeconds,
+        addedDurationSeconds: proposal.addedDurationSeconds,
+        worstDetourSeconds: proposal.worstExistingPassengerDetourSeconds,
+        passengerDurations: proposal.passengerDurations ?? [],
+      },
+      limits: {
+        maxPickupWaitSeconds: env.matching.maxPickupWaitSeconds,
+        maxAddedPoolDurationSeconds: env.matching.maxAddedPoolDurationSeconds,
+        maxExistingPassengerDetourSeconds: env.matching.maxExistingPassengerDetourSeconds,
+        maxExistingPassengerDetourRatio: env.matching.maxExistingPassengerDetourRatio,
+      },
+    });
+
+    if (!verdict.valid) {
+      throw new ApiError(
+        409,
+        `This join can no longer be made (${verdict.detail ?? verdict.reason ?? PLAN_REJECTION.PICKUP_WAIT})`,
+      );
+    }
+
+    // --- Commit the join -----------------------------------------------------
+    const added = await addMemberToPool(tx, {
+      pool,
+      request,
+      proposal,
+      actorUserId: driver.id,
+      now,
+    });
+
+    await applyRideRequestTransition(tx, {
+      request,
+      toStatus: RIDE_REQUEST_STATUS.MATCHED,
+      eventType: RIDE_EVENT_TYPE.PASSENGER_MATCHED,
+      actorType: RIDE_ACTOR_TYPE.SYSTEM,
+      actorUserId: null,
+      metadata: {
+        ridePoolId: pool.id,
+        poolMemberId: added.member.id,
+        driverProfileId,
+        joinedExistingPool: true,
+        ruleVersion: MATCHING_RULE_VERSION,
+        poolVersionBefore: proposal.poolVersion,
+        poolVersionAfter: added.version,
+      },
+      now,
+    });
+
+    await tx.dispatchOffer.update({
+      where: { id: offer.id },
+      data: { status: OFFER_STATUS.ACCEPTED, respondedAt: now },
+    });
+
+    await appendRideEvent(tx, {
+      rideRequestId: request.id,
+      eventType: RIDE_EVENT_TYPE.POOL_JOIN_ACCEPTED,
+      actorType: RIDE_ACTOR_TYPE.SYSTEM,
+      previousStatus: RIDE_REQUEST_STATUS.WAITING,
+      newStatus: RIDE_REQUEST_STATUS.MATCHED,
+      metadata: {
+        offerId: offer.id,
+        ridePoolId: pool.id,
+        poolMemberId: added.member.id,
+        ruleVersion: MATCHING_RULE_VERSION,
+        score: proposal.score,
+        addedDistanceMeters: proposal.addedDistanceMeters,
+        addedDurationSeconds: proposal.addedDurationSeconds,
+        pickupWaitSeconds,
+        worstDetourSeconds: proposal.worstExistingPassengerDetourSeconds,
+        poolVersionBefore: proposal.poolVersion,
+        poolVersionAfter: added.version,
+        stopOrder: proposal.stops.map((stop) => `${stop.sequence}:${stop.stopType}`),
+      },
+      now,
+    });
+
+    // The driver stays RESERVED: they were committed to this pool before the offer
+    // and they are still committed to it after.
+    return {
+      expired: false,
+      stale: false,
+      rideRequestId: request.id,
+      ridePoolId: pool.id,
+      poolVersion: added.version,
+    };
+  });
+
+  if (outcome.stale) {
+    throw new ApiError(
+      409,
+      'This pool has changed since the offer was made; the ride will be offered again',
+    );
+  }
+
+  return outcome;
 };
 
 /** The driver's current pool, or null. A driver has at most one active pool. */

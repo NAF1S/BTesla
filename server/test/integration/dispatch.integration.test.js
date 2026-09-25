@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { after, before, beforeEach, describe, it } from 'node:test';
 
 import { env } from '../../src/config/env.js';
+import * as assignment from '../../src/services/assignment.service.js';
 import { createSoloFareQuote } from '../../src/services/fare.service.js';
 import * as dispatch from '../../src/services/dispatch.service.js';
 import * as offers from '../../src/services/offer.service.js';
@@ -749,9 +750,19 @@ describe('a refusal', () => {
     const events = await listRideEvents(request.id);
     assert.deepStrictEqual(
       events.map((event) => event.eventType),
-      ['RIDE_REQUESTED', 'DRIVER_OFFERED', 'DRIVER_REJECTED'],
+      [
+        'RIDE_REQUESTED',
+        'DRIVER_OFFERED',
+        'DRIVER_REJECTED',
+        // The rejection is answered over HTTP, which re-runs assignment: no
+        // existing pool can take the passenger, and the only driver who could
+        // reach the pickup has just refused, so the attempt is recorded as a
+        // fallback to solo dispatch that found nobody.
+        'INITIAL_DISPATCH_FALLBACK',
+      ],
     );
     assert.strictEqual(events[2].metadata.reason, 'TOO_FAR');
+    assert.strictEqual(events[3].metadata.reason, 'no_candidate_pools');
   });
 
   it('offers the request to the next eligible driver', async () => {
@@ -822,8 +833,16 @@ describe('expiry', () => {
     const events = await listRideEvents(request.id);
     assert.deepStrictEqual(
       events.map((event) => event.eventType),
-      ['RIDE_REQUESTED', 'DRIVER_OFFERED', 'DRIVER_OFFER_EXPIRED', 'DRIVER_OFFERED'],
+      [
+        'RIDE_REQUESTED',
+        'DRIVER_OFFERED',
+        'DRIVER_OFFER_EXPIRED',
+        // Expiry re-runs assignment, which tries the pool-first order first.
+        'INITIAL_DISPATCH_FALLBACK',
+        'DRIVER_OFFERED',
+      ],
     );
+    assert.strictEqual(events[3].metadata.reason, 'no_candidate_pools');
     assert.strictEqual(await requestStatus(request.id), 'WAITING');
     assert.strictEqual(await driverStatus(jashim.driverProfile.id), 'AVAILABLE');
   });
@@ -971,7 +990,7 @@ describe('dispatch triggered by the ride request itself', () => {
 });
 
 describe('scope boundary', () => {
-  it('creates only INITIAL_RIDE offers, and never an ADD_PASSENGER one', async () => {
+  it('creates only INITIAL_RIDE offers: a join offer is the matching service\'s job', async () => {
     await goOnline(jashim, POINTS.NEAR);
     await goOnline(salauddin, POINTS.MID);
 
@@ -985,7 +1004,14 @@ describe('scope boundary', () => {
     assert.deepStrictEqual(
       [...new Set(rows.map((row) => row.offer_type))],
       ['INITIAL_RIDE'],
-      'ADD_PASSENGER is reserved for the pooling milestone and is never created here',
+      'the dispatcher finds drivers; it never proposes that a pool take another passenger',
+    );
+
+    // The orchestrator is what adds the pool-first stage, and it is a separate
+    // step in front of dispatch rather than a change to it.
+    assert.deepStrictEqual(
+      (await assignment.findPendingOffer(request.id)).offerType,
+      'INITIAL_RIDE',
     );
   });
 

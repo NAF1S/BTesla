@@ -278,6 +278,26 @@ export const selectCandidate = async ({
 const inTransaction = (work) =>
   prisma.$transaction(work, { timeout: env.dispatch.transactionTimeoutMs });
 
+/**
+ * The assignment orchestrator, imported lazily.
+ *
+ * `assignment.service.js` calls into this module for the initial-driver fallback,
+ * so a static import here would be a cycle. Loading it the first time it is
+ * actually needed breaks that cleanly and keeps the dependency honest: this module
+ * knows how to find a driver, not how a request arrived at it.
+ *
+ * What it means for behaviour: an offer that expires now goes back through the
+ * *whole* assignment decision, so a request that lost its driver gets another look
+ * at the pools around it before a second driver is found. That is the point of a
+ * pool-first system -- a request is never committed to one strategy.
+ */
+let assignmentModule = null;
+const assignWaitingRequest = async (args) => {
+  assignmentModule ??= import('./assignment.service.js');
+  const module = await assignmentModule;
+  return module.assignWaitingRequest(args);
+};
+
 const skip = (reason, extra = {}) => ({ dispatched: false, reason, ...extra });
 
 /** True when the error is a PostgreSQL uniqueness violation, however it arrives. */
@@ -557,9 +577,10 @@ export const expireOverdueOffers = async ({ now = new Date(), limit = 100 } = {}
 
     summary.expired += 1;
 
-    // The request is waiting again, so the next best driver can be offered it.
-    const result = await dispatchWaitingRequest({ rideRequestId: expired.rideRequestId, now });
-    if (result.dispatched) summary.redispatched += 1;
+    // The request is waiting again, so the next best option can be tried: another
+    // pool first, then the next driver.
+    const result = await assignWaitingRequest({ rideRequestId: expired.rideRequestId, now });
+    if (result.assigned) summary.redispatched += 1;
   }
 
   return summary;
@@ -590,8 +611,8 @@ export const retryWaitingRequests = async ({ now = new Date(), limit = 50 } = {}
   const summary = { examined: waiting.length, dispatched: 0, skipped: 0 };
 
   for (const request of waiting) {
-    const result = await dispatchWaitingRequest({ rideRequestId: request.id, now });
-    if (result.dispatched) summary.dispatched += 1;
+    const result = await assignWaitingRequest({ rideRequestId: request.id, now });
+    if (result.assigned) summary.dispatched += 1;
     else summary.skipped += 1;
   }
 

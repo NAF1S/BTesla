@@ -1,8 +1,8 @@
 import { env } from '../config/env.js';
 import { currentUser } from '../middleware/auth.js';
+import * as assignment from '../services/assignment.service.js';
 import * as drivers from '../services/driver.service.js';
 import * as offers from '../services/offer.service.js';
-import * as dispatch from '../services/dispatch.service.js';
 import { toDriverAvailabilityDto } from '../serializers/driver.serializer.js';
 import { toPoolDto } from '../serializers/pool.serializer.js';
 import { OFFER_STATUSES, REJECTION_REASONS } from '../services/dispatch.rules.js';
@@ -158,20 +158,27 @@ export const rejectOffer = async (req, res) => {
     ...(reason ? { reason } : {}),
   });
 
-  // The request is waiting again, so the next best driver can be offered it. The
-  // rejection is already committed at this point, and a dispatch failure cannot
-  // undo it: the sweep will offer the request again.
+  // The request is waiting again, so the orchestrator gets it: the pool that just
+  // refused is excluded, another compatible pool may be tried, and a driver of
+  // their own is found if none can take it. The rejection is already committed at
+  // this point, and an assignment failure cannot undo it: the sweep will pick the
+  // request up.
   try {
-    await dispatch.dispatchWaitingRequest({ rideRequestId: outcome.rideRequestId });
+    await assignment.assignWaitingRequest({ rideRequestId: outcome.rideRequestId });
   } catch (err) {
-    console.error(`[dispatch] could not re-offer ride request ${outcome.rideRequestId}:`, err.message);
+    console.error(
+      `[assignment] could not re-assign ride request ${outcome.rideRequestId}:`,
+      err.message,
+    );
   }
 
   res.json({
     offerId: outcome.offerId,
+    offerType: outcome.offerType,
     status: 'REJECTED',
     rejectionReason: outcome.reason,
     rideRequestId: outcome.rideRequestId,
+    ridePoolId: outcome.ridePoolId,
   });
 };
 
