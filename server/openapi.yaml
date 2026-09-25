@@ -1586,7 +1586,7 @@ paths:
               properties:
                 reason:
                   type: string
-                  enum: [CHANGED_MIND, FOUND_OTHER_RIDE, WAITING_TOO_LONG, OTHER]
+                  enum: [CHANGED_MIND, WRONG_LOCATION, WAIT_TOO_LONG, OTHER]
                   default: OTHER
       responses:
         '200':

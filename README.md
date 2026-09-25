@@ -216,7 +216,12 @@ Base URL: `http://localhost:4000/api`
 | `GET`  | `/ride-requests/my`        | The caller's own ride requests, newest first, paged (**PASSENGER only**) |
 | `GET`  | `/ride-requests/:id`       | One of the caller's own ride requests (**PASSENGER only**) |
 | `POST` | `/ride-requests/:id/cancel`| Cancel a request that is still waiting (**PASSENGER only**) |
+| `GET`  | `/ride-requests/:id/fare`  | The caller's own shared fare (**PASSENGER only**) -- see [Shared fares](#shared-fares) |
+| `GET`  | `/passengers/me/current-ride` | The passenger's active ride, with `stage` and `nextAction` (**PASSENGER only**) -- see [Reading a ride](#reading-a-ride) |
+| `GET`  | `/passengers/me/rides`     | The passenger's ride history, filterable and paged (**PASSENGER only**) |
+| `GET`  | `/passengers/me/rides/:rideRequestId` | One of the passenger's own rides, with its stops and timeline (**PASSENGER only**) |
 | `GET`  | `/drivers/me/availability` | The driver's own availability (**DRIVER only**) -- see [Driver dispatch and pools](#driver-dispatch-and-pools) |
+| `PATCH`| `/drivers/me/availability` | Go online or offline in one call: `{ online, servicePointCode \| servicePointId }` (**DRIVER only**) -- see [Reading a ride](#reading-a-ride) |
 | `POST` | `/drivers/me/online`       | Go online at a service point (**DRIVER only**) |
 | `POST` | `/drivers/me/offline`      | Go offline (**DRIVER only**) |
 | `PUT`  | `/drivers/me/current-service-point` | Move to another service point (**DRIVER only**) |
@@ -224,7 +229,18 @@ Base URL: `http://localhost:4000/api`
 | `GET`  | `/drivers/me/offers/:offerId` | One of the driver's own offers (**DRIVER only**) |
 | `POST` | `/drivers/me/offers/:offerId/accept` | Accept an offer (no body); starts a pool, or adds the passenger to an existing one (**DRIVER only**) |
 | `POST` | `/drivers/me/offers/:offerId/reject` | Refuse an offer; the request moves on, the pool does not change (**DRIVER only**) |
-| `GET`  | `/drivers/me/pool`         | The pool the driver is committed to (**DRIVER only**) |
+| `GET`  | `/drivers/me/pool`         | The pool the driver is committed to (**DRIVER only**) -- see [The driver's trip](#the-drivers-trip) |
+| `POST` | `/drivers/me/pools/:poolId/depart` | Set off for the first pickup: closes the pool to matching, freezes the fare (**DRIVER only**) |
+| `POST` | `/drivers/me/pools/:poolId/stops/:stopId/arrive` | Reach the next stop (**DRIVER only**) |
+| `POST` | `/drivers/me/pools/:poolId/stops/:stopId/members/:memberId/pickup` | Confirm a passenger is in the vehicle (**DRIVER only**) |
+| `POST` | `/drivers/me/pools/:poolId/start` | Begin the journey with the passengers on board (**DRIVER only**) |
+| `POST` | `/drivers/me/pools/:poolId/stops/:stopId/members/:memberId/dropoff` | Deliver a passenger (**DRIVER only**) |
+| `POST` | `/drivers/me/pools/:poolId/complete` | Finish the trip and release the driver (**DRIVER only**) |
+| `GET`  | `/drivers/me/rides`        | The pools the driver has driven, filterable and paged (**DRIVER only**) -- see [Reading a ride](#reading-a-ride) |
+| `GET`  | `/drivers/me/rides/:poolId` | One of the driver's own pools, in detail (**DRIVER only**) |
+| `GET`  | `/docs`                    | The OpenAPI 3.1 document, served verbatim from `server/openapi.yaml` |
+
+**`server/openapi.yaml` is the machine-readable contract** for the whole API: paths, parameters, status codes, response DTOs and worked examples using the seeded Banani data and the demo cast. It is served at `GET /api/docs` as `text/yaml`, so an editor or a client generator can fetch it from the running API. `test/unit/openapi.test.js` checks it against the route files, so a route that is not documented fails the suite.
 
 The location endpoints are read-only and return DTOs (`server/src/serializers/location.serializer.js`) instead of raw rows, so database column names, routing vertices and audit timestamps never leak into responses. `/location` is only ever about places: there is deliberately no route, distance, ETA, quote or fare endpoint under it, and none should be added. Route estimation lives at `/routes/estimate` instead.
 
@@ -847,7 +863,9 @@ The fare tests are explicit about the parts that are easy to get quietly wrong: 
 
 ### What is deliberately not here
 
-Fare quoting stops at a price. There is **no** shared fare, pooling discount, seat reservation, payment, wallet, demand-based surge pricing or external pricing API -- and no external routing API. The fare is a **solo** fare: one journey, one passenger, one price. A pool carries one member in the current milestone, so "shared" has no meaning yet, and nothing in this section prices one.
+Fare *quoting* stops at a price. There is no pooling discount, seat reservation, payment, wallet, demand-based surge pricing or external pricing API -- and no external routing API. A quote is a **solo** fare: one journey, one passenger, one price.
+
+What a passenger in a shared car actually owes is a separate calculation, built on these quotes rather than a replacement for them: see [Shared fares](#shared-fares). Every passenger keeps their solo quote as a ceiling, and the pooling arithmetic never re-prices it.
 
 A quote **is** owned by the passenger who asked for it -- ownership arrived with the ride-request milestone, which is what stops one passenger accepting another passenger's quote. The ride request that accepts it is the next section.
 
@@ -1473,9 +1491,885 @@ npm run dispatch:sweep --workspace server           # also tries the next pool a
 
 ### What is deliberately not here
 
-There is **no shared fare or pooling discount**, no fare redistribution, and no trip operations: no driver arrival, trip start, passenger pickup, drop-off or completion, and no matching into a pool that has started. No live GPS, no WebSockets, no notifications, no payments. Passengers keep the solo fares their own quotes froze, and `match` never reads one.
+There is **no shared fare or pooling discount** in this section: matching chooses a *plan*, and what that plan costs each passenger is the [next section](#shared-fares). The trip operations are not here either -- driver arrival, trip start, passenger pickup, drop-off and completion are [the milestone after that](#the-drivers-trip) -- and `match` never reads a price. What this section *does* decide, and all a later milestone needed, is that a pool which is no longer `FORMING` is never matched into: departure is what closes it, and nothing else had to change.
 
 Two assumptions worth stating. The occupancy simulation is plan-level, so it proves a *plan* is legal, not that a car was never overfull; the trip milestones are what turn stops into facts. And a pool's stored duration is priced at its own creation instant while proposals are measured at match time, so `addedDurationSeconds` can be negative after a traffic-profile change -- the score clamps it to zero rather than letting a join be rewarded for a clock change, and the limits are checked against the same clamped numbers.
+
+
+## Shared fares
+
+A pool is a plan, and a plan has a price. This milestone turns the plan into one
+versioned, explainable fare per passenger, built from the legs of the journey each
+passenger is actually on board for.
+
+```text
+leg i -> i+1  costs what it costs to drive
+              and is split between the passengers in the car for it
+passenger     pays the pool's base fare + their share of every leg they are on,
+              capped by their own accepted solo fare
+              and by the fare they were last given
+```
+
+```bash
+# What the passenger is currently being charged, and why.
+curl localhost:4000/api/ride-requests/<id>/fare -b passenger-cookies.txt
+```
+
+### The rule version
+
+`SHARED_FARE_RULE_VERSION` in `src/services/pool-fare.rules.js` is `pool-leg-share-v1`, and every stored calculation records the version it was made with.
+
+This is not decoration. Any change to the arithmetic changes what passengers are charged, so it has to be published as a **new** version rather than deployed on top of the old one: an old calculation is then still explainable by the rules that produced it, and a new calculation is visibly a different answer rather than a silent correction of history. It is deliberately **not** configuration -- `env.fare.pool` holds the transaction ceiling and nothing else -- so changing it means changing code that a reviewer can see.
+
+### Who pays for which leg
+
+The plan is applied in stop order, and the action at a stop is applied *before* the leg that follows it:
+
+```text
+for each stop i, for the leg i -> i + 1:
+    a PICKUP at stop i puts that member on board
+    a DROPOFF at stop i takes them off
+    the resulting set of passengers pays for that leg
+```
+
+So a passenger starts paying immediately after being collected and stops the moment they are delivered. Nobody pays for a leg before their pickup, after their drop-off, or for a leg they were never in the car for -- and a leg with **nobody** on board is recorded (the driver drove it, and it has to stay auditable) but funds nothing: all four of its money columns are zero, and `pool_fare_legs_unfunded_is_free` refuses any other combination.
+
+The driver's **approach to the first pickup is not a leg at all** in this milestone: there is no passenger on board for it by definition, so there is nobody to share it with.
+
+A calculation is refused outright when the plan cannot be priced: a stop numbered out of order, a drop-off before its pickup, a passenger collected or delivered twice, a member with only one of their two stops, an occupancy that exceeds the vehicle, or a leg the router cannot connect.
+
+### What a leg costs
+
+For every consecutive pair of stops, the leg is routed through the authoritative routing service, each traversed edge is priced with the policy in force, and the traffic multiplier is applied **once**:
+
+```text
+edgeDistanceCost = edgeKilometers × perKilometerRate × edge.fareWeight   [rounded]
+distanceCost     = sum(edgeDistanceCost)
+timeCost         = legMinutes × perMinuteRate                             [rounded]
+preTrafficCost   = distanceCost + timeCost
+trafficAdjustment= preTrafficCost × (trafficMultiplier - 1)               [rounded]
+totalLegCost     = preTrafficCost + trafficAdjustment
+```
+
+Three things about that are deliberate:
+
+- **the fare weight multiplies distance only.** It never reaches the duration, and it never reaches the router -- the shortest path was chosen on duration before any of this ran, so a weight can re-price an edge but cannot move the route;
+- **the base fare is not in a leg.** It is a per-passenger amount added later, which is why a leg cost is a property of the road and not of who is in the car;
+- **`totalLegCost = preTrafficCost + round(preTrafficCost × (m - 1))` is `preTrafficCost × m` with one rounding instead of two.** The three stored components therefore add up to the stored total exactly (`pool_fare_legs_total_consistent`), and the multiplier cannot be applied twice without the row failing that check.
+
+Every leg keeps a `routeSnapshot`: the edges in travel order with their distance, selected duration, fare weight and the charge the weight produced, plus the profile and the components. The whole leg can be re-priced from that snapshot and the stored policy alone -- the test suite does exactly that and asserts it reproduces the stored numbers -- which is what makes a fare auditable rather than merely recorded.
+
+### Splitting a leg
+
+```text
+unroundedShare = totalLegCost / N            (exact decimal, ten decimals)
+share          = unroundedShare rounded DOWN to the currency
+                 + one currency unit for the first `residual` passengers, in member-id order
+```
+
+`10.00` split three ways is `3.3333...` each, which is not an amount anybody can be charged. So each share is floored to the policy's rounding scale, and the remaining whole units are handed out **one each, in a stable order (the pool member id)** until the shares add up to the leg's cost exactly. The consequence is the property that matters: **no money is ever discarded or invented by division rounding** -- the shares of a leg sum to the leg's total, which `passenger_fare_leg_shares_sum_is_exact` (a deferred constraint trigger) refuses to commit otherwise, and one share exists per passenger who was on board.
+
+Each share stores the exact quotient, the amount charged, and the difference between them, so a share can be explained without recomputing the division. Which passenger got the extra unit is visible from the amounts themselves, and is deterministic: the same leg always produces the same split.
+
+### What a passenger owes
+
+```text
+allocatedLegCost   = sum(their shares)
+uncappedPooledFare = baseFare + allocatedLegCost
+afterMinimum       = max(minimumFare, uncappedPooledFare)
+afterSoloCap       = min(acceptedSoloFare, afterMinimum)
+finalFare          = min(previousPooledFareCap ?? afterSoloCap, afterSoloCap)
+```
+
+The order is the product's, and the database enforces the result of it:
+
+| Protection | What it guarantees | How it is enforced |
+| ---------- | ------------------ | ------------------ |
+| **Solo cap** | nobody pays more than the fare their own quote froze | `final_fare <= accepted_solo_fare` |
+| **No-increase cap** | adding a passenger never increases an existing passenger's fare | `final_fare <= previous_pooled_fare_cap` when there is one |
+| **Minimum fare** | the pool has a floor | `GREATEST(minimum_fare, uncapped_pooled_fare)` |
+
+`previous_pooled_fare_cap` is the fare that passenger's **previous** allocation gave them -- from the calculation for the preceding pool version, whatever rule version produced it. A passenger who has just joined has no previous cap, which is what makes their first pooled fare a fresh calculation rather than another ceiling.
+
+When the minimum fare and a protection disagree, **the passenger wins**: a fare can only be reduced by a cap, never raised above one by the floor. The difference is recorded rather than absorbed -- `solo_cap_reduction`, `no_increase_reduction` and, on the calculation, `total_minimum_fare_uplift`, which is the part of a fare no passenger produced. The row's arithmetic has to close:
+
+```text
+final_fare + solo_cap_reduction + no_increase_reduction
+  = GREATEST(minimum_fare, uncapped_pooled_fare)
+```
+
+so a fare with an unexplained difference cannot be written by any code path, including one added later by mistake.
+
+### One passenger, no invented discount
+
+For a one-member pool the passenger receives the whole of every funded leg and pays the base fare on top of it. Nothing is split, so nothing is discounted -- and off-peak, where the traffic multiplier is `1.00`, that fare is **exactly** the accepted solo fare. At rush hour it is slightly *below* it, for a reason worth stating: a solo quote applies the multiplier to its whole subtotal including the base fare, while a pooled base fare is a fixed per-passenger amount and only the driving is traffic-scaled. That is a property of `pool-leg-share-v1`, not a discount anybody invented, and it is in the direction of the guarantee: no passenger ever pays more than their quote.
+
+### Versioning: one answer per plan
+
+| Rule | What enforces it |
+| ---- | ---------------- |
+| At most one `CURRENT` calculation per pool | partial unique index `one_current_pool_fare_calculation_per_pool` |
+| At most one calculation per (pool version, rule version) | unique `pool_fare_calculations_version_rule_unique` |
+| Amounts, versions and the policy are write-once | `enforce_pool_fare_calculation_update` trigger: only `status` may move, and only `CURRENT -> SUPERSEDED or FINALIZED` |
+| Legs, allocations and shares are append-only | a trigger per table refuses any `UPDATE` |
+| A fare never moves without a plan change | the calculation is written inside the acceptance transaction, not after it |
+
+Because the pair (pool version, rule version) is unique, recalculating is **idempotent**: a retry, a sweep or a second caller finds the stored answer and writes nothing. Because the plan version is checked under the pool's row lock, asking for a version the pool has moved past is a `409` rather than a calculation of something that no longer exists.
+
+`SUPERSEDED` rows are kept forever: the history of what each passenger was quoted at every step is the audit trail, and it is also where the no-increase cap reads its ceiling from. `FINALIZED` is written by [the trip milestone](#the-drivers-trip): departure moves the pool's `CURRENT` calculation to `FINALIZED` with `finalized_at`, so the passengers travel under exactly the numbers they were last shown, and `finalized_at` is refused unless the status is `FINALIZED`.
+
+### When it runs
+
+A pool's plan is what its fares are made of, so a calculation is written whenever the plan changes -- and **inside the transaction that changes it**:
+
+1. the initial pool acceptance, which produces version 1;
+2. an accepted `ADD_PASSENGER` offer, which produces the next version;
+3. and `recalculatePoolFaresStandalone`, for a pool whose calculation is missing or stale.
+
+That is the guarantee the whole design is built around: **a successful plan change cannot commit without a valid calculation**, so a matched passenger can never exist without a fare. If the calculation fails -- the pricing is not configured, a leg cannot be routed, the plan cannot be priced -- the member, the stops, the route, the version bump and the request's status change all roll back with it. The test suite proves it by breaking the pricing and asserting that the join left nothing behind.
+
+The cost of the guarantee is real and worth naming: the critical section now routes every leg of the plan (a handful of short pgRouting queries) rather than reusing durations from a plan computed earlier. Pricing a plan that has not been written yet, or writing one that cannot be priced, would both be worse.
+
+The repair command exists for the two cases the trigger cannot cover -- a plan change that predates this milestone, and a calculation a deployment has since fixed:
+
+```bash
+npm run pool-fares:recalculate --workspace server
+```
+
+It examines forming pools whose calculation is missing or stale for their current version, recalculates those, and reports what it did. It is idempotent, safe to run repeatedly, and skips (rather than guesses at) a pool whose plan moves while it runs.
+
+### Reading a fare
+
+`GET /api/ride-requests/:id/fare` returns the authenticated passenger's own allocation:
+
+```json
+{
+  "rideRequestId": "…",
+  "fareStatus": "ESTIMATED",
+  "calculationStatus": "CURRENT",
+  "currency": "BDT",
+  "acceptedSoloFare": "110.85",
+  "currentPooledFare": "95.42",
+  "baseFare": "40.00",
+  "allocatedLegCost": "55.42",
+  "uncappedPooledFare": "95.42",
+  "minimumFare": "80.00",
+  "minimumFareApplied": false,
+  "legsPaidFor": 2,
+  "previousPooledFare": "97.10",
+  "soloCapApplied": false,
+  "noIncreaseCapApplied": true,
+  "soloCapReduction": "0.00",
+  "noIncreaseReduction": "1.68",
+  "totalReduction": "1.68",
+  "savedAgainstSoloFare": "15.43",
+  "pricingCode": "dhaka-solo",
+  "pricingVersion": 1,
+  "sharedFareRuleVersion": "pool-leg-share-v1",
+  "poolVersion": 2,
+  "calculatedAt": "2026-09-25T06:12:44.118Z"
+}
+```
+
+`fareStatus` is `ESTIMATED` while a pool is still forming, and `FINALIZED` once the driver has departed: the freeze is what commits the passengers to the numbers they were last shown. `calculationStatus` distinguishes a current answer from a superseded one. A fare stays readable after departure, which is what lets a passenger look up what they are travelling under.
+
+**Privacy is structural, not a filter.** The response is derived from one allocation, so there is no shape of it in which another passenger's fare, the pool's revenue, or the platform's share of somebody else's minimum fare could appear -- the serializer is not given those numbers. There is deliberately no route that takes a pool id: a passenger cannot ask about a pool, and therefore cannot ask about the people in it. Another passenger's request is a `404` (not a `403`, so request ids cannot be probed), a driver is refused by the role guard, and before a request is matched there is no pooled fare to report, which is a `404` as well rather than an invented `0.00`. Drivers see no fares at all: the driver endpoints carry plans, not money.
+
+### Commands
+
+```bash
+npm run db:migrate                                  # applies 11-pool-fares.sql (idempotent)
+npm test                                             # unit + integration
+npm run test:unit --workspace server                 # the fares rules, with no database
+npm run test:integration --workspace server          # the ledger, the caps, the races, privacy
+npm run pool-fares:recalculate --workspace server    # repair: price any stale pool
+```
+
+### What is deliberately not here
+
+There is **no payment, wallet, refund, driver payout, cancellation fee, tax, promo code or settlement**. A fare is frozen by departure ([the driver's trip](#the-drivers-trip)) and never charged: `FINALIZED` is a commitment about arithmetic, not a movement of money, and a settlement milestone is what would collect it. A fare here is an estimate for a plan that has not started -- every stop must still be `PENDING` for a calculation to be *written*, and a pool whose trip has begun is refused with a `409` rather than re-priced.
+
+Two limitations worth stating plainly. The occupancy behind a fare is the *plan*: this milestone prices what the plan says will happen, and the trip milestone is what turns a stop into a fact. And a fare is recomputed from the current plan rather than adjusted incrementally, so a fare is only ever as current as the last plan change -- which is exactly why the plan change and the calculation share a transaction, and why departure has to freeze the answer before the car moves.
+
+
+## The driver's trip
+
+A pool is a plan. This milestone is the driver executing it: setting off, reaching
+each stop, collecting the passengers, starting the journey, delivering them one by
+one, and finishing. It is the point at which every "planned" thing in the previous
+sections becomes a fact, and the only milestone in which the driver calls the API
+instead of answering it.
+
+```text
+FORMING  --depart-->  DRIVER_EN_ROUTE  --arrive (first pickup)-->  ARRIVED
+                                                                    |
+                                                          --start (passengers aboard)-->
+                                                                    |
+                                                              IN_PROGRESS  --complete-->  COMPLETED
+```
+
+```bash
+# What am I committed to, and what may I do next?
+curl localhost:4000/api/drivers/me/current-pool -b driver-cookies.txt
+
+# Set off. Then reach a stop, collect a passenger, start, deliver, finish.
+curl -X POST localhost:4000/api/drivers/me/pools/<id>/depart -b driver-cookies.txt
+curl -X POST localhost:4000/api/drivers/me/pools/<id>/stops/<stopId>/arrive -b driver-cookies.txt
+curl -X POST localhost:4000/api/drivers/me/pools/<id>/stops/<stopId>/members/<memberId>/pickup -b driver-cookies.txt
+curl -X POST localhost:4000/api/drivers/me/pools/<id>/start -b driver-cookies.txt
+curl -X POST localhost:4000/api/drivers/me/pools/<id>/stops/<stopId>/members/<memberId>/dropoff -b driver-cookies.txt
+curl -X POST localhost:4000/api/drivers/me/pools/<id>/complete -b driver-cookies.txt
+```
+
+### Departure, and what it closes
+
+Departing is `FORMING -> DRIVER_EN_ROUTE` and nothing else. It is the *only* moment
+a pool stops being matchable: shared matching considers `ELIGIBLE_POOL_STATUSES`,
+which is `FORMING` alone, so after this a new passenger can never be folded into a
+plan that is already being driven. It is the same transaction that **freezes the
+fare**: the pool's `CURRENT` `pool_fare_calculations` row moves to `FINALIZED` with
+`finalized_at`, and the passengers travel under exactly the numbers they were last
+shown. A trip cannot start without that freeze (`FARE_NOT_FINALIZED`), so a fare can
+never be settled after the fact by a driver who forgot to depart.
+
+Departure is also what cancels the offers it invalidates. A pending `ADD_PASSENGER`
+offer to another driver is answered `409` by a departing pool, because the answer
+would be a promise about a plan that is no longer a plan. Departure pulls the
+driver's own pending offers closed first and then, best-effort, re-dispatches the
+passengers those offers were holding -- a refusal here never blocks the departure.
+
+### The stop order, and why a corner is two stops
+
+```text
+the next actionable stop = the lowest-sequence stop whose status is not COMPLETED
+```
+
+A `pool_stops` row names **one member and one stop type**, so two passengers
+collected at the same corner are two stops at the same service point in consecutive
+order. That single rule is what makes "a shared corner stays open until everybody
+there is in the car" fall out of the design rather than being special-cased: after
+the first of the two pickups the second is still the next actionable stop, so the
+driver cannot skip it and cannot reach a later stop first.
+
+Reaching a stop the driver has already passed, or any stop that is not the next
+actionable one, is a `409` (`STOP_NOT_NEXT`). There is no "set my position" call: the
+driver's place in the journey *is* the stops they have finished.
+
+### Arriving
+
+`POST .../stops/:stopId/arrive` writes `actual_arrival_at` and moves the stop to
+`ARRIVED`. Arriving at the **first pickup** is what moves the pool out of
+`DRIVER_EN_ROUTE` and into `ARRIVED`; later arrivals leave the pool exactly as it is,
+because the trip has its own clock from there.
+
+A pickup stop that is reached also writes a `DRIVER_ARRIVED` event onto the
+passenger's own timeline -- and **only** a pickup stop does. A delivery stop is not a
+promise that a car is coming for anybody, so it never claims one.
+
+Reaching a stop is not the same as serving it: a stop can be `ARRIVED` and still
+`PENDING` in the sense that its passenger has not been confirmed into the car. The
+stop status is what the *driver* did; the member status is what happened to the
+*passenger*, and the two are written together.
+
+### Collecting a passenger
+
+`POST .../stops/:stopId/members/:memberId/pickup` requires the stop to be the next
+actionable one, to be a `PICKUP`, and to be *that passenger's* own stop
+(`MEMBER_NOT_ON_STOP` otherwise), so a driver cannot complete somebody else's stop by
+naming the wrong member. It sets `picked_up_at`, the stop to `COMPLETED`, the member
+to `PICKED_UP`, and the event on both timelines.
+
+The passenger's *ride* is not started by this. A passenger collected before the trip
+starts stays `MATCHED`; one collected **during** a trip that is already `IN_PROGRESS`
+has their ride begin immediately (`collected_during_trip`), because they are being
+driven the moment they get in.
+
+### Starting the trip
+
+`POST .../start` requires `ARRIVED`, at least one passenger aboard, and **no pickup
+still open at the next actionable stop** (`PICKUP_ACTION_OPEN`). It sets
+`started_at` on the pool, moves every `MATCHED` request of every passenger already
+aboard to `IN_PROGRESS` with their own `started_at`, and writes `TRIP_STARTED`.
+
+The rule is deliberately local, and it is what makes staggered pooling work: the trip
+starts where the driver currently is, so a passenger waiting **later** along the route
+is still `MATCHED` and is collected into a running trip. There is no requirement that
+everyone in the pool is aboard before the car moves.
+
+### Delivering a passenger
+
+`POST .../stops/:stopId/members/:memberId/dropoff` requires the next actionable stop,
+a `DROPOFF`, and that the passenger is `PICKED_UP`. It sets `dropped_off_at`, the stop
+to `COMPLETED`, the member to `DROPPED_OFF`, **that request to `COMPLETED`** with its
+own `completed_at`, and writes `MEMBER_DROPPED_OFF`.
+
+Completion is per passenger: the pool keeps carrying whoever is still in the car, and
+a passenger who has been delivered is finished with this pool even though the trip
+has not ended. `pool_members.dropped_off_at` and `ride_requests.completed_at` are two
+instants proving two different things -- one passenger's stop, and one ride -- and the
+second is what their history is built from.
+
+### Completing the trip
+
+`POST .../complete` is the only operation that is purely about **facts**, and it
+refuses if any of them is missing:
+
+| Requirement | Refusal |
+| ----------- | ------- |
+| the pool is `IN_PROGRESS` | `POOL_NOT_IN_PROGRESS` |
+| every stop is `COMPLETED` | `STOPS_UNFINISHED` |
+| nobody is still `PICKED_UP` | `MEMBERS_ONBOARD` |
+| every passenger is `DROPPED_OFF` | `MEMBERS_ONBOARD` |
+| every ride is `COMPLETED` | `REQUESTS_UNFINISHED` |
+| the fare was frozen before the trip | `FARE_NOT_FINALIZED` |
+
+There is no "close it anyway", because completing with a passenger aboard would strand
+a ride request in a state no later operation could repair. Completion sets
+`completed_at`, writes `TRIP_COMPLETED`, and **releases the driver**: the driver goes
+`ON_RIDE -> AVAILABLE` at the final drop-off's service point, with `availableSince`
+and `lastSeenAt` moved to now, and a `DRIVER_AVAILABLE` event. The driver is therefore
+dispatched from where the trip actually ended rather than from where it began.
+
+### Idempotency is a property of the state, not a token
+
+None of these endpoints takes an idempotency key. A repeated command is answered by
+the **state it produced**:
+
+| Decision | Meaning | Response |
+| -------- | ------- | -------- |
+| `APPLY` | do it | `200`, the command happened |
+| `REPEAT` | this exact operation already succeeded | `200`, the current state, nothing written |
+| `REFUSE` | the resources exist but the order or state is wrong | `409` with a named reason |
+
+A `REPEAT` moves **no timestamp and writes no event** -- the test suite asserts this by
+comparing the whole rows and the whole event lists before and after, not just the
+status. It is checked *before* any "the trip is over" refusal, so a driver whose
+network dropped mid-request can retry a pickup after the trip completed and get their
+answer rather than a `409` about a trip that is over. And the timestamps are written
+from the state, never from the retry, so a second `arrive` cannot make the driver
+arrive twice.
+
+### Concurrency
+
+Each command runs in one transaction and locks what it touches, always in the same
+order: **the pool, its stops, its member requests, then the driver.** The row lock on
+the pool is what serialises two commands on the same trip, and the lock on the driver
+is what makes the release at completion atomic with the rest.
+
+There is one exception, and it is documented at the top of `trip.service.js`: a
+departure writes a `DRIVER_OFFER_CANCELLED` event onto *other* passengers' timelines,
+so those requests are locked **first**, in ascending id order, before the pool. Taking
+the pool first would let a departure hold the pool while waiting for a request that an
+offer acceptance holds while waiting for the pool -- a deadlock the test suite
+provokes with two commands issued at once.
+
+### The response: `allowedActions` is computed, not told
+
+```json
+{
+  "pool": {
+    "poolId": "…",
+    "status": "ARRIVED",
+    "version": 2,
+    "capacity": 3,
+    "vehicle": { "name": "Bullet", "seatCapacity": 3 },
+    "plan": { "distanceMeters": 2214, "durationSeconds": 569, "stopCount": 3 },
+    "stops": [
+      { "stopId": "…", "sequence": 1, "stopType": "PICKUP", "status": "ARRIVED",
+        "servicePoint": { "code": "banani-road-11", "name": "Banani Road 11" },
+        "plannedArrivalAt": "…", "actualArrivalAt": "…", "completedAt": null }
+    ],
+    "nextStop": { "stopId": "…", "sequence": 1, "stopType": "PICKUP", "status": "ARRIVED" },
+    "allowedActions": ["PICKUP_PASSENGER"],
+    "pricing": { "finalized": true, "finalizedAt": "…", "poolVersion": 2 },
+    "departedAt": "…",
+    "members": [
+      { "memberId": "…", "status": "ASSIGNED", "rideStatus": "MATCHED", "displayName": "Nusrat",
+        "pickup": { "code": "banani-road-11" }, "dropoff": { "code": "mohakhali-bus-terminal" },
+        "matchedAt": "…", "pickedUpAt": null, "droppedOffAt": null, "stops": [ … ] }
+    ],
+    "events": [ { "sequence": 1, "eventType": "POOL_CREATED", "actorType": "DRIVER", "createdAt": "…" } ]
+  }
+}
+```
+
+`allowedActions` lists an action **only when its own decision would be `APPLY`**, so a
+driver's client is never offered a button that would answer `409` -- and an action that
+has already succeeded is absent, because there is nothing left to do about it. It is
+computed from the state on every read rather than stored, so it cannot drift from the
+rules that enforce it: the same `trip.rules.js` that answers the request answers this
+field. `GET /drivers/me/current-pool` is the canonical name (`/drivers/me/pool` still
+answers identically, so an earlier caller does not break), it is wrapped in a `pool`
+key like every other allowance-shaped read, and it reports the driver's pool whether it
+is still `FORMING` or already `COMPLETED` -- which is what makes it the one endpoint a
+client needs to poll. `pool` is `null` rather than an error for a driver with no pool,
+which is the same answer a fresh driver and a driver whose trip has finished get.
+
+`pricing.finalized` is a **boolean and a version, never an amount**: the driver is told
+whether the money is frozen, not what it is, and the driver DTO carries no fare at all.
+
+### What the passenger sees
+
+`GET /api/ride-requests/:id` gains a `trip` block, and the fare endpoint reports the
+settled status once the trip has begun:
+
+```json
+{
+  "trip": {
+    "poolId": "…",
+    "poolStatus": "IN_PROGRESS",
+    "memberStatus": "PICKED_UP",
+    "stage": "PICKED_UP",
+    "driver": { "displayName": "Jashim" },
+    "vehicle": { "name": "Bullet", "seatCapacity": 3 },
+    "stops": [ { "stopId": "…", "sequence": 1, "stopType": "PICKUP", "status": "COMPLETED" } ],
+    "nextStop": { "stopId": "…", "sequence": 2, "stopType": "DROPOFF", "status": "PENDING" },
+    "timeline": {
+      "matchedAt": "…", "departedAt": "…", "driverArrivedAt": "…",
+      "pickedUpAt": "…", "droppedOffAt": null
+    },
+    "events": [ { "sequence": 3, "eventType": "DRIVER_DEPARTED", "actorType": "DRIVER", "createdAt": "…" } ]
+  }
+}
+```
+
+`stage` is **derived from the timestamps, never stored**, because a stored stage is a
+second source of truth that can disagree with the instants that justify it:
+
+```text
+DRIVER_ASSIGNED   a driver accepted; nobody has set off
+DRIVER_EN_ROUTE   the driver left for the first pickup
+DRIVER_ARRIVED    the car is at *this* passenger's pickup
+PICKED_UP         this passenger is in the car, the trip has not started
+IN_PROGRESS       this passenger's ride has begun
+RIDE_COMPLETED    this passenger has been delivered
+```
+
+Every field is about *this* passenger: the arrival instant is their own pickup stop's,
+the completion is their own ride's -- which happens while the pool may still be
+carrying somebody else -- and the pool's status and departure are the only shared facts
+in it. The driver is a first name and a car, as in the rest of the driver-facing
+surface; a passenger who is not in a pool gets no `trip` at all rather than an empty
+one, and another passenger's request is still a `404`.
+
+### Events
+
+`pool_events` gains `DRIVER_DEPARTED`, `STOP_ARRIVED`, `TRIP_STARTED`, `TRIP_COMPLETED`
+and `DRIVER_AVAILABLE`; `ride_events` gains `DRIVER_ARRIVED`. Every one is written in
+the same transaction as the state change it records, so a timeline cannot claim
+something the state does not show, and the tables still refuse `UPDATE` -- a retry
+finds the event already there and writes no second one.
+
+### What the database enforces
+
+`server/db/12-driver-trip.sql` adds the instants and the consistency they imply, so a
+state that cannot be reached cannot be *written* either:
+
+| Column | New |
+| ------ | --- |
+| `ride_pools.departed_at` | yes |
+| `pool_stops.completed_at` | yes |
+| `ride_requests.started_at`, `ride_requests.completed_at` | yes |
+| `pool_members.picked_up_at`, `dropped_off_at` | no -- already existed, and are now reachable |
+| `ride_pools.driver_arrived_at`, `ride_pools.started_at`, `ride_pools.completed_at`, `pool_stops.actual_arrival_at` | no -- already existed, and are now written |
+
+and four `CHECK`s: `ride_pools_lifecycle_consistent` (a pool that is not `FORMING` has
+departed; `IN_PROGRESS` iff `started_at`; `COMPLETED` iff `completed_at`; `CANCELLED`
+iff `cancelled_at`; a completed or cancelled pool may not also be under way),
+`pool_stops_lifecycle_consistent` (`ARRIVED` has an arrival, `COMPLETED` has both,
+`PENDING` has neither), `pool_members_lifecycle_consistent` and
+`ride_requests_lifecycle_consistent` (`IN_PROGRESS` or `COMPLETED` iff `started_at`;
+`COMPLETED` iff `completed_at`).
+
+The migration also adds `ride_requests_passenger_completed_at_idx`, the index a
+passenger's finished-ride history reads through, and it **rewrites the two existing
+lifecycle checks** rather than adding a second one that could disagree.
+
+A note on names: the brief called the third pool state `DRIVER_ARRIVED`, which is the
+`ARRIVED` enum value this schema has had since matching; and the stop instant the brief
+called `actual_completed_at` is `pool_stops.completed_at` here. Nothing was renamed, so
+no previously applied migration had to be edited -- the only instants genuinely missing
+were `ride_pools.departed_at`, the completion of a stop, and the two on the ride
+request itself.
+
+### Commands
+
+```bash
+npm run db:migrate      # applies 12-driver-trip.sql (idempotent, safe to re-run)
+npm test                 # unit + integration
+npm run test:unit --workspace server         # the trip rules, with no database
+npm run test:integration --workspace server  # the six endpoints, the races, the boundary
+```
+
+### What is deliberately not here
+
+**No passenger cancellation, no driver cancellation, no no-show handling, no payments
+or refunds, no live GPS, no WebSockets or notifications, no ratings, no frontend code
+and no rematching after departure.** A cancelled pool, a `SKIPPED` stop and a
+`CANCELLED` or `NO_SHOW` member are defined in the schema and reached by no code path;
+the trip suite asserts that after a full journey the counts of all of them are still
+zero. There is no "driver is late" operation and no way to move a stop: the plan a
+passenger was priced against is the plan that is driven.
+
+Two limitations worth naming. Location is **declarative**: the API records that a
+driver reached a stop, and never checks that they were physically there -- the client
+is trusted, which is the honest design until there is a GPS milestone to check it
+against. And the trip is driven by the driver alone: nothing expires a stop that is
+never served, so a driver who abandons a journey mid-trip leaves a pool `IN_PROGRESS`
+until a cancellation milestone exists to close it.
+
+
+## Reading a ride
+
+Every milestone before this one built the API a client *writes* to: quote, request,
+accept, depart, collect. This one builds the API a client **reads**: what am I on
+now, what have I done, and what may I do next. It is the layer a passenger and a
+driver app is actually made of.
+
+```bash
+# The passenger: where am I in my journey, and what should I do?
+curl localhost:4000/api/passengers/me/current-ride -b passenger-cookies.txt
+
+# Their history, filtered and paged.
+curl 'localhost:4000/api/passengers/me/rides?status=COMPLETED&limit=20' -b passenger-cookies.txt
+
+# One ride, with its own stops and its own timeline.
+curl localhost:4000/api/passengers/me/rides/<rideRequestId> -b passenger-cookies.txt
+
+# The driver: the same questions, about the pool instead of the request.
+curl localhost:4000/api/drivers/me/current-pool -b driver-cookies.txt
+curl 'localhost:4000/api/drivers/me/rides?from=2026-09-01T00:00:00Z' -b driver-cookies.txt
+curl localhost:4000/api/drivers/me/rides/<poolId> -b driver-cookies.txt
+
+# One call for the whole availability toggle.
+curl -X PATCH localhost:4000/api/drivers/me/availability -b driver-cookies.txt \
+  -H 'Content-Type: application/json' \
+  -d '{"online":true,"servicePointCode":"banani-kakoli"}'
+```
+
+### A passenger's history is requests; a driver's is pools
+
+The two are not the same shape, and the difference is the product rather than the
+schema. A passenger's history is a list of **ride requests**, because one request
+is one passenger's journey. A driver's history is a list of **pools**, because a
+pool is one car's journey: a driver who carried three passengers drove one trip,
+not three. Reporting a driver's history per request would show the same journey
+three times and make "how many trips did I drive" unanswerable.
+
+The passenger side also keeps two levels apart. `GET /passengers/me/rides` returns
+**summaries** — enough for a list — while `GET /passengers/me/rides/:id` adds the
+passenger's own stops, their own lifecycle timeline and the pool they shared. The
+list deliberately does not load each ride's stops and events, because that would be
+a query per row to answer a question a list page is not asking.
+
+### The current ride, and why it is a 200 with `null`
+
+`GET /passengers/me/current-ride` answers the passenger's single active request
+(`WAITING`, `MATCHED` or `IN_PROGRESS` — the database allows at most one), with a
+`stage` and a `nextAction`:
+
+```json
+{
+  "ride": {
+    "rideRequestId": "86274eb8-0f84-42b3-b2b8-3619d7c7f902",
+    "status": "MATCHED",
+    "stage": "DRIVER_EN_ROUTE",
+    "nextAction": "WATCH_DRIVER",
+    "pickup": { "code": "banani-road-11", "name": "Banani Road 11" },
+    "destination": { "code": "mohakhali-bus-terminal", "name": "Mohakhali Bus Terminal" },
+    "driver": { "displayName": "Jashim" },
+    "vehicle": { "name": "Bullet", "seatCapacity": 3 },
+    "passengerCount": 1,
+    "myStops": [
+      { "stopId": "…", "sequence": 1, "stopType": "PICKUP", "status": "PENDING",
+        "servicePoint": { "code": "banani-road-11", "name": "Banani Road 11" } }
+    ],
+    "sharedFare": { "fare": "126.63", "currency": "BDT", "finalized": true, "poolVersion": 1 },
+    "timeline": { "matchedAt": "…", "departedAt": "…", "driverArrivedAt": null }
+  }
+}
+```
+
+A passenger who is not riding gets `200` with `{ "ride": null }`, not a `404`. Not
+being on a journey is a normal state rather than a missing resource, so a client
+polling this endpoint does not have to treat the ordinary answer as an error — the
+same choice the driver's current-pool endpoint makes with `{ "pool": null }`. A
+named resource that is not the caller's *is* a `404`, and a fare that does not
+exist yet is a `404` rather than an invented `0.00`.
+
+`stage` and `nextAction` are **derived from the timestamps on every read**, never
+stored:
+
+```text
+DRIVER_ASSIGNED  WAIT_FOR_DRIVER    a driver accepted; nobody has set off
+DRIVER_EN_ROUTE  WATCH_DRIVER       the driver left for the first pickup
+DRIVER_ARRIVED   BOARD_VEHICLE      the car is at *this* passenger's pickup
+PICKED_UP        IN_RIDE            in the car, the trip has not started
+IN_PROGRESS      IN_RIDE            this passenger's ride has begun
+RIDE_COMPLETED   RIDE_FINISHED      delivered
+```
+
+A stored stage would be a second source of truth that can disagree with the
+instants that justify it, and a stored "next action" is a button that can be wrong.
+Both come from `trip.rules.js`, which is the same module the trip commands use, so
+a client is never offered an action the server would refuse.
+
+### Privacy: structural, not a filter
+
+This is where the read APIs are most deliberate, and the design is the same one the
+fare milestone used: **a response is built from one passenger's rows**, so there is
+no shape of it in which another passenger could appear.
+
+| A passenger never receives | How |
+| -------------------------- | --- |
+| Another passenger's name, account id or contact details | The other member's row is never selected |
+| Another passenger's ride-request id | Reachable only through their own request |
+| Another passenger's pickup or destination | `myStops` is filtered by *their* request, so a co-passenger's stop is not read |
+| Another passenger's fare | The fare read is keyed by their own request id |
+| Another passenger's event history | `ride_events` is per request; a driver's `pool_events` are never read for a passenger |
+| The event payloads behind any timeline | The mapper reads a fixed set of fields and `metadata` is not among them |
+
+What *is* shared is aggregate: `passengerCount` and `vehicle.seatCapacity`. A count
+cannot be unpacked into a person, and a passenger has a legitimate interest in both.
+A passenger also sees `POOL_JOIN_ACCEPTED` as "someone joined your shared ride" —
+the one event about another person that is included, because the passenger count
+already discloses that a second person is in the car, and a shared-ride timeline
+that silently omitted the second pickup would misdescribe the product.
+
+For a driver the boundary runs the other way. A driver **must** see who they are
+collecting and where, so a passenger appears with a first name, their two service
+points and their own timestamps — and nothing else:
+
+* no passenger account field, user id, email or credential;
+* **no per-passenger fare.** The pool's fare is reported once, as a total, with no
+  key that could attribute an amount to the person behind them;
+* no passenger event history. The timeline is the **pool's**, mapped from
+  `pool_events`;
+* no other driver's data.
+
+There is one asymmetry worth naming, because it looks like an inconsistency and is
+not. A driver's **history** reports the pool's fare total; the pool they are
+**currently** driving reports only whether the fare is settled, never an amount.
+While a driver can still decide where to go next, what a passenger is paying must
+not be part of that decision.
+
+### Timelines are mapped, not dumped
+
+`src/services/timeline.rules.js` is the single definition of **which internal event
+a person may be told about, and what they are told**. It turns an
+`event_type` into a sentence with a phase, and it is a whitelist:
+
+* an event with no entry is **invisible**, so a milestone that adds an enum value
+  gets an event nobody is told about until somebody decides what it means to whom;
+* the whole dispatch family — `DRIVER_OFFERED`, `DRIVER_REJECTED`,
+  `DRIVER_OFFER_EXPIRED`, `POOL_CANDIDATE_EVALUATED`, `POOL_JOIN_OFFERED`,
+  `POOL_JOIN_REJECTED`, `INITIAL_DISPATCH_FALLBACK` — is absent for a passenger.
+  `DRIVER_REJECTED` is the important one: telling a passenger that four drivers
+  said no is a product decision nobody has made, and it is information about the
+  drivers;
+* `metadata` and `actorUserId` are never read, so an audit payload has no path into
+  a response;
+* the order is `sequence`, then timestamp, then id — deterministic even for a list
+  assembled from more than one source.
+
+### Pagination, filters and the tie-breaker
+
+Both list endpoints use the project's existing envelope — `limit` + `offset` with
+`pagination: { limit, offset, returned, total, hasMore }` — ordered newest first,
+with the id appended:
+
+```text
+ORDER BY requested_at DESC, id DESC     (a passenger's rides)
+ORDER BY created_at DESC, id DESC       (a driver's pools)
+```
+
+The tie-breaker is not cosmetic. Two rows written in the same millisecond have no
+inherent order, so without it a client paging through them can see one twice and
+miss another. With it the order is total, and page N+1 starts exactly where page N
+stopped. The test suite proves it by writing three rows with an *identical*
+timestamp and walking the pages twice.
+
+`?status=` is validated against the real enum, so a typo is a `400` rather than an
+empty page that looks like "you have never ridden". `?from=` and `?to=` are an
+inclusive range of ISO instants. The driver's range filters `createdAt` rather than
+`completedAt`, because `completedAt` is null on the pools a driver cares most
+about — the ones still running; "finished trips in a range" is
+`?status=COMPLETED&from=…&to=…`.
+
+### Indexes
+
+`server/db/13-read-api.sql` adds four indexes, and nothing else — the read APIs
+needed no new state:
+
+| Index | Serves |
+| ----- | ------ |
+| `ride_requests_passenger_status_requested_at_idx` | The passenger's history, with and without `?status=` |
+| `ride_pools_driver_created_at_idx` | The driver's history, newest first, carrying the `id` tie-breaker |
+| `ride_pools_driver_status_created_at_idx` | The driver's history filtered by status |
+| `ride_pools_driver_completed_at_idx` (partial) | The driver's history filtered by a completion range |
+
+They are ascending, and a btree index is read backwards at almost no cost, so an
+index on `(passenger_profile_id, status, requested_at)` serves
+`ORDER BY requested_at DESC` exactly as well as a `DESC` index would — and unlike
+one, Prisma can express it, so `migrate diff` stays clean.
+
+### Driver availability in one call
+
+`PATCH /drivers/me/availability` is the toggle a driver app binds to:
+
+```text
+{ online: true,  servicePointCode | servicePointId, vehicleId? }  -> AVAILABLE
+{ online: false }                                                 -> OFFLINE
+```
+
+It is **not** a second implementation of going online: it calls the same two
+operations the dedicated endpoints do, so the state machine, the lock order and
+every refusal are shared rather than duplicated. The response carries the boolean a
+switch binds to (`online`), the state machine's own value under the name the
+documentation uses (`operationalStatus`), and the place the driver is
+(`servicePoint`, with the id a client sends back).
+
+`operationalStatus` is deliberately **not accepted** in the body — sending it is a
+`400`, not a silent no-op. A client may say "I am online" or "I am offline"; it may
+never say "I am `ON_RIDE`". `RESERVED` and `ON_RIDE` are established by accepting an
+offer and departing for the first pickup, and a device that could set them could
+make itself dispatchable while carrying a passenger, or invisible while committed
+to one.
+
+Going offline is refused for `RESERVED` and `ON_RIDE` for the mirror-image reason:
+a passenger is waiting for that car. The service point is *kept* across going
+offline — it is where the driver is, and where they will come back from. Being
+offline is not the same as being nowhere; the `OFFLINE` status is what removes a
+driver from the dispatch search.
+
+### Performance, and how it is proven
+
+A history page costs a fixed number of queries whatever its size. The three
+non-obvious pieces of that:
+
+* the page query resolves the two service points, the member, the pool, its
+  vehicle and its driver **inside one `findMany`**, so a page of one and a page of
+  a hundred issue the same statements;
+* every ride's shared fare is read in **one query for the whole page**, not one per
+  row — and a page with no rows skips it entirely;
+* the driver's summary reads no member rows at all: `passengerCount` comes from an
+  aggregate, so paging back through every passenger a driver has ever carried is
+  not a request that exists.
+
+`test/integration/passenger-read-api.integration.test.js` proves this by **counting
+queries**, not by checking the JSON: Prisma emits `query` events under
+`NODE_ENV=test`, and the suite asserts that a page of ten costs exactly what a page
+of one costs. A per-row query would produce identical output and a growing count,
+which is exactly the bug a shape-based test cannot see.
+
+A note on the absolute number, because it is not small: Prisma resolves each nested
+relation with its own statement rather than joining, so a "handful of queries" here
+means roughly a dozen. The property that matters — and the one the tests pin — is
+that the number is bounded by the *shape of a ride* rather than by how many rides
+were asked for.
+
+### Commands
+
+```bash
+npm run db:migrate      # applies 13-read-api.sql (idempotent, safe to re-run)
+npm test                 # unit + integration
+npm run test:unit --workspace server         # the rules and the DTOs, with no database
+npm run test:integration --workspace server  # the reads over HTTP, the ownership, the query counts
+curl localhost:4000/api/docs                 # the OpenAPI document
+```
+
+### What is deliberately not here
+
+**No passenger cancellation, no driver cancellation, no no-show handling, no
+payments or refunds, no live GPS, no WebSockets or notifications, no ratings, no
+admin workflows and no frontend code.** The read APIs add no write of their own:
+`POST`, `PUT`, `PATCH` and `DELETE` against a read path are `404`, and a test
+asserts it.
+
+Two limitations worth naming. Everything is **polling**: there is no push, so a
+client learns about a pickup by asking, and the honest interval is a few seconds.
+And the read APIs report the plan rather than the road — an arrival is a stop being
+marked `ARRIVED`, never a verified position, until a GPS milestone makes that a
+claim rather than a statement.
+
+
+## The passenger's app
+
+The first frontend milestone: the **passenger** half of the product, end to end. Sign
+in, choose two places, see a price, request the ride, and watch it.
+
+```bash
+npm run db:up
+npm run db:migrate
+DEMO_SEED_PASSWORD='<pick one>' npm run db:seed   # creates the demo accounts
+npm run dev                                       # API on :4000, client on :3000
+```
+
+| Screen | URL | What it does |
+| ------ | --- | ------------ |
+| Redirect | `/` | A passenger goes to `/ride`; anybody else to `/signin`; an unreachable API to `/status` |
+| Sign in | `/signin` | `POST /auth/login` — signed-in passengers are redirected on |
+| Sign up | `/signup` | `POST /auth/register` with `role: PASSENGER` — creates the account *and* signs in |
+| Request | `/ride` | `GET /location/zones`, `GET /location/points`, `POST /fare-quotes`, `POST /ride-requests` |
+| Track | `/track` | `GET /passengers/me/current-ride`, polled every 5 seconds |
+| Status | `/status` | The scaffold's diagnostics page: health, database latency, and the seeded accounts |
+
+### The five rules the client is built on
+
+1. **Nothing takes a user id.** There is no user picker and no passenger id in any
+   body: the HttpOnly cookie identifies the caller and every `/me` path resolves it
+   on the server.
+2. **The request is quote-first.** `POST /fare-quotes` returns an immutable quote the
+   passenger owns; `POST /ride-requests` is created *from* it and takes only
+   `{ fareQuoteId }` plus a required `Idempotency-Key` header (8–128 characters).
+   The key identifies one **intent**, not one attempt — a retry that generates a fresh
+   key creates a second ride.
+3. **The screen submits the quote it is showing.** A quote is priced at an instant by
+   a traffic profile, so quoting again at submit time can return a different number
+   from the one on screen. The panel therefore quotes once, keeps the `quoteId`, and
+   submits it. `requestRide()` in the API layer — which quotes and requests in one
+   call — is deliberately *not* used by a screen that has already displayed a price.
+4. **No rule is re-implemented.** `stage` and `nextAction` are computed on the server
+   from the ride's own timestamps; the client renames them for display. There is no
+   `if (status === "MATCHED" && !departedAt)` anywhere, no fare arithmetic, and money
+   stays the exact decimal string the API sent (`Number("130.63")` is a binary float
+   and is how a paisa goes missing).
+5. **The guard runs on the server.** `src/lib/session.js` resolves the session while
+   the page renders, so protected markup is never shipped to a browser that should
+   not see it. No `page.js` is a client component; only the pieces that collect input
+   or poll are.
+
+### Tracking is polling, and stops when the ride does
+
+There is no push in this project, so the tracker asks. The interesting part is how:
+
+* A **recursive `setTimeout`**, not `setInterval` — an interval lets a slow request
+  stack up behind the next tick, so the screen shows the answer to a question asked
+  four polls ago.
+* **It stops when the ride is over.** `GET /passengers/me/current-ride` answers with
+  an *active* ride (`WAITING`, `MATCHED`, `IN_PROGRESS`) or `200 { ride: null }`. A
+  ride that reached `COMPLETED` or `CANCELLED` therefore arrives as `null` and there
+  is nothing left to poll for.
+* **A hidden tab pauses**, and re-checks the moment it becomes visible.
+* **A failed poll keeps the last good ride** and says the update failed, because the
+  API being briefly unreachable is not the same as the ride disappearing.
+
+`null` does **not** say which way the ride ended. The screen says "this ride is no
+longer active" and shows the last things it knew; calling it completed or cancelled
+would be a guess about somebody's money. Distinguishing them needs
+`GET /passengers/me/rides/:id`, which is a later milestone.
+
+### What is deliberately not here
+
+**No driver screens, no pooling screens, no history screen, no map, no realtime
+socket, no passenger or driver cancellation, no payment and no admin workflow.** The
+server supports all of them; this client calls only the passenger endpoints it needs,
+and the header links only to the two screens that exist.
+
+Two more honest limitations. The client has **no test suite** — `npm run lint` and
+`npm run build` are its automated checks, and the server's 1123 tests are what pin
+the contract it renders. And `GET /api/users` is still public and unauthenticated,
+kept that way so `/status` can list the seeded accounts.
 
 
 ## Tests
@@ -1488,23 +2382,35 @@ npm run test:integration --workspace server
 
 Tests use Node's built-in runner (`node --test`) — no extra dependencies. The integration suites run against the real PostgreSQL database from `DATABASE_URL`, apply `server/db/*.sql` and the seed themselves, and clean up after themselves; the database must be reachable (`npm run db:up`). Constraint tests run inside rolled-back transactions.
 
-Coverage highlights: the PostGIS extension and the real spatial column types; the GiST spatial indexes; that coordinates are stored longitude-first; `ST_DWithin` proximity answering in metres with a distant point correctly excluded; the seed totals, per-zone point counts, correct zone membership and idempotency; the coordinate bounds; and -- for the graph -- no isolated vertex, one weakly connected component, every zone linked to another, edge endpoints aligned with their vertices, edge distance matching `ST_Length`, and the direction / duration / fare-weight invariants. It also asserts that the superseded `/api/transport/*` endpoints are gone, and that `/api/location/*` still exposes no routing of its own. Routing, pricing, ride requests, dispatch and shared matching are covered by their own suites -- see [Routing](#routing), [Fare quotes](#fare-quotes), [Ride requests](#ride-requests), [Driver dispatch and pools](#driver-dispatch-and-pools) and [Pool-first shared matching](#pool-first-shared-matching) for the lists.
+Coverage highlights: the PostGIS extension and the real spatial column types; the GiST spatial indexes; that coordinates are stored longitude-first; `ST_DWithin` proximity answering in metres with a distant point correctly excluded; the seed totals, per-zone point counts, correct zone membership and idempotency; the coordinate bounds; and -- for the graph -- no isolated vertex, one weakly connected component, every zone linked to another, edge endpoints aligned with their vertices, edge distance matching `ST_Length`, and the direction / duration / fare-weight invariants. It also asserts that the superseded `/api/transport/*` endpoints are gone, and that `/api/location/*` still exposes no routing of its own. Routing, pricing, ride requests, dispatch, shared matching, shared fares, the driver's trip and the read APIs are covered by their own suites -- see [Routing](#routing), [Fare quotes](#fare-quotes), [Ride requests](#ride-requests), [Driver dispatch and pools](#driver-dispatch-and-pools), [Pool-first shared matching](#pool-first-shared-matching), [Shared fares](#shared-fares), [The driver's trip](#the-drivers-trip) and [Reading a ride](#reading-a-ride) for the lists.
 
-Each milestone's suite also pins the boundary of the next one: the fare suite asserts which tables exist and that nothing shared, seated or paid does, and the matching suite asserts that no shared fare and no trip operation is reachable, and that a pool that has started is never matched into.
+Each milestone's suite also pins the boundary of the next one: the fare suite asserts which tables exist and that nothing shared, seated or paid does, and the matching suite asserts that no shared fare and no trip operation is reachable, and that a pool that has started is never matched into. The shared-fare suite pins the same boundary one step further on: no payment, wallet, payout or settlement endpoint exists, and a fare is never finalized. The trip suite pins the last of it: no payment, wallet, payout or settlement endpoint is reachable, no passenger-side pick-up, drop-off or completion exists, and after a whole journey the counts of cancelled pools, skipped stops and cancelled or no-show members are all still zero.
 
 The matching suites are split the way the rules are. `test/unit/matching.rules.test.js` covers insertion positions, stop orders, occupancy, arrival arithmetic, the limits, scoring and the full tie-break, with a fixture whose distances are literal metres so the numbers can be checked by hand. `test/integration/matching.integration.test.js` covers the candidate query and its exclusions, the PostGIS shortlist and what proximity does *not* buy, the offer lifecycle over HTTP, the acceptance transaction, and the races -- including a pool's last seat contended by two requests at once.
+
+The trip suites are split the same way. `test/unit/trip.rules.test.js` covers, with no database at all, the departure requirements, the stop order (including why a shared corner is two consecutive stops and neither can be skipped), every arrival, pickup, start, drop-off and completion requirement by name, the three decisions and the order they are asked in, the passenger stages, the passenger's next action, and `allowedActions` offering an action exactly when its own decision would be `APPLY`. `test/integration/trip.integration.test.js` drives the whole lifecycle over HTTP against the real database: ownership (another driver's pool is a `404` on all six endpoints, a passenger's is a `403`), departure and what it closes and freezes, the stop-order refusals, arrival, collecting at a shared corner, starting with a later passenger still `MATCHED`, per-passenger completion while the pool carries on, completion and the driver's release, retries (asserting by `deepStrictEqual` that no timestamp and no event moved), two commands at once, and what the passenger sees -- including that their `trip` block leaks nobody else's plan.
+
+The read-API suites are split the same way again. `test/unit/timeline.rules.test.js` pins the event mapper -- every dispatch event invisible to a passenger, every ride event invisible to a driver, an unknown event type invisible to everybody, and an entry's keys fixed so a payload cannot creep in. `test/unit/passenger-ride.serializer.test.js` and `test/unit/driver-ride.serializer.test.js` assert each DTO's exact key set against fixtures that *carry* the fields they must not publish (a co-passenger's email, a fingerprint, a per-passenger fare), so a serializer that started reading one fails rather than leaking. `test/unit/openapi.test.js` reads the route files and asserts that `openapi.yaml` documents every path the router mounts and no path it has stopped mounting -- the drift that actually happens to a spec. The integration suites then drive real pools over HTTP: `passenger-read-api.integration.test.js` covers the current ride, the history, the detail, ownership between two passengers who have really ridden, filters, pagination stability with equal timestamps, timeline privacy against the real `ride_events` rows, and **counts the queries Prisma issues** to prove a page of ten costs what a page of one costs. `driver-ride-history.integration.test.js` covers the same ground for a driver, with two drivers and their own pools: ordering, the shared-corner plan, pool fare totals with no per-passenger amount, another driver's pool as a `404`, and that an offline driver is left out of the dispatch search until they come back online.
+
+One fixture rule the trip milestone imposed on the older suites is worth recording, because it was the source of a suite-wide failure that looked like a bug in the code: a pooled fare is priced at the instant the plan changes, and a passenger's detour is measured against the duration **their own quote** froze. A fixture that pins a quote's departure to a fixed hour therefore prices it under whatever traffic profile that hour carries, while the detour is measured *now* -- so the same fixture passes at noon and fails at 17:00. Every fixture that creates a quote and then joins a pool now quotes at `new Date()` (`planNow()` in the matching, fare and trip suites), which is what a real passenger does.
+
+The shared-fare suites are split the same way. `test/unit/pool-fare.rules.test.js` covers who is on board for which leg, what a leg costs, how a leg is split and how the residual units are handed out, the two caps and the minimum fare's precedence, and the totals identity -- all with amounts that can be checked by hand, and with an exhaustive split table asserting that shares sum to the leg cost for every amount and every passenger count. `test/integration/pool-fare.integration.test.js` covers the ledger: one CURRENT calculation per pool and one per plan version, superseding rather than overwriting, the write-once and append-only triggers, idempotent recalculation, a stale version refused with a `409`, a join rolled back when the pricing is broken, two recalculations racing to one answer, the two protections biting when a policy changes mid-pool, and the passenger API's privacy. Between them they name the milestone's numbered categories `1`--`42` and `44`--`46`; category `43` -- that the authentication, routing, fare, request, dispatch, pool and matching suites still pass -- is the `npm test` gate itself, and the two suites that would break it are the ones they changed.
+
+The passenger frontend milestone adds **no tests of its own**, and that is deliberate rather than unfinished: the client is JavaScript with no test runner, and everything it renders -- the quote, the `stage`, the `nextAction`, the DTO's exact field set -- is pinned by the server suites those sections describe. What the client *is* checked by is `npm run lint` (ESLint with the Next config) and `npm run build` (a real Next build, which fails on an unresolved import, a client component that imported the server-only guard, or a page that used a synchronous `cookies()`), plus the full server suite, which must stay green because the client renders its answers.
 
 ## Next steps
 
 - Decide how schema changes are reviewed now that Prisma is in place: keep the idempotent `server/db/*.sql` files as the source of truth (the current setup, and what preserves the `CHECK` constraints, the partial unique index and the GiST indexes Prisma cannot model), or move fully to Prisma Migrate and express those another way.
-- Build the trip on top of matched pools: driver arrival, trip start, passenger pickup and drop-off, trip completion. The transitions (`MATCHED -> IN_PROGRESS -> COMPLETED`, `ASSIGNED -> PICKED_UP -> DROPPED_OFF`) and the events are defined and enforced already, and a pool whose stops are collected can move out of `FORMING`; what is missing is the endpoints, the rules about who may call them, and the matching cut-off that a started pool implies. The eligibility rule is already in one place (`ELIGIBLE_POOL_STATUSES`).
-- Price sharing. Every passenger currently keeps the solo fare their own quote froze, and `match` never reads a price. Shared fares need a policy (how the saving is split, what happens when somebody is delayed, what a cancellation in a pool costs) before they need code, and a pool is the natural scope for the ledger.
-- Decide what happens to a pool when one of its members cancels after being matched. Cancelling a matched request is refused today, which is the honest answer while a pool has no trip, but it cannot stay that way once a driver is driving towards somebody.
+- Build the trip on top of matched pools: driver arrival, trip start, passenger pickup and drop-off, trip completion. *Done -- see [The driver's trip](#the-drivers-trip).* The transitions (`MATCHED -> IN_PROGRESS -> COMPLETED`, `ASSIGNED -> PICKED_UP -> DROPPED_OFF`, `FORMING -> DRIVER_EN_ROUTE -> ARRIVED -> IN_PROGRESS -> COMPLETED`) and the events are implemented end to end, the pool is closed to matching by its own departure, and the fare is frozen in the same transaction.
+- Settle the fares once that trip exists. *Done -- departure finalizes the pool's `CURRENT` `pool_fare_calculations` row (`status = FINALIZED`, `finalized_at`), and a ride cannot start under an unfinalized fare.* A *second* rule version is still what a post-trip adjustment would need, because a settlement that silently changed `pool-leg-share-v1`'s answer would be a re-pricing of money already owed.
+- Decide what a cancellation inside a matched pool costs. Cancelling a matched request is refused today, which is the honest answer while a pool has no trip and no money has changed hands; once fares are charged, a cancellation needs a policy (who keeps the seat, what the remaining passengers are charged, whether a fee applies) before it needs code. `passenger_fare_allocations.previous_pooled_fare_cap` is where the remaining passengers' ceilings would come from. The same milestone is what would close a journey a driver abandoned: today a pool that is never completed stays `IN_PROGRESS` and its fare stays `FINALIZED`, with no operation that could end it.
+- Prove where the driver is. The trip records that a driver reached a stop and never checks that they were there; a GPS milestone is what would make the arrival a claim rather than a statement, and it would need a tolerance policy and an "the driver is not moving" rule before it needed code.
+- Charge and pay out. Nothing collects money or pays a driver, and a fare is a number until a payment milestone decides otherwise; the ledger is deliberately shaped so that settlement is a new operation over existing rows rather than a change to how fares are calculated.
 - Run the sweeps on a schedule. `npm run ride-requests:expire --workspace server` and `npm run dispatch:sweep --workspace server` are the operations; nothing calls them yet, so requests and offers are cleaned up when someone runs them.
 - Consider time-dependent profiles *within* a journey (the current router picks one profile from the departure instant and applies it to the whole route), which needs per-second costs and a time-dependent router.
-- Authenticate the client: send the auth cookie from the Next.js app, then tighten `GET /api/users`, which is still public so the demo page keeps rendering. `POST /api/routes/estimate` already requires a session, so the client needs to carry the cookie before it can call it.
+- Authenticate the client: send the auth cookie from the Next.js app, then tighten `GET /api/users`, which is still public so the demo page keeps rendering. *Half done -- the client carries the cookie and every passenger screen is guarded on the server; `GET /api/users` is still public, and `/status` is why.* `POST /api/routes/estimate` already requires a session, so the client needs to carry the cookie before it can call it.
 - Add email verification and password reset. Sign-up currently accepts any address a caller supplies, so nobody proves they own the email they register with.
 - Rate-limit `POST /api/auth/login` and `POST /api/auth/register`. No limiter is installed yet, so password guessing and bulk sign-ups are unthrottled.
 - JWT logout cannot revoke a token before it expires. Add a token denylist (or move to opaque server-side sessions) if immediate revocation becomes a requirement.
 - Add validation (e.g. `zod`) for request bodies once write endpoints exist.
-- Add Playwright coverage for the client.
+- Add Playwright coverage for the client. It has none today: `npm run lint` and `npm run build` are its only automated checks, and every behaviour it renders is pinned indirectly by the server suites.
