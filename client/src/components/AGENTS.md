@@ -1,9 +1,9 @@
 # `client/src/components/` — the shared pieces
 
-Three files of presentational primitives, and one folder (`passenger/`) of the
-components that actually do something. The split is the point: everything in *this*
-folder is a pure function of its props, and everything that holds state, fetches or
-decides lives one level down.
+Three files of presentational primitives, and three folders of components that
+actually do something. The split is the point: everything in *this* folder is a pure
+function of its props, and everything that holds state, fetches or decides lives one
+level down, under the role it belongs to.
 
 | File | What it is |
 | ---- | ---------- |
@@ -11,15 +11,26 @@ decides lives one level down.
 | `status-chip.js` | `Chip`, `RideStatusChip`, `Labeled`, `PlaceLine` |
 | `async-state.js` | `Loading`, `EmptyState`, `ErrorState`, `ForbiddenState` |
 
+| Folder | What lives there |
+| ------ | ---------------- |
+| `auth/` | Signing in and out — belongs to neither role. See `auth/AGENTS.md` |
+| `passenger/` | The passenger's screens. See `passenger/AGENTS.md` |
+| `driver/` | The driver's console. See `driver/AGENTS.md` |
+
 ## Why it matters
 
 * **There is no component library, and adding one would be a dependency for a
   styling problem.** Tailwind is already here; these are the repeated combinations
-  worth naming once, so a screen's markup reads as structure rather than as
-  utility classes.
-* **Nothing here knows about rides.** No component in this folder imports
-  `passenger-api.js`, reads a context, or holds state. That is what makes them
-  usable from a Server Component and a Client Component alike.
+  worth naming once, so a screen's markup reads as structure rather than as utility
+  classes.
+* **Nothing here knows about rides.** No component in this folder imports an API
+  module, reads a context, or holds state. That is what makes them usable from a
+  Server Component and a Client Component alike.
+* **A component goes in a role folder, not in this one, the moment it knows anything.**
+  The test is whether it would still make sense with the roles swapped: a `Panel`,
+  a `Chip` and a `Loading` would, which is why they are here; a `RideStatusChip`
+  would not, which is why it is a thin wrapper over `Chip` rather than a change to
+  it.
 * **The four async states are components, not conventions.** This client talks to a
   separate process over HTTP, so "the API is not running", "the seed is missing",
   "the session expired" and "not yours (404)" are ordinary occurrences rather than

@@ -1,21 +1,23 @@
 import { SignUpForm } from "@/components/passenger/sign-up-form";
 import { Heading, PageShell } from "@/components/ui";
-import { PASSENGER_HOME, redirectIfSignedIn } from "@/lib/session";
+import { redirectIfSignedIn } from "@/lib/session";
 
 export const metadata = { title: "Create account — TeslaB" };
 
 /**
- * The sign-up screen.
+ * Passenger sign-up.
  *
- * Guarded by the same rule as `/signin`, in the opposite direction: a passenger
- * who already has a session belongs on the ride screen, not on a form that would
- * create a second account.
+ * Guarded by the same rule as `/signin`, in the opposite direction: somebody who
+ * already has a session belongs on **their own** home, not on a form that would
+ * create a second account. No destination is named, so a signed-in driver opening
+ * this page goes to `/driver` rather than being routed through the passenger's
+ * screen.
  *
  * There is nothing to pass in. The API signs the new account in as part of the
  * registration, so the form has no second step and no state to carry across.
  */
 export default async function SignUpPage() {
-  await redirectIfSignedIn({ to: PASSENGER_HOME });
+  await redirectIfSignedIn();
 
   return (
     <PageShell className="flex flex-col items-center justify-center gap-6">

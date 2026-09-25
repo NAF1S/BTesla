@@ -1,16 +1,19 @@
-# `client/src/components/passenger/` — the screens that do something
+# `client/src/components/passenger/` — the passenger's screens
 
-Four components, all `'use client'`. This is the only folder in the client that
-holds state, and it is deliberately the only one that imports
+Three components, all `'use client'`. This folder is the passenger's half of the
+client, and it is deliberately the only passenger-side folder that imports
 `lib/passenger-api.js`.
 
 | File | What it is |
 | ---- | ---------- |
-| `sign-in-form.js` | Email and password -> `POST /auth/login` |
-| `sign-up-form.js` | Name, email, password -> `POST /auth/register` |
-| `sign-out-button.js` | -> `POST /auth/logout`, then back to `/signin` |
+| `sign-up-form.js` | Name, email, password -> `POST /auth/register` as a `PASSENGER` |
 | `ride-request-panel.js` | Two locations -> a quote -> a ride request |
 | `ride-tracker.js` | The current ride, polled every few seconds |
+
+Signing in and out used to live here. They moved to `../auth/` when the driver's
+screens arrived and needed them too: a person signs in **before** they are a
+passenger or a driver, so those two components belong to neither folder. If you are
+looking for `sign-in-form.js`, it is one level up.
 
 ## Why these are client components and the pages are not
 
@@ -44,25 +47,30 @@ on the smallest file that needs it — never on a page, and never on a primitive
    `Number("130.63")` is a binary float and is how a paisa goes missing. No component
    adds up a fare.
 
-## The tracker's polling, and why it is shaped that way
+## The tracker's polling
 
-There is no push in this project, so polling is the honest transport. How it is done
-is the interesting part, and each decision is load-bearing:
+There is no push in this project, so polling is the honest transport. *How* to ask —
+a recursive `setTimeout` rather than an interval, one request in flight, cancel on
+unmount — lives in `../../lib/use-polling.js`, because the driver's console needs
+exactly the same rules and two copies would drift.
 
-* **A recursive `setTimeout`, not `setInterval`.** An interval lets a slow request
-  stack up behind the next tick, so the screen shows the answer to a question asked
-  four polls ago. This waits for the reply before scheduling the next question.
-* **It stops when the ride is over**, because `GET /passengers/me/current-ride`
-  answers with an *active* ride or nothing at all. A ride that ends arrives as
-  `null`, and there is nothing left to learn.
-* **It pauses on a hidden tab** and re-checks the moment the tab becomes visible —
-  a background tab does not need four requests a minute, but the passenger looking
-  at it again should not be up to an interval behind.
+*Whether* to keep asking is the tracker's own decision, and it is one case: the
+endpoint answers with an *active* ride or nothing at all, so a ride that ends
+arrives as `null` and there is nothing left to learn. That is what stops the loop,
+and it is why "stop polling at completed or cancelled" needs no status check here.
+
+The tracker's cadence differs from the driver console's in one respect: it **stops
+entirely** in a background tab, because a ride nobody is looking at has nothing to
+keep current. The console cannot do that — for a driver, reading the offers is what
+keeps them dispatchable — so it slows down instead. Where the two disagree is exactly
+where the shared hook takes a parameter.
+
+Two more things the tracker does itself, both about honesty rather than traffic:
+
 * **A failed poll keeps the last good ride.** The API being briefly unreachable is
   not the same as the ride disappearing, and blanking the screen would be a worse
-  lie than a note saying the last update failed.
-* **The timer is cleared and a flag set on unmount**, so a slow reply cannot
-  `setState` on a component that is gone.
+  lie than a note saying the last update failed. A failure is therefore *not* a
+  reason to stop asking either.
 * **Times come from a client clock that starts as `null`.** The server renders the
   absolute time, the first client render agrees with it, and the relative age appears
   once the first poll has a clock. Rendering "58 seconds ago" on the server is a
@@ -78,10 +86,10 @@ answer needs the ride-detail endpoint, which is a later milestone.
 
 ## Depends on / depended on by
 
-Depends on `../../lib/passenger-api.js` (which owns every URL), `../../lib/format.js`
-and `../../lib/ride-status.js` for presentation, and `../ui.js`,
-`../status-chip.js`, `../async-state.js` for markup. Depended on by
-`../../app/{signin,signup,ride,track}/page.js` and by `../../app/../layout.js`.
+Depends on `../../lib/passenger-api.js` (fares and rides), `../../lib/location-api.js`
+(the two place lists), `../../lib/format.js`, `../../lib/ride-status.js` and
+`../../lib/use-polling.js`, plus `../ui.js`, `../status-chip.js` and
+`../async-state.js` for markup. Depended on by `../../app/{signup,ride,track}/page.js`.
 
 **Never import `lib/session.js` from a file in this folder.** It uses
 `next/headers` and only works on the server; a client component that imports it

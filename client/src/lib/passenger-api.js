@@ -1,13 +1,17 @@
 import { apiFetch, apiPost } from "./api";
 
 /**
- * Every backend call this milestone's screens make, in one place.
+ * Every backend call a **passenger's** screen makes, in one place.
  *
  * The point of this module is that **a screen never builds a URL**. A component
  * asks for "the zones" or "a quote between these two points" and gets a typed
  * object or an `ApiError`; the paths, the verbs, the body shapes and the header
  * names live here. That is what keeps the frontend thin, and it is what makes the
  * API's conventions visible in one file instead of scattered across pages.
+ *
+ * Signing in and out is deliberately **not** here -- it belongs to the person, not
+ * to the role, and lives in `auth-api.js`. This module is only what a passenger
+ * can ask for once they are one.
  *
  * ---------------------------------------------------------------------------
  * IDENTITY IS NEVER SENT
@@ -27,94 +31,6 @@ import { apiFetch, apiPost } from "./api";
  * two here rather than in a component is what lets the screen say "request a ride
  * between these two places" and stay readable.
  */
-
-// ---------------------------------------------------------------------------
-// Authentication. The session is an HttpOnly cookie, so there is no token to
-// store, read or attach — the browser holds it and JavaScript never sees it.
-// ---------------------------------------------------------------------------
-
-/**
- * Signs a passenger in. Resolves to the signed-in user.
- *
- * Every rejected attempt answers the same 401 and the same message, so the UI
- * cannot tell an unknown account from a wrong password — and must not try to.
- *
- * @param {{ email: string, password: string }} credentials
- * @returns {Promise<import("./types").SessionUser>}
- */
-export const signIn = async ({ email, password }) => {
-  const { user } = await apiPost("/auth/login", { email, password });
-  return user;
-};
-
-/**
- * Creates a passenger account and signs in, in one call.
- *
- * `role` is pinned to `PASSENGER` here rather than accepted from a caller: this
- * is the passenger client, and a sign-up screen with a role selector would be a
- * driver screen in disguise.
- *
- * @param {{ name: string, email: string, password: string }} account
- * @returns {Promise<import("./types").SessionUser>}
- */
-export const signUp = async ({ name, email, password }) => {
-  const { user } = await apiPost("/auth/register", {
-    name,
-    email,
-    password,
-    role: "PASSENGER",
-  });
-  return user;
-};
-
-/**
- * Clears the cookie.
- *
- * The API answers `204` and does not require a valid token, so this is safe to
- * call on a stale session and safe to retry.
- *
- * @returns {Promise<void>}
- */
-export const signOut = () => apiPost("/auth/logout");
-
-/**
- * The current user, or `null` when there is no valid session.
- *
- * Used by the server-side guard, which passes the incoming cookie explicitly
- * because a Server Component has no ambient session.
- *
- * @param {{ cookie?: string }} [options]
- * @returns {Promise<import("./types").SessionUser | null>}
- */
-export const getCurrentUser = async ({ cookie } = {}) => {
-  try {
-    const { user } = await apiFetch("/auth/me", { cookie });
-    return user;
-  } catch (error) {
-    // A missing or expired session is the expected answer here, not a failure:
-    // this call exists to ask "is anybody signed in?".
-    if (error.status === 401) return null;
-    throw error;
-  }
-};
-
-// ---------------------------------------------------------------------------
-// Locations. Public endpoints, so they work before sign-in too.
-// ---------------------------------------------------------------------------
-
-/** Every active service area, for grouping the location dropdowns.
- * @returns {Promise<import("./types").Zone[]>}
- */
-export const listZones = () => apiFetch("/location/zones");
-
-/**
- * Every active service point, optionally narrowed to one zone.
- *
- * @param {{ zoneCode?: string }} [options]
- * @returns {Promise<import("./types").ServicePoint[]>}
- */
-export const listServicePoints = ({ zoneCode } = {}) =>
-  apiFetch(`/location/points${zoneCode ? `?zoneCode=${encodeURIComponent(zoneCode)}` : ""}`);
 
 // ---------------------------------------------------------------------------
 // Fares and rides

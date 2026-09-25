@@ -10,23 +10,30 @@ This block is written and re-added by `next dev` — verify at `node_modules/nex
 
 ## What this client is, and is not
 
-The **passenger** app: sign in, choose two places, see a price, request a ride, watch
-it. Seven routes, all dynamic — `/` redirects, `/signin`, `/signup`, `/ride`,
-`/track`, and `/status` (the scaffold's diagnostics page, kept because it is the only
-screen that explains a broken environment).
+**Both halves of the loop**: a passenger asks for a ride, a driver accepts it, the
+passenger's screen changes. Eight routes, all dynamic — `/` redirects, `/signin`,
+`/signup`, `/ride`, `/track`, `/driver`, and `/status` (the scaffold's diagnostics
+page, kept because it is the only screen that explains a broken environment).
 
-There is **no driver UI, no pooling UI, no history screen, no map, no cancellation,
-no payment and no admin screen**. The server supports all of those and documents
-them; this client calls only the passenger endpoints it needs. Nothing here pushes:
-polling is the transport.
+There is **no trip-execution UI, no history screen, no map, no cancellation, no
+payment and no admin screen**. The server supports all of those and documents them;
+this client calls only the endpoints it needs. Nothing here pushes: polling is the
+transport.
 
 Everything above the `END` marker is written and re-added by `next dev`; everything
 below it is ours and survives regeneration.
 
-* The server is the source of truth for what a passenger may do next. Do not compute
-  a transition here: read `stage` and `nextAction` from
-  `GET /api/passengers/me/current-ride` and render them.
-* **That endpoint answers with an *active* ride only**, and `200 { ride: null }`
+**Two roles, one client.** A person signs in once; the role the API reports decides
+which half they get — `/ride` and `/track` for a passenger, `/driver` for a driver.
+Someone signed in as the other role is redirected to their own home rather than to
+the sign-in form, because a form they would immediately re-submit is a loop.
+`src/lib/roles.js` holds that one mapping.
+
+* The server is the source of truth for what either role may do next. Do not compute
+  a transition, a permission or a fare here — read `stage` and `nextAction`
+  (passenger), `canGoOnline`, `canGoOffline`, an offer's `expired` and
+  `allowedActions` (driver) and render them.
+* **`current-ride` answers with an *active* ride only**, and `200 { ride: null }`
   otherwise. A ride that reached `COMPLETED` or `CANCELLED` therefore arrives as
   `null`, and the response does not say which. Do not guess; the ride-detail endpoint
   is a later milestone.
@@ -34,13 +41,24 @@ below it is ours and survives regeneration.
   passenger owns, and `POST /api/ride-requests` is created *from* it with a required
   `Idempotency-Key` (8–128 characters, one per intent — not per attempt). A screen
   that has shown a price must submit that quote rather than quoting again.
+* **Reading the driver's offers is a heartbeat.** `lastSeenAt` is refreshed when a
+  driver goes online, moves, reads their offers, or answers one, and a location older
+  than `DISPATCH_LOCATION_FRESHNESS_SECONDS` (300 s) drops them out of dispatch. So
+  the console polls `/me/offers` — in a background tab too, at a slower cadence — and
+  does not poll at all while offline.
+* **Accepting an offer sends no body.** The plan is the one stored when the offer was
+  made. The endpoint posts an offer id and renders the pool that comes back. An offer
+  that is somebody else's is a `404`, the same as one that does not exist.
 * A `404` is the API's way of saying "not yours", so treat it as "gone", not as an
-  error to surface. A `403` only ever means "this account is not a passenger".
+  error to surface. A `403` only ever means "this account is not allowed here".
 * The guard runs on the **server** (`src/lib/session.js`); no `page.js` is a client
-  component. `src/lib/session.js` must never be imported from one.
+  component. `src/lib/session.js` must never be imported from one — which is why the
+  role mapping lives in `src/lib/roles.js`, where both sides can reach it.
 * Auth is the HttpOnly cookie from `POST /api/auth/login`; `src/lib/api.js` proxies
-  `/api/*` through the Next rewrite, so browser requests are same-origin.
+  `/api/*` through the Next rewrite, so browser requests are same-origin. There is no
+  token to store, and no `localStorage` in the client.
 
-See `../README.md` (the API tables and
-[The passenger's app](../README.md#the-passengers-app)) for the full contract, and
+See `../README.md` (the API tables,
+[The passenger's app](../README.md#the-passengers-app) and
+[The driver's console](../README.md#the-drivers-console)) for the full contract, and
 `src/AGENTS.md` for how the three directories divide the work.

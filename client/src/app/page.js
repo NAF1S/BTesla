@@ -1,6 +1,7 @@
 import { redirect } from "next/navigation";
 
-import { PASSENGER_HOME, getSessionUser } from "@/lib/session";
+import { homeForRole } from "@/lib/roles";
+import { getSessionUser } from "@/lib/session";
 
 export const dynamic = "force-dynamic";
 
@@ -9,13 +10,15 @@ export const dynamic = "force-dynamic";
  *
  * Three destinations, and each is a fact rather than a preference:
  *
- *  * a signed-in **passenger** -> the ride screen, which is where the brief says a
- *    signed-in passenger belongs;
- *  * anybody else — including a signed-in **driver** — -> the sign-in screen, which
- *    is where the guard explains that this client is the passenger's;
+ *  * somebody signed in -> **their own** home, from `homeForRole`: a passenger to
+ *    `/ride`, a driver to `/driver`. There is exactly one mapping for this, in
+ *    `lib/roles.js`, because the sign-in form, the guards and this page all need
+ *    the same answer and must never disagree about it;
+ *  * anybody with no home here — an `ADMIN`, or nobody at all — to the sign-in
+ *    screen, which is where the guard explains it;
  *  * **the API being unreachable** -> the diagnostics screen at `/status`, because
  *    that is the one page in this app that can say *why* nothing loaded and what to
- *    start. Sending a visitor to a sign-in form whose own session check will fail
+ *    start. Sending somebody to a sign-in form whose own session check will fail
  *    the same way would be a worse answer than an explanation.
  */
 export default async function Home() {
@@ -27,5 +30,5 @@ export default async function Home() {
     redirect("/status");
   }
 
-  redirect(user?.role === "PASSENGER" ? PASSENGER_HOME : "/signin");
+  redirect(homeForRole(user?.role) ?? "/signin");
 }

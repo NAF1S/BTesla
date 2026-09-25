@@ -1,8 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 
 import { getCurrentRide } from "@/lib/passenger-api";
+import { usePolling } from "@/lib/use-polling";
 import { formatDistance, formatDuration, formatMoney, formatElapsed, formatTime } from "@/lib/format";
 import { MEMBER_STATUS, NEXT_ACTION, PASSENGER_STAGE, POOL_STATUS, STOP_STATUS, isFinished } from "@/lib/ride-status";
 import { Button, Facts, Heading, LinkButton, Notice, Panel } from "@/components/ui";
@@ -13,31 +14,26 @@ import { EmptyState, ErrorState, Loading } from "@/components/async-state";
  * The passenger's live view of their ride.
  *
  * ---------------------------------------------------------------------------
- * POLLING, AND WHY IT IS WRITTEN THIS WAY
+ * POLLING
  * ---------------------------------------------------------------------------
  * There is no push in this project — no WebSockets, no notifications — so the only
- * way to learn that a driver has moved is to ask again. Polling is therefore the
- * honest transport, and the interesting part is doing it without being wasteful or
- * getting it wrong when the component goes away:
+ * way to learn that a driver has moved is to ask again. Polling is the honest
+ * transport.
  *
- *  * **A recursive `setTimeout`, not `setInterval`.** With an interval, a slow or
- *    hanging request stacks up behind the next tick and the screen can be showing
- *    the answer to a question asked four polls ago. This waits for the reply before
- *    scheduling the next question.
- *  * **It stops when the ride is over.** A finished ride is not polled for: the
- *    endpoint answers with an *active* ride only, so a ride that ends arrives as
- *    `null`, and there is nothing left to learn. That is the "stop polling at
- *    completed or cancelled" requirement, and it is also what makes the final
- *    screen stable rather than flickering.
- *  * **It pauses on a hidden tab.** A passenger who switched away does not need
- *    four requests a minute, and a background tab is a battery. Coming back asks
- *    once, immediately, so the screen is never stale for long.
- *  * **It cancels on unmount.** The `cancelled` flag and the cleared timer are not
- *    decoration: without them a slow reply can call `setState` on an unmounted
- *    component, and a timer outlives the page.
- *  * **A failed poll keeps the last good ride.** The API being briefly unreachable
- *    is not the same as the ride disappearing, and blanking the screen would be a
- *    worse lie than a note saying the last update failed.
+ * *How* to ask — a recursive timeout rather than an interval, skipping a hidden
+ * tab, resuming the moment it is looked at, cancelling on unmount, one request in
+ * flight at a time — lives in `usePolling`, because the driver's console needs
+ * exactly the same six rules and two copies of them would drift.
+ *
+ * *Whether* to keep asking is this component's, and it is one case: **the ride is
+ * over, so stop**. The endpoint answers with an *active* ride only, so a ride that
+ * finishes arrives as `null` and there is nothing left to learn. That is also what
+ * makes the final screen stable rather than flickering, and it is why the
+ * "completed or cancelled" requirement needs no status check here.
+ *
+ * A *failed* poll is not that case: the API being briefly unreachable is not the
+ * ride disappearing, so the loop keeps trying and the screen keeps the last good
+ * ride with a note saying the update failed.
  *
  * ---------------------------------------------------------------------------
  * WHAT IS NOT SHOWN
@@ -78,6 +74,19 @@ export function RideTracker({ initialRide = null, pollIntervalMs = POLL_INTERVAL
    */
   const [now, setNow] = useState(null);
 
+  /**
+   * One read. Also the "Try again" button's handler, which is why it is separate
+   * from the polling below.
+   *
+   * Three outcomes, and the difference between the last two matters:
+   *
+   *  * a ride -> `lastRide` and `ride` both move, and the screen stays live;
+   *  * `null` -> there is no active ride. The caller decides whether that means
+   *    "never had one" or "the one they had is over";
+   *  * `undefined` -> the request itself failed. `error` is set and the last good
+   *    ride is left alone, because "the API is briefly unreachable" is not the
+   *    same as "the ride is gone".
+   */
   const load = useCallback(async () => {
     try {
       const current = await getCurrentRide();
@@ -94,59 +103,25 @@ export function RideTracker({ initialRide = null, pollIntervalMs = POLL_INTERVAL
     }
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
-    let timer = null;
-
-    const scheduleNext = () => {
-      timer = setTimeout(tick, pollIntervalMs);
-    };
-
-    async function tick() {
-      if (cancelled) return;
-
-      // A hidden tab gets one more check and then nothing until it is visible
-      // again: the passenger is not looking, so there is nothing to keep current.
-      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
-        scheduleNext();
-        return;
-      }
-
-      const current = await load();
-      if (cancelled) return;
-
-      // Stop when the ride is gone or finished. `undefined` means the request
-      // itself failed, and a failure is not a reason to give up on the ride — the
-      // next tick tries again.
-      if (current === null || (current && isFinished(current.status))) return;
-
-      scheduleNext();
-    }
-
-    // One immediate read, then the cadence. This is what makes a page that was
-    // rendered on the server with `initialRide` also self-correcting.
-    tick();
-
-    return () => {
-      cancelled = true;
-      if (timer) clearTimeout(timer);
-    };
-  }, [load, pollIntervalMs]);
-
   /**
-   * Re-check as soon as the tab comes back.
+   * The polling loop's question, and when to stop asking.
    *
-   * Without this the screen could sit up to a full interval behind, which is
-   * exactly the moment a passenger looks at it.
+   * `usePolling` owns *how* to ask — recursive timeout, hidden tab, unmount — and
+   * this owns *whether to keep asking*, which is the part that differs between the
+   * two screens. Here it stops on the one case that is genuinely terminal: the
+   * server has no active ride for this passenger, so there is nothing left to
+   * learn. A failure is not terminal — the next tick tries again.
    */
-  useEffect(() => {
-    const onVisibility = () => {
-      if (document.visibilityState === "visible") load();
-    };
+  const poll = useCallback(async () => {
+    const current = await load();
 
-    document.addEventListener("visibilitychange", onVisibility);
-    return () => document.removeEventListener("visibilitychange", onVisibility);
+    if (current === null) return false;
+    if (current && isFinished(current.status)) return false;
+
+    return true;
   }, [load]);
+
+  usePolling(poll, { intervalMs: pollIntervalMs });
 
   // "The ride ended" is derived, not stored: there was a ride, and now there is
   // not one. A passenger who never had one gets the empty state instead.

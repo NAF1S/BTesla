@@ -131,7 +131,6 @@
  */
 
 /** The pool's two statuses a passenger is shown. @typedef {"FORMING" | "DRIVER_EN_ROUTE" | "ARRIVED" | "IN_PROGRESS" | "COMPLETED" | "CANCELLED"} PoolStatus */
-
 /** This passenger's own member state in the pool. @typedef {"ASSIGNED" | "PICKED_UP" | "DROPPED_OFF" | "CANCELLED" | "NO_SHOW"} MemberStatus */
 
 /** A driver as a passenger may know them: a first name. @typedef {{ displayName: string | null }} DriverSummary */
@@ -211,6 +210,175 @@
  * @property {{ fareQuoteId: string, fare: string, currency: string, pricingCode: string, pricingVersion: number, distanceMeters: number, durationSeconds: number }} acceptedQuote
  * @property {string} requestedAt
  * @property {string} searchExpiresAt
+ */
+
+// ---------------------------------------------------------------------------
+// The driver slice. Everything below is transcribed from
+// `server/src/serializers/driver.serializer.js`, `pool.serializer.js` and
+// `offer.service.js`'s `toOfferDto`, and is subject to the same rule as
+// everything above: the server wins.
+// ---------------------------------------------------------------------------
+
+/**
+ * A driver's working state. `RESERVED` means they have accepted a ride but not
+ * set off; `ON_RIDE` means a trip is under way. Only `AVAILABLE` is dispatchable.
+ *
+ * @typedef {"OFFLINE" | "AVAILABLE" | "RESERVED" | "ON_RIDE"} DriverAvailabilityStatus
+ */
+
+/**
+ * The driver's own availability.
+ *
+ * `online` is the boolean a switch binds to — false exactly when the status is
+ * `OFFLINE`. `canGoOnline` / `canGoOffline` are separate derived facts and are
+ * what decide whether that switch is usable: a `RESERVED` driver is online and
+ * still may not go offline. Never recompute either from `status`.
+ *
+ * `servicePoint` and `currentServicePoint` are the same place under two names,
+ * published so that a client written against either keeps working; only
+ * `servicePoint` carries the id.
+ *
+ * @typedef {object} DriverAvailability
+ * @property {string} driverProfileId
+ * @property {DriverAvailabilityStatus} status
+ * @property {boolean} online
+ * @property {DriverAvailabilityStatus} operationalStatus
+ * @property {{ code: string, name: string } | null} currentServicePoint
+ * @property {{ id: string, code: string, name: string } | null} servicePoint
+ * @property {{ vehicleId: string, name: string, seatCapacity: number } | null} vehicle
+ * @property {Array<{ vehicleId: string, name: string, seatCapacity: number }>} vehicles
+ * @property {string | null} availableSince
+ * @property {string | null} lastSeenAt
+ * @property {boolean} canGoOnline
+ * @property {boolean} canGoOffline
+ * @property {string} updatedAt
+ */
+
+/** Starting a ride of their own, or joining one they are already driving.
+ * @typedef {"INITIAL_RIDE" | "ADD_PASSENGER"} OfferType
+ */
+
+/** Only `PENDING` may be answered, and only while `expired` is false.
+ * @typedef {"PENDING" | "ACCEPTED" | "REJECTED" | "EXPIRED" | "CANCELLED"} OfferStatus
+ */
+
+/** The closed list the API accepts when a driver declines a ride.
+ * @typedef {"TOO_FAR" | "UNAVAILABLE" | "VEHICLE_ISSUE" | "OTHER"} RejectionReason
+ */
+
+/**
+ * An offer the driver may answer.
+ *
+ * One shape, two kinds. An `INITIAL_RIDE` offer has no pool yet, so it carries
+ * the two places, the approach and the vehicle. An `ADD_PASSENGER` offer proposes
+ * changing a pool the driver is already committed to, so it also carries the plan
+ * as it is (`currentStops`) and as it would become (`proposedStops`), plus what
+ * the detour costs the people already aboard.
+ *
+ * `expired` is the server's own answer to "is this still worth answering" — a
+ * client that compared `expiresAt` with its own clock would be a second copy of
+ * the TTL rule, and would disagree whenever a clock drifted.
+ *
+ * Never present: the passenger's identity beyond a display name, contact
+ * details, the candidate score, or the passenger's fare.
+ *
+ * @typedef {object} DispatchOffer
+ * @property {string} offerId
+ * @property {OfferStatus} status
+ * @property {OfferType} offerType
+ * @property {boolean} expired
+ * @property {string} offeredAt
+ * @property {string} expiresAt
+ * @property {string | null} respondedAt
+ * @property {RejectionReason | null} rejectionReason
+ * @property {string} rideRequestId
+ * @property {{ displayName: string | null } | null} passenger
+ * @property {string | null} ridePoolId
+ * @property {QuoteEndpoint | null} pickup
+ * @property {QuoteEndpoint | null} destination
+ * @property {{ distanceMeters: number, durationSeconds: number } | null} passengerRoute
+ * @property {{ distanceMeters: number, durationSeconds: number } | null} approach
+ * @property {VehicleSummary | null} vehicle
+ * @property {number | null} [poolVersion]
+ * @property {{ seats: number | null, passengers: number, peakOccupancy: number | null }} [capacity]
+ * @property {{ distanceMeters: number | null, durationSeconds: number | null }} [added]
+ * @property {number | null} [pickupWaitSeconds]
+ * @property {number | null} [pickupEtaSeconds]
+ * @property {string | null} [plannedPickupArrivalAt]
+ * @property {number | null} [maxExistingPassengerDetourSeconds]
+ * @property {Array<{ sequence: number, stopType: string, servicePoint: QuoteEndpoint | null }>} [currentStops]
+ * @property {Array<{ sequence: number, stopType: string, servicePoint: QuoteEndpoint | null, isNew: boolean }>} [proposedStops]
+ */
+
+/** One of the six commands a driver performs to drive a pool.
+ * @typedef {"DEPART" | "ARRIVE_AT_STOP" | "PICKUP_PASSENGER" | "START_TRIP" | "DROPOFF_PASSENGER" | "COMPLETE_TRIP"} TripAction
+ */
+
+/** One stop on the driver's plan, in the order it is driven.
+ * @typedef {object} DriverPoolStop
+ * @property {string} stopId
+ * @property {number} sequence
+ * @property {"PICKUP" | "DROPOFF"} stopType
+ * @property {"PENDING" | "ARRIVED" | "COMPLETED" | "SKIPPED"} status
+ * @property {QuoteEndpoint | null} servicePoint
+ * @property {string | null} plannedArrivalAt
+ * @property {string | null} actualArrivalAt
+ * @property {string | null} completedAt
+ */
+
+/**
+ * One passenger in the driver's pool.
+ *
+ * `passenger.displayName` is a first name and nothing else — no profile id, no
+ * contact details. That is deliberate on the server's side: a driver needs
+ * something to greet the rider with, not a way to look them up.
+ *
+ * @typedef {object} DriverPoolMember
+ * @property {string} poolMemberId
+ * @property {string} rideRequestId
+ * @property {MemberStatus} status
+ * @property {RideRequestStatus | null} rideStatus
+ * @property {string | null} matchedAt
+ * @property {string | null} pickedUpAt
+ * @property {string | null} droppedOffAt
+ * @property {{ displayName: string | null }} passenger
+ * @property {QuoteEndpoint | null} pickup
+ * @property {QuoteEndpoint | null} destination
+ * @property {DriverPoolStop[]} stops
+ */
+
+/**
+ * The pool the driver is committed to, as `GET /drivers/me/current-pool` reports
+ * it.
+ *
+ * `allowedActions` lists exactly the trip commands that would succeed right now,
+ * computed by the same rules the commands consult. This milestone shows them and
+ * does not offer them — the trip execution UI is the next one — so the screen can
+ * say what comes next without being able to do it yet.
+ *
+ * `pricing` is a boolean and a version, never an amount: the passenger's fare is
+ * between the passenger and the platform, and showing it to the driver is a
+ * product decision this project has not taken.
+ *
+ * @typedef {object} DriverPool
+ * @property {string} poolId
+ * @property {PoolStatus} status
+ * @property {number} version
+ * @property {number} capacity
+ * @property {VehicleSummary | null} vehicle
+ * @property {{ distanceMeters: number | null, durationSeconds: number | null, stopCount: number }} plan
+ * @property {DriverPoolStop[]} stops
+ * @property {DriverPoolStop | null} nextStop
+ * @property {TripAction[]} allowedActions
+ * @property {{ finalized: boolean, finalizedAt: string | null, poolVersion: number | null }} pricing
+ * @property {string | null} acceptedAt
+ * @property {string | null} departedAt
+ * @property {string | null} driverArrivedAt
+ * @property {string | null} startedAt
+ * @property {string | null} completedAt
+ * @property {string | null} cancelledAt
+ * @property {DriverPoolMember[]} members
+ * @property {Array<{ sequence: number, eventType: string, actorType: string, createdAt: string }>} events
  */
 
 export {};

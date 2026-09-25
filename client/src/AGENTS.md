@@ -5,46 +5,72 @@ App Router, JavaScript (no TypeScript), Tailwind v4. Three directories:
 | Directory | Holds |
 | --------- | ----- |
 | `app/` | The routes, the layout and the global styles — see `app/AGENTS.md` |
-| `lib/` | The API client, the guard and the formatters — see `lib/AGENTS.md` |
-| `components/` | The presentational primitives and the passenger screens — see `components/AGENTS.md` |
+| `lib/` | The API modules, the guard, the polling hook and the formatters — see `lib/AGENTS.md` |
+| `components/` | The presentational primitives, and one folder per role — see `components/AGENTS.md` |
 
 ## Why it matters
 
-This is the only client of the API in the repository. It implements the **passenger**
-half of the product: sign in, choose two places, see a price, request a ride, watch
-it. Everything else the server supports — driver availability, offers, the driver's
-trip, pooling, history — is documented and tested on the server and has no screen
-here yet.
+This is the only client of the API in the repository, and it now covers **both halves
+of the loop**: a passenger requests a ride, a driver accepts it, and the passenger's
+screen changes.
+
+| Half | Screens |
+| ---- | ------- |
+| Passenger | sign up, choose two places, see a price, request a ride, watch it |
+| Driver | sign in, go online, see the offer, accept or decline, see the pool |
+
+Neither half is complete, and what is missing is deliberate: the trip controls (set
+off, arrive, collect, start, drop off, finish), history, maps, cancellation, payment
+and anything administrative. The server supports all of it and is tested for it; the
+client does not call it yet.
 
 That makes this directory the place where the API contract gets tested by use. When
 something here is awkward to write, the contract is often the thing to fix.
 
-## The one architectural decision, made once
+## The two architectural decisions, made once
 
-**The guard is on the server, and the state machine stays there too.**
+**The guard is on the server, and it is role-aware.**
 
 * Who is asking is resolved while the page renders (`lib/session.js`), so protected
-  markup is never sent to a browser that should not have it.
-* What a passenger may do next is read from the API (`stage`, `nextAction`), never
-  derived. `lib/ride-status.js` renames those values for a screen and derives
-  nothing; the components decide presentation, not rules.
+  markup is never sent to a browser that should not have it. `requireRole` takes the
+  role the screen is for.
+* Someone signed in **as the other role** is sent to their own home, not to the
+  sign-in form. That matters more than it sounds: sending a signed-in driver to
+  `/signin` would show a form they would immediately submit, only to be sent
+  back — a loop. `lib/roles.js` holds the single mapping that the guard, the sign-in
+  form and `/` all use.
+
+**The state machine stays on the server.**
+
+* What a passenger may do next is read from the API (`stage`, `nextAction`), and what
+  a driver may do is read from it too (`canGoOnline`, `canGoOffline`, `expired`,
+  `allowedActions`). `lib/ride-status.js` and `lib/driver-status.js` rename those
+  values for a screen and derive nothing.
+* Where a screen has to decide *which control to draw*, it uses a published fact —
+  `online` — rather than a status it would have to interpret. Where the fact it needs
+  is missing ("may I move?" has no boolean), the control is left out and the DTO gap
+  is documented rather than guessed at.
 * Interactive pieces are the smallest files that need to be: no `page.js` in `app/`
   is a client component.
 
 ## What not to do here
 
-* **Do not compute state transitions in the client.** `allowedActions` (driver) and
-  `nextAction` (passenger) are computed on the server from the state, so a button the
+* **Do not compute state transitions, permissions or fares in the client.**
+  `allowedActions` (driver), `nextAction` (passenger), `canGoOnline` / `canGoOffline`
+  and an offer's `expired` are computed on the server from the state, so a button the
   server would refuse is never rendered. Reimplementing the rules in JavaScript is how
   the two drift apart.
 * **Do not compute a fare.** Money is an exact decimal string from the API; the client
   displays it. `Number("130.63")` is a binary float and is how a paisa goes missing.
 * **Do not read ids from anywhere but a previous response.** There is no user picker
-  and no passenger id to send: every `/me` endpoint already knows who is asking.
+  and no passenger or driver id to send: every `/me` endpoint already knows who is
+  asking.
 * **Do not put the token in `localStorage`.** It is an HttpOnly cookie by design; the
   browser holds it and JavaScript never sees it.
 * **Do not import `lib/session.js` from a client component.** It uses `next/headers`
   and will fail the build.
+* **Do not write your own polling loop.** `lib/use-polling.js` holds the rules, and
+  the two live screens differ only in the cadence they pass it.
 * **Do not add a font or a second styling system** without reading the Tailwind v4
   notes first: this Next version has breaking changes, and `client/AGENTS.md` says
   where to look.

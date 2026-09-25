@@ -4,7 +4,8 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
-import { signUp } from "@/lib/passenger-api";
+import { signUp } from "@/lib/auth-api";
+import { ROLE } from "@/lib/roles";
 import { Button, Field, Input, Notice, Panel } from "@/components/ui";
 
 /**
@@ -43,7 +44,7 @@ export function SignUpForm() {
     setError(null);
 
     try {
-      await signUp({ name: name.trim(), email: email.trim(), password });
+      await signUp({ name: name.trim(), email: email.trim(), password, role: ROLE.PASSENGER });
       router.replace("/ride");
       router.refresh();
     } catch (err) {

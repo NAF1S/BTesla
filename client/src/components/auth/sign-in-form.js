@@ -4,32 +4,34 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
-import { signIn } from "@/lib/passenger-api";
+import { signIn } from "@/lib/auth-api";
+import { homeForRole } from "@/lib/roles";
 import { Button, Field, Input, Notice, Panel } from "@/components/ui";
 
 /**
- * The passenger sign-in form.
+ * Signing in — one form, both roles.
  *
  * ---------------------------------------------------------------------------
- * WHY THIS IS A CLIENT COMPONENT
+ * WHY THIS IS IN `components/auth/` AND NOT `components/passenger/`
  * ---------------------------------------------------------------------------
- * It is the one place in this milestone that genuinely needs to be: it collects
- * input, submits it, and reacts to the answer. Everything downstream is guarded on
- * the server, so nothing sensitive is rendered here.
+ * A person signs in before they are a passenger or a driver: the API has one
+ * login endpoint, one cookie, and one DTO. Only *after* it answers does the role
+ * matter, and it is the API's answer that decides where this lands — never a
+ * field on the form and never a client-side guess. A role selector here would be
+ * a way to ask for a session you should not have.
  *
  * ---------------------------------------------------------------------------
  * WHAT IT DOES WITH THE SESSION
  * ---------------------------------------------------------------------------
  * Nothing. `signIn` posts the credentials, and the API answers with an HttpOnly
  * cookie that the browser stores and JavaScript cannot read. There is no token to
- * keep, no `localStorage`, and therefore nothing here that can leak one. That is
- * the project's existing pattern, not a choice made in this file.
+ * keep, no `localStorage`, and therefore nothing here that can leak one.
  *
  * After a successful sign-in, `router.replace` navigates and `router.refresh`
- * tells Next to re-render the server components — which is what makes the layout
- * start showing the passenger's name and the guard start letting them through.
- * `replace` rather than `push`, so the back button does not return to a sign-in
- * form the passenger has already used.
+ * tells Next to re-render the server components — which is what makes the header
+ * start showing the name and the guard start letting them through. `replace`
+ * rather than `push`, so the back button does not return to a form that has
+ * already been used.
  */
 export function SignInForm({ next = null, deniedRole = null }) {
   const router = useRouter();
@@ -49,8 +51,13 @@ export function SignInForm({ next = null, deniedRole = null }) {
     setError(null);
 
     try {
-      await signIn({ email: email.trim(), password });
-      router.replace(next || "/ride");
+      // The role decides where this lands: a passenger at `/ride`, a driver at
+      // `/driver`. It comes from the user the API just returned, and
+      // `homeForRole` is the one place that mapping is written down. `next` wins
+      // when the guard remembered where somebody was going, because "the screen
+      // you asked for" is more specific than "the screen for your role".
+      const user = await signIn({ email: email.trim(), password });
+      router.replace(next || homeForRole(user.role) || "/signin");
       router.refresh();
     } catch (err) {
       setError(err);
@@ -66,19 +73,22 @@ export function SignInForm({ next = null, deniedRole = null }) {
             Sign in
           </h2>
           <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
-            Request a ride and track it here.
+            Passengers get the ride screen; drivers get the driver console.
           </p>
         </div>
 
         {deniedRole ? (
-          <Notice tone="warning" title="This is the passenger app">
-            You are signed in as a {deniedRole}, which this client does not support yet. Sign in
-            with a passenger account.
+          <Notice tone="warning" title={`This account is a ${deniedRole}`}>
+            This client has a screen for passengers and one for drivers, and none for a{" "}
+            {deniedRole}. Sign in with one of those accounts.
           </Notice>
         ) : null}
 
         {error ? (
-          <Notice tone="error" title={error.isUnauthenticated ? "Sign-in failed" : "Could not sign in"}>
+          <Notice
+            tone="error"
+            title={error.isUnauthenticated ? "Sign-in failed" : "Could not sign in"}
+          >
             {error.message}
           </Notice>
         ) : null}
@@ -92,7 +102,7 @@ export function SignInForm({ next = null, deniedRole = null }) {
             required
             value={email}
             onChange={(event) => setEmail(event.target.value)}
-            placeholder="nusrat@example.com"
+            placeholder="you@example.com"
           />
         </Field>
 
@@ -117,6 +127,14 @@ export function SignInForm({ next = null, deniedRole = null }) {
           <Link href="/signup" className="underline underline-offset-4">
             Create a passenger account
           </Link>
+        </p>
+
+        {/* Said plainly, and as a warning rather than a feature: there is no
+            vehicle endpoint, so a driver created here cannot be dispatched to.
+            The dashboard explains the same thing from the driver's side. */}
+        <p className="text-xs text-zinc-500 dark:text-zinc-400">
+          Driver accounts are seeded, not self-service: a new driver has no vehicle and dispatch
+          cannot use one. Sign in as the seeded driver to drive a ride.
         </p>
       </form>
     </Panel>

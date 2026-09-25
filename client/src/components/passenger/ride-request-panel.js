@@ -3,7 +3,8 @@
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { createRideRequest, listServicePoints, listZones, quoteFare } from "@/lib/passenger-api";
+import { createRideRequest, quoteFare } from "@/lib/passenger-api";
+import { listServicePoints, listZones } from "@/lib/location-api";
 import { formatDistance, formatDuration, formatMoney, formatTime } from "@/lib/format";
 import { Button, Facts, Field, Notice, Panel, Select } from "@/components/ui";
 import { Chip } from "@/components/status-chip";

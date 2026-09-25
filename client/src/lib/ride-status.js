@@ -94,10 +94,18 @@ export const PASSENGER_STAGE = {
  * the driver's to do. A client that invented a button here would be inventing a
  * rule.
  *
+ * `WAIT_FOR_DRIVER` is deliberately vague about *why* the passenger is waiting,
+ * and that is not laziness. The server returns it for the whole pre-departure
+ * stretch — `WAITING` (nobody found yet) and `MATCHED` (found, still parked) alike
+ * — because "there is nothing for you to do" is the true answer in both. Saying
+ * "we are looking for a driver" would be wrong the moment one has been assigned,
+ * and the assigned case is the common one. The status chip sits inches away and
+ * says which it is; this line only says that waiting is correct.
+ *
  * @type {Record<import("./types").PassengerNextAction, string>}
  */
 export const NEXT_ACTION = {
-  WAIT_FOR_DRIVER: "Hang tight — we are looking for a driver.",
+  WAIT_FOR_DRIVER: "Nothing to do just yet — this screen updates on its own.",
   WATCH_DRIVER: "Watch for your driver to arrive at your pickup point.",
   BOARD_VEHICLE: "Your car is here — get in when it is safe to.",
   IN_RIDE: "Sit back — your driver is taking you to your destination.",
