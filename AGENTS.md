@@ -8,7 +8,7 @@ read the one nearest the code you are about to change.
 
 | Path | What lives there |
 | ---- | ---------------- |
-| `client/` | Next.js 16 (App Router, JavaScript, Tailwind v4). The **passenger** app: auth, locations, fare estimate, ride request, live tracking. Nothing else. |
+| `client/` | Next.js 16 (App Router, JavaScript, Tailwind v4). **Both halves of the loop**: passenger auth, locations, fare estimate, ride request, live tracking — and driver auth, availability, offers, accept/decline, and driving the ride to completion. Nothing else. |
 | `server/` | The Express 5 API. **All the domain rules live here.** See `server/AGENTS.md`. |
 | `server/db/*.sql` | Hand-written, idempotent migrations. The schema's source of truth. |
 | `server/openapi.yaml` | The machine-readable API contract, served at `GET /api/docs`. |
@@ -19,18 +19,31 @@ read the one nearest the code you are about to change.
 
 ```text
 Passenger:  GET /api/passengers/me/current-ride     -> { ride } or { ride: null }
-            GET /api/passengers/me/rides            -> { data, pagination }
-            GET /api/passengers/me/rides/:id        -> stops, timeline, fare
+            POST /api/fare-quotes                   -> the quote a request is made from
+            POST /api/ride-requests                 -> needs an Idempotency-Key header
+            GET /api/passengers/me/rides[/:id]      -> history, and one ride in detail
 
-Driver:     GET /api/drivers/me/current-pool        -> allowedActions is the buttons
+Driver:     GET /api/drivers/me/availability        -> canGoOnline / canGoOffline
             PATCH /api/drivers/me/availability      -> { online, servicePointCode }
+            GET /api/drivers/me/offers              -> also the heartbeat; see below
+            POST /api/drivers/me/offers/:id/{accept,reject}   -> accept takes no body
+            GET /api/drivers/me/current-pool        -> allowedActions are the buttons
+            POST /api/drivers/me/pools/:id/{depart,start,complete}
+            POST /api/drivers/me/pools/:id/stops/:stopId/{arrive,
+                 members/:memberId/{pickup,dropoff}}          -> no body, ever
             GET /api/drivers/me/rides[/:poolId]     -> the pools they have driven
 ```
 
 **Never compute a state transition in a client.** The server publishes
-`allowedActions` (driver) and `nextAction` (passenger), computed from the state, so
-a client renders what the server would accept instead of reimplementing the rules.
-Nothing takes a user id: every `/me` path already knows who is asking.
+`allowedActions` (driver), `nextAction` (passenger), `canGoOnline` / `canGoOffline`
+and an offer's `expired`, all computed from the state, so a client renders what the
+server would accept instead of reimplementing the rules. Nothing takes a user id:
+every `/me` path already knows who is asking.
+
+**Reading a driver's offers is a heartbeat.** It refreshes `lastSeenAt`, and a
+location older than `DISPATCH_LOCATION_FRESHNESS_SECONDS` (300 s) makes the driver
+ineligible. A driver screen that stops asking quietly drops its driver out of
+dispatch — so the console polls even in a background tab.
 
 ## Running it
 

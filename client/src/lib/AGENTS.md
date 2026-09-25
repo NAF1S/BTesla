@@ -10,8 +10,8 @@ only presentation.
 | `auth-api.js` | Sign in, sign up, sign out, "who am I" — role-independent | both |
 | `roles.js` | The roles, and where each of them lives | both |
 | `location-api.js` | Zones and service points — public reference data | both |
-| `passenger-api.js` | Fares, ride requests, the current ride | both |
-| `driver-api.js` | Availability, offers, the accepted pool | both |
+| `passenger-api.js` | Fares, ride requests, the current ride, one ride in detail | both |
+| `driver-api.js` | Availability, offers, the accepted pool, the six trip commands | both |
 | `session.js` | The route guard, and the cookie reader | **server only** |
 | `use-polling.js` | The polling policy, shared by both live screens | **client only** |
 | `types.js` | The DTOs, as JSDoc typedefs | neither (types) |
@@ -84,6 +84,11 @@ But the three API modules are split by **who the caller is**, not by convenience
   and an offer's `expired` precisely so a client does not reimplement the rules.
   `ride-status.js` and `driver-status.js` *rename* those values; they derive nothing.
   If a screen needs a fact the DTO lacks, add it to the DTO.
+* **"Nothing right now" is `200` with a null, and a finished ride needs a second
+  question.** `current-pool` and `current-ride` answer `null` when there is nothing to
+  report. That is an ordinary state — but for a finished ride it is *not* an answer:
+  `getRideDetail` is what reports `COMPLETED` versus `CANCELLED`, and nothing should be
+  inferred from the absence.
 * **`format.js` does no arithmetic on money.** It appends the currency to the exact
   decimal string the API sent. `Number("130.63")` is a binary float and is how a
   paisa goes missing. Unit conversion (metres to "2.2 km") is presentation and is

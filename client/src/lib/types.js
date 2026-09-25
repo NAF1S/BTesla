@@ -212,6 +212,62 @@
  * @property {string} searchExpiresAt
  */
 
+/**
+ * One of the passenger's rides, in full — from `GET /passengers/me/rides/:id`.
+ *
+ * The same summary a current ride carries, plus the two things a **finished** ride
+ * needs and a live one does not: `status` reaches the terminal `COMPLETED` or
+ * `CANCELLED` here (the current-ride endpoint stops answering for those), and
+ * `timeline` is a list of events rather than a set of instants.
+ *
+ * `completedAt` is the **request's** own instant, not the pool's. A passenger is
+ * delivered while the car may still be carrying somebody else, so the pool's
+ * completion would be the wrong moment to show them.
+ *
+ * @typedef {object} RideDetail
+ * @property {string} rideRequestId
+ * @property {RideRequestStatus} status
+ * @property {boolean} cancellable
+ * @property {QuoteEndpoint} pickup
+ * @property {QuoteEndpoint} destination
+ * @property {string} requestedAt
+ * @property {string | null} startedAt
+ * @property {string | null} completedAt
+ * @property {string | null} cancelledAt
+ * @property {{ distanceMeters: number, durationSeconds: number }} route
+ * @property {{ fare: string, currency: string, pricingCode: string, pricingVersion: number }} soloEstimate
+ * @property {SharedFareSummary | null} sharedFare
+ * @property {DriverSummary | null} driver
+ * @property {VehicleSummary | null} vehicle
+ * @property {number | null} passengerCount
+ * @property {PassengerStage} stage
+ * @property {PassengerNextAction} nextAction
+ * @property {string} searchExpiresAt
+ * @property {MemberStatus | null} memberStatus
+ * @property {RideStop[]} myStops
+ * @property {{ distanceMeters: number, durationSeconds: number } | null} sharedRoute
+ * @property {{ poolId: string, status: PoolStatus, passengerCount: number | null, capacity: number, completedAt: string | null } | null} pool
+ * @property {{ memberStatus: MemberStatus, matchedAt: string | null, pickedUpAt: string | null, droppedOffAt: string | null } | null} member
+ * @property {TimelineEntry[]} timeline
+ */
+
+/**
+ * One entry in an audience-filtered timeline.
+ *
+ * The server maps raw events through a whitelist keyed by *event type and
+ * audience*, so a passenger never receives a dispatch event and a driver never
+ * receives somebody else's ride event. There is no payload and no actor id here:
+ * `actorType` says which *kind* of actor acted, never which one.
+ *
+ * @typedef {object} TimelineEntry
+ * @property {number} sequence
+ * @property {string} eventType
+ * @property {"REQUEST" | "MATCHING" | "PICKUP" | "RIDE" | "END"} phase
+ * @property {string} label
+ * @property {"PASSENGER" | "DRIVER" | "SYSTEM" | "ADMIN" | null} actorType
+ * @property {string} at
+ */
+
 // ---------------------------------------------------------------------------
 // The driver slice. Everything below is transcribed from
 // `server/src/serializers/driver.serializer.js`, `pool.serializer.js` and

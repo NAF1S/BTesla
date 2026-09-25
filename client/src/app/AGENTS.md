@@ -11,7 +11,7 @@ renderable route.
 | `signup/page.js` | `/signup` | Passenger sign-up |
 | `ride/page.js` | `/ride` | Pick two places, see the price, request the ride |
 | `track/page.js` | `/track` | The passenger's current ride, polled |
-| `driver/page.js` | `/driver` | The driver's console: availability, offers, the accepted pool |
+| `driver/page.js` | `/driver` | The driver's console: availability, offers, and the ride in progress |
 | `status/page.js` | `/status` | The scaffold's diagnostics page: is the API up, and who is seeded? |
 | `globals.css` | — | The Tailwind v4 entry point |
 
@@ -62,13 +62,14 @@ renderable route.
 
 ## What is deliberately not here
 
-No trip-execution screen, no history screen, no map, no cancellation, no payment and
-no admin route.
+No history screen, no map, no cancellation, no payment and no admin route — the
+server supports all of it and the client does not call it yet.
 
-The trip controls are the next milestone, and the driver's pool summary shows
-`allowedActions` **in words** without offering them: drawing a button that the server
-would refuse — or five commands the next milestone owns — would be worse than
-saying what comes next.
+The two halves are otherwise complete for an MVP: a passenger can request a ride and
+watch it, and a driver can accept one and drive it to the end. What is *not* here is
+any client-side idea of how a ride progresses — the driver's buttons are the server's
+`allowedActions` and the passenger's stage is the server's `stage`, so neither screen
+holds a state machine.
 
 ## Depends on / depended on by
 

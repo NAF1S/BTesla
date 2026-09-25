@@ -2363,13 +2363,204 @@ would be a guess about somebody's money. Distinguishing them needs
 
 **No driver screens, no pooling screens, no history screen, no map, no realtime
 socket, no passenger or driver cancellation, no payment and no admin workflow.** The
-server supports all of them; this client calls only the passenger endpoints it needs,
-and the header links only to the two screens that exist.
+server supports all of them; this client calls only the passenger endpoints it needs.
+Two of those limitations were closed by the next milestone — see
+[The driver's console](#the-drivers-console) — and the rest still stand.
 
 Two more honest limitations. The client has **no test suite** — `npm run lint` and
 `npm run build` are its automated checks, and the server's 1123 tests are what pin
 the contract it renders. And `GET /api/users` is still public and unauthenticated,
 kept that way so `/status` can list the seeded accounts.
+
+
+## The driver's console
+
+The other half of the loop. A passenger asks for a ride, a driver is offered it,
+answers it, and the passenger's screen changes from *finding a driver* to *waiting
+for a driver* — with a name and a car on it.
+
+```text
+Passenger creates a WAITING ride request
+  -> the dispatcher shortlists nearby AVAILABLE drivers and routes them to the pickup
+  -> the best candidate gets one DispatchOffer, which expires in 30 seconds
+  -> the driver's console polls its offers and shows it
+  -> accept  ->  a pool, and the passenger's current ride becomes MATCHED
+  -> decline ->  the request stays WAITING and the next driver is offered it
+```
+
+| Screen | URL | What it does |
+| ------ | --- | ------------ |
+| Sign in | `/signin` | One form for both roles; the role decides where you land |
+| Console | `/driver` | `GET /drivers/me/availability`, `GET /drivers/me/offers`, `GET /drivers/me/current-pool`, `PATCH /drivers/me/availability` |
+| Answer | — | `POST /drivers/me/offers/:id/accept` (no body) and `…/reject` with a reason |
+
+You need a driver with a vehicle to try it. The seed creates one — sign in as
+`jashim@example.com` with the password from `DEMO_SEED_PASSWORD` — and come online at
+a point near the passenger's pickup (Banani Kakoli is 445 m from Banani Road 11;
+Gulshan 2 Circle is 1068 m in a straight line but 3.1 km by road).
+
+### Four things this slice had to get right
+
+1. **One client, two roles.** A person signs in before they are a passenger or a
+   driver: the API has one login endpoint, one cookie and one DTO, and the role only
+   matters once it has answered. Someone signed in as the *other* role is redirected
+   to their own home rather than to the sign-in form — a signed-in driver sent to
+   `/signin` would fill it in and be sent straight back, which is a loop.
+2. **The offers list *is* the heartbeat.** `last_seen_at` is refreshed when a driver
+   goes online, moves, **reads their offers**, or answers one. A location older than
+   `DISPATCH_LOCATION_FRESHNESS_SECONDS` (300 s) makes them ineligible, so a console
+   that stops polling quietly drops its driver out of dispatch. It therefore polls in
+   a background tab too, at 30 seconds instead of 5 — and not at all while offline.
+   (The passenger's tracker does the opposite in a background tab, because a ride
+   nobody is looking at has nothing to keep current. The two are the same hook with
+   different cadences.)
+3. **Nothing is derived in the browser.** `canGoOnline`, `canGoOffline` and an
+   offer's `expired` come from the API. They are not opposites: a `RESERVED` driver is
+   online and may still not go offline, because they have accepted a passenger.
+   Where a screen has to choose *which control to draw* it uses the published
+   `online` boolean, not a status it would have to interpret.
+4. **Accepting sends no body.** The plan is the one stored when the offer was made, so
+   there is nothing to submit and nothing to edit — the endpoint posts an offer id and
+   returns the pool. An offer that belongs to another driver is a `404`, the same as
+   one that does not exist.
+
+### What is deliberately not here
+
+**No trip execution.** The console shows the pool the driver has just accepted —
+who, from where, to where, in what order — and `allowedActions` in words, but no
+buttons. Departing, arriving, collecting, starting, dropping off and completing are
+the next milestone, and drawing a control for them now would mean either wiring five
+commands this milestone does not own or drawing a button that does nothing.
+
+**No driver sign-up.** The API accepts `role: DRIVER` on `POST /auth/register`, but
+a new driver starts `OFFLINE` with no vehicle, and **no endpoint in this project
+creates one** — so such an account can sign in and cannot be dispatched to. The
+console says that plainly when it happens, rather than offering a switch that would
+`409` every time.
+
+**No "move me" control.** `PUT /drivers/me/current-service-point` exists and is valid
+while a driver is offline or available, but the availability DTO publishes no boolean
+for it. Working it out from `status` would be a second copy of
+`canSetCurrentServicePoint`, so a driver who wants to relocate goes offline and comes
+online somewhere else — two clicks, and no new rule.
+
+### The bug this slice found in the server
+
+The API's own OpenAPI document listed the ride-cancellation reasons as
+`CHANGED_MIND`, `FOUND_OTHER_RIDE`, `WAITING_TOO_LONG` and `OTHER`. The endpoint
+accepts `CHANGED_MIND`, `WRONG_LOCATION`, `WAIT_TOO_LONG` and `OTHER` — so a client
+written against the published contract got a `400`. `openapi.yaml` is corrected; the
+unit suite only checked paths, not enum values, which is why it had gone unnoticed.
+
+
+## Driving the ride
+
+The last piece of the loop: an accepted ride, driven to the end. The passenger's
+screen follows it without being told anything — the driver presses a button, and the
+tracker's next poll reports the new stage.
+
+```text
+Driver accepted
+  -> set off            passenger: driver on the way
+  -> arrive at pickup   passenger: driver has arrived
+  -> collect            passenger: you are in the car
+  -> start the trip     passenger: trip in progress
+  -> arrive at dropoff  (no stage change: the passenger is already in the car)
+  -> drop off           passenger: ride completed, with the fare and the timeline
+  -> complete           driver released, back to AVAILABLE
+```
+
+| Screen | URL | What it does |
+| ------ | --- | ------------ |
+| Console | `/driver` | The pool in progress: the ordered plan, the passengers, and one button per allowed action |
+
+The commands are `POST /drivers/me/pools/:poolId/{depart,start,complete}` and
+`…/stops/:stopId/arrive` / `…/stops/:stopId/members/:memberId/{pickup,dropoff}`. Every
+one takes **no body** — the identifier is in the path, and there is nothing a client
+could usefully add. Idempotency is state rather than a key: sending the same command
+twice returns the state it produced the first time, with no second event and no
+timestamp moved, so a retry after a timeout is safe.
+
+### Where the buttons come from
+
+**`allowedActions` arrives with the pool, and each entry becomes one button.** That is
+the whole design: the server computes the six commands' preconditions with the same
+rules the commands themselves consult, so the client cannot offer an action that would
+be refused, and cannot hide one that is legal.
+
+Two things this gets right that a hand-written state machine would not:
+
+* **The list is not one action per status.** Immediately after collecting a passenger
+  the server allows **two** commands at once — `ARRIVE_AT_STOP` *and* `START_TRIP` —
+  because the driver may either reach the drop-off or begin the journey proper. A
+  screen that rendered "the next action" would silently drop one of them.
+* **An action that already succeeded is absent, not disabled.** The server omits a
+  command whose decision is "repeat", because there is nothing left to do about it.
+  A greyed-out button would be inventing history.
+
+`nextStop` is where the actions point — "the lowest-sequence stop that is not done, and
+the only stop they may serve" — so the label ("Pick up **Nusrat**", "Arrive at
+**Mohakhali Bus Terminal**") and the request cannot disagree about which stop or which
+passenger is meant. The wording comes from `driver-status.js`; the permission came from
+the server.
+
+Observed at each step of a real run:
+
+| After | Pool | `allowedActions` | Passenger `status` / `stage` |
+| ----- | ---- | ---------------- | ---------------------------- |
+| accept | `FORMING` | `[DEPART]` | `MATCHED` / `DRIVER_ASSIGNED` |
+| set off | `DRIVER_EN_ROUTE` | `[ARRIVE_AT_STOP]` | `MATCHED` / `DRIVER_EN_ROUTE` |
+| arrive | `ARRIVED` | `[PICKUP_PASSENGER]` | `MATCHED` / `DRIVER_ARRIVED` |
+| collect | `ARRIVED` | `[ARRIVE_AT_STOP, START_TRIP]` | `MATCHED` / `PICKED_UP` |
+| start | `IN_PROGRESS` | `[ARRIVE_AT_STOP]` | `IN_PROGRESS` / `IN_PROGRESS` |
+| arrive | `IN_PROGRESS` | `[DROPOFF_PASSENGER]` | `IN_PROGRESS` / `IN_PROGRESS` |
+| drop off | `IN_PROGRESS` | `[COMPLETE_TRIP]` | `COMPLETED` / `RIDE_COMPLETED` |
+| complete | `COMPLETED` | `[]` | `COMPLETED` / `RIDE_COMPLETED` |
+
+### How the passenger's screen learns it finished
+
+`GET /passengers/me/current-ride` answers with an **active** ride or nothing, so a
+finished ride arrives as `null` — and that response does not say whether the passenger
+arrived or was cancelled on. The tracker therefore asks a second question the moment
+the active ride disappears: `GET /passengers/me/rides/:id`, which has no status filter
+and reports the API's own `COMPLETED` or `CANCELLED`.
+
+That is the difference between reporting and guessing. The screen previously inferred
+"completed" from a drop-off timestamp on the last active read — usually right, and
+still a claim about somebody's money built out of an absence. It now shows the real
+status, the request's own `completedAt`, the fare, and the nine-event timeline the
+passenger is allowed to see. Polling stops at that point: there is nothing left to
+learn.
+
+### What is deliberately not here
+
+**No cancellation.** A passenger cannot cancel a matched ride and a driver cannot call
+one off; the API refuses both, and this milestone does not add either.
+
+**No history.** Both roles have read APIs for the rides they have finished
+(`/passengers/me/rides`, `/drivers/me/rides`) and neither has a screen.
+
+**No location the server can verify.** "Arrive at stop" is the driver *saying* they
+arrived — there is no GPS, and the API records the claim rather than checking it. So
+the timeline says "Your driver arrived at your pickup" because the driver pressed a
+button, which is honest for this MVP and is the thing a GPS milestone would change.
+
+**No payment.** A fare is settled by departure and reported to the passenger; nothing
+collects it.
+
+### The bug this slice found in the server
+
+**`nextStop` was serialized from the wrong shape.** `toPoolDto` picks the next stop with
+`nextActionableStop(...)` — but it was passing it the *rule-shaped* stops from
+`toRuleContext`, which carry only the four fields the rules read. The DTO's
+`nextStop` therefore had `servicePoint: null` and no planned arrival, while the
+identical row in `stops[]` named the place all along. A driver's screen could not say
+which stop it was about to arrive at.
+
+The fix matches the decision to the loaded row by id, so the *choice* still comes from
+the rules and the *data* comes from the row. The unit test had asserted only
+`nextStop.stopId` and `nextStop.stopType`, which is why it survived; it now compares
+`nextStop` field by field against the same stop in `stops`.
 
 
 ## Tests
@@ -2396,7 +2587,7 @@ One fixture rule the trip milestone imposed on the older suites is worth recordi
 
 The shared-fare suites are split the same way. `test/unit/pool-fare.rules.test.js` covers who is on board for which leg, what a leg costs, how a leg is split and how the residual units are handed out, the two caps and the minimum fare's precedence, and the totals identity -- all with amounts that can be checked by hand, and with an exhaustive split table asserting that shares sum to the leg cost for every amount and every passenger count. `test/integration/pool-fare.integration.test.js` covers the ledger: one CURRENT calculation per pool and one per plan version, superseding rather than overwriting, the write-once and append-only triggers, idempotent recalculation, a stale version refused with a `409`, a join rolled back when the pricing is broken, two recalculations racing to one answer, the two protections biting when a policy changes mid-pool, and the passenger API's privacy. Between them they name the milestone's numbered categories `1`--`42` and `44`--`46`; category `43` -- that the authentication, routing, fare, request, dispatch, pool and matching suites still pass -- is the `npm test` gate itself, and the two suites that would break it are the ones they changed.
 
-The passenger frontend milestone adds **no tests of its own**, and that is deliberate rather than unfinished: the client is JavaScript with no test runner, and everything it renders -- the quote, the `stage`, the `nextAction`, the DTO's exact field set -- is pinned by the server suites those sections describe. What the client *is* checked by is `npm run lint` (ESLint with the Next config) and `npm run build` (a real Next build, which fails on an unresolved import, a client component that imported the server-only guard, or a page that used a synchronous `cookies()`), plus the full server suite, which must stay green because the client renders its answers.
+The frontend milestones add **no tests of their own**, and that is deliberate rather than unfinished: the client is JavaScript with no test runner, and everything it renders -- the quote, the `stage`, the `nextAction`, `canGoOnline`, an offer's `expired`, the DTO's exact field set -- is pinned by the server suites those sections describe. What the client *is* checked by is `npm run lint` (ESLint with the Next config) and `npm run build` (a real Next build, which fails on an unresolved import, a client component that imported the server-only guard, or a page that used a synchronous `cookies()`), plus the full server suite, which must stay green because the client renders its answers.
 
 ## Next steps
 

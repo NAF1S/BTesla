@@ -128,11 +128,13 @@ const idempotencyKeyFor = ({ originServicePointCode, destinationServicePointCode
  * ---------------------------------------------------------------------------
  * The endpoint answers with an **active** ride — `WAITING`, `MATCHED` or
  * `IN_PROGRESS` — or nothing at all. A ride that reached `COMPLETED` or
- * `CANCELLED` therefore arrives as `null`, not as a terminal status. A tracker can
- * see that the ride ended, but this call cannot say *which* way it ended; that is
- * the ride-detail endpoint's answer, and it belongs to a later milestone. Nothing
- * should be inferred from the absence — showing "cancelled" for a completed ride
- * would be a guess about the passenger's money.
+ * `CANCELLED` therefore arrives as `null`, not as a terminal status. This call can
+ * see that a ride ended; it cannot say *which* way it ended, and nothing should be
+ * inferred from the absence — showing "cancelled" for a completed ride would be a
+ * guess about somebody's money.
+ *
+ * `getRideDetail` is the answer to that question, and the tracker asks it the
+ * moment this returns `null` with a ride still in hand.
  *
  * @param {{ cookie?: string }} [options]
  * @returns {Promise<import("./types").CurrentRide | null>}
@@ -141,3 +143,33 @@ export const getCurrentRide = async ({ cookie } = {}) => {
   const { ride } = await apiFetch("/passengers/me/current-ride", { cookie });
   return ride ?? null;
 };
+
+/**
+ * One of the passenger's own rides, in full — **including a finished one**.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THIS IS WHAT SETTLES THE TERMINAL STATE
+ * ---------------------------------------------------------------------------
+ * `current-ride` stops answering the moment a ride leaves the active statuses, so
+ * the tracker knows a ride ended without knowing how. This endpoint has no status
+ * filter: it reads a request that belongs to the passenger whatever state it is in,
+ * and reports `status` as the API's own `COMPLETED` or `CANCELLED`.
+ *
+ * That is the difference between *reporting* and *guessing*. Without it the tracker
+ * could only say "this ride is no longer active", and any stronger claim — that the
+ * passenger arrived, or that they were cancelled on — would be invented at the one
+ * moment somebody cares most about the truth.
+ *
+ * It also carries what a finished ride needs and a live one does not: the timeline
+ * of events as the passenger may see them, the member's own `pickedUpAt`/
+ * `droppedOffAt`, and the pool's completion instant. The passenger is delivered
+ * while the pool may still be carrying somebody else, so `completedAt` here is the
+ * *request's* own instant, not the pool's.
+ *
+ * A ride that is not this passenger's is a `404`, exactly as an unknown id is.
+ *
+ * @param {{ rideRequestId: string, cookie?: string }} ride
+ * @returns {Promise<import("./types").RideDetail>}
+ */
+export const getRideDetail = ({ rideRequestId, cookie }) =>
+  apiFetch(`/passengers/me/rides/${rideRequestId}`, { cookie });

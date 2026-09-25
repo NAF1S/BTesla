@@ -128,20 +128,59 @@ export const REJECTION_REASONS = [
 ];
 
 /**
- * The label for one of the six trip commands.
+ * What each of the six trip commands is called, and what it acts on.
  *
- * Nothing in **this** milestone renders these: the trip execution UI is the next
- * one. They are here because the pool summary shows what the server says is
- * allowed right now, and a screen that has the list but not the words would have
- * to either hide it or print `ARRIVE_AT_STOP` at a driver.
+ * ---------------------------------------------------------------------------
+ * WHY `target` IS HERE, AND WHY IT IS NOT A RULE
+ * ---------------------------------------------------------------------------
+ * `allowedActions` names an action but is not *addressable*: it says
+ * `PICKUP_PASSENGER`, not which passenger. The pool publishes the other half —
+ * `nextStop`, and each member's own stops — so `target` says what the button has to
+ * name in order to be understandable: "Pick up **Nusrat**" rather than "Pick up the
+ * passenger".
  *
- * @type {Record<string, string>}
+ * That is presentation. It does not say whether the action is *allowed* — the
+ * server decided that before the action name arrived — and it does not choose the
+ * stop: `driver-api.js` resolves both from `nextStop`. A screen that read `target`
+ * as permission would be doing the server's job.
+ *
+ * @type {Record<import("./types").TripAction, { label: string, done: string, target: "none" | "stop" | "member", help: string }>}
  */
 export const TRIP_ACTION = {
-  DEPART: "Set off",
-  ARRIVE_AT_STOP: "Arrive at the next stop",
-  PICKUP_PASSENGER: "Pick up the passenger",
-  START_TRIP: "Start the trip",
-  DROPOFF_PASSENGER: "Drop the passenger off",
-  COMPLETE_TRIP: "Complete the trip",
+  DEPART: {
+    label: "Set off",
+    done: "You have set off",
+    target: "none",
+    help: "Closes the ride to further passengers, freezes the fare, and puts you on the way to the first pickup.",
+  },
+  ARRIVE_AT_STOP: {
+    label: "Arrive at",
+    done: "Arrival recorded",
+    target: "stop",
+    help: "Tells the passenger you are there. A later stop cannot be reached before this one.",
+  },
+  PICKUP_PASSENGER: {
+    label: "Pick up",
+    done: "Passenger collected",
+    target: "member",
+    help: "Marks the passenger as aboard. At a shared corner the stop stays open until everybody there has been collected.",
+  },
+  START_TRIP: {
+    label: "Start the trip",
+    done: "The trip has started",
+    target: "none",
+    help: "Begins the journey proper. A passenger still to be collected further along keeps waiting to be picked up during it.",
+  },
+  DROPOFF_PASSENGER: {
+    label: "Drop off",
+    done: "Passenger delivered",
+    target: "member",
+    help: "Completes this passenger's ride. The pool keeps running for anybody else in the car.",
+  },
+  COMPLETE_TRIP: {
+    label: "Complete the trip",
+    done: "Trip completed — you are free again",
+    target: "none",
+    help: "Finishes the ride and releases you. Refused while any stop is unfinished or anybody is still in the car.",
+  },
 };

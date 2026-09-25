@@ -2,7 +2,7 @@
 
 import { useCallback, useState } from "react";
 
-import { getCurrentRide } from "@/lib/passenger-api";
+import { getCurrentRide, getRideDetail } from "@/lib/passenger-api";
 import { usePolling } from "@/lib/use-polling";
 import { formatDistance, formatDuration, formatMoney, formatElapsed, formatTime } from "@/lib/format";
 import { MEMBER_STATUS, NEXT_ACTION, PASSENGER_STAGE, POOL_STATUS, STOP_STATUS, isFinished } from "@/lib/ride-status";
@@ -63,6 +63,20 @@ export function RideTracker({ initialRide = null, pollIntervalMs = POLL_INTERVAL
   const [error, setError] = useState(null);
 
   /**
+   * The finished ride's own record, fetched once when the ride leaves the active
+   * list.
+   *
+   * It is the difference between reporting and guessing. `current-ride` stops
+   * answering as soon as a ride reaches `COMPLETED` or `CANCELLED`, so on its own
+   * the tracker could say only "this ride is no longer active" — and the two
+   * outcomes are the two things a passenger most wants to be right. The detail
+   * endpoint has no status filter, so asking it settles the question with the
+   * API's own answer.
+   */
+  const [finishedRide, setFinishedRide] = useState(null);
+  const [finishing, setFinishing] = useState(false);
+
+  /**
    * The browser's clock, or `null` until this component has run in a browser.
    *
    * "Requested 57 seconds ago" is a fact about *now*, so it cannot be rendered on
@@ -104,22 +118,48 @@ export function RideTracker({ initialRide = null, pollIntervalMs = POLL_INTERVAL
   }, []);
 
   /**
+   * Asks the API how the ride actually ended.
+   *
+   * Called once, and only when there was a ride and there is no longer one. The id
+   * comes from the last active read, which is the only moment the id is available —
+   * that is why `lastRide` exists at all.
+   */
+  const settleArrival = useCallback(async () => {
+    if (!lastRide) return;
+
+    setFinishing(true);
+    try {
+      setFinishedRide(await getRideDetail({ rideRequestId: lastRide.rideRequestId }));
+    } catch (err) {
+      // Not fatal: the screen still says the ride is over, just without the
+      // outcome. Losing the detail must not lose the fact that it ended.
+      setError(err);
+    } finally {
+      setFinishing(false);
+    }
+  }, [lastRide]);
+
+  /**
    * The polling loop's question, and when to stop asking.
    *
    * `usePolling` owns *how* to ask — recursive timeout, hidden tab, unmount — and
    * this owns *whether to keep asking*, which is the part that differs between the
    * two screens. Here it stops on the one case that is genuinely terminal: the
    * server has no active ride for this passenger, so there is nothing left to
-   * learn. A failure is not terminal — the next tick tries again.
+   * learn — the ride's own record is then read once from the other endpoint.
+   *
+   * A failure is not terminal: the next tick tries again.
    */
   const poll = useCallback(async () => {
     const current = await load();
 
-    if (current === null) return false;
-    if (current && isFinished(current.status)) return false;
+    if (current === null || (current && isFinished(current.status))) {
+      await settleArrival();
+      return false;
+    }
 
     return true;
-  }, [load]);
+  }, [load, settleArrival]);
 
   usePolling(poll, { intervalMs: pollIntervalMs });
 
@@ -127,7 +167,16 @@ export function RideTracker({ initialRide = null, pollIntervalMs = POLL_INTERVAL
   // not one. A passenger who never had one gets the empty state instead.
   const ended = ride === null && lastRide !== null;
 
-  if (ended) return <RideEnded lastRide={lastRide} />;
+  if (ended) {
+    return (
+      <RideEnded
+        ride={finishedRide}
+        lastRide={lastRide}
+        loading={finishing}
+        onRetry={settleArrival}
+      />
+    );
+  }
 
   if (error && !ride) {
     return (
@@ -325,44 +374,105 @@ function Timeline({ ride }) {
 /**
  * The screen after the ride stops being active.
  *
- * `GET /passengers/me/current-ride` answers with an *active* ride or nothing, so a
- * ride that ends arrives as `null` and the exact final status — completed, or
- * cancelled — is not in that response. Finding out which needs the ride-detail
- * endpoint, which belongs to a later milestone, so this says what it can show and
- * does not invent the rest.
+ * ---------------------------------------------------------------------------
+ * WHERE THE ANSWER COMES FROM
+ * ---------------------------------------------------------------------------
+ * `current-ride` answers with an active ride or nothing, so a ride that ends
+ * arrives as `null` and that response does not say which way it ended. `ride` here
+ * is the **ride detail**, fetched once from the other endpoint the moment the
+ * active ride disappeared, and its `status` is the API's own `COMPLETED` or
+ * `CANCELLED`.
+ *
+ * That ordering matters. The previous version of this component inferred
+ * "completed" from the presence of a drop-off timestamp on the last *active* read —
+ * an inference that was usually right and that the docs had to apologise for. A
+ * passenger being told they arrived is a claim worth getting from the record.
+ *
+ * `lastRide` is still rendered while the detail is in flight, so the screen shows
+ * the journey it knows about rather than a spinner over nothing.
  */
-function RideEnded({ lastRide }) {
-  const completed = lastRide?.timeline?.droppedOffAt != null;
+function RideEnded({ ride, lastRide, loading, onRetry }) {
+  const status = ride?.status ?? null;
+  const completed = status === "COMPLETED";
+  const cancelled = status === "CANCELLED";
+
+  const journey = ride ?? lastRide;
+
+  const headline = completed
+    ? "You have arrived"
+    : cancelled
+      ? "This ride was cancelled"
+      : "This ride is over";
+
+  const copy = completed
+    ? "Thanks for riding with TeslaB."
+    : cancelled
+      ? "The ride was cancelled before it finished."
+      : "The ride is no longer active. Its outcome could not be read just now.";
 
   return (
     <Panel className="text-center">
-      <Chip tone={completed ? "done" : "stopped"}>
-        {completed ? "Ride completed" : "Ride no longer active"}
-      </Chip>
-      <h2 className="mt-3 text-xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-50">
-        {completed ? "You have arrived" : "This ride has finished"}
-      </h2>
-      <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
-        {completed
-          ? "Thanks for riding with TeslaB."
-          : "The ride is no longer active. It may have been completed or cancelled."}
-      </p>
+      {status ? (
+        <RideStatusChip status={status} />
+      ) : (
+        <Chip tone="stopped">{loading ? "Finishing up…" : "Ride no longer active"}</Chip>
+      )}
 
-      {lastRide ? (
+      <h2 className="mt-3 text-xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-50">
+        {headline}
+      </h2>
+      <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">{copy}</p>
+
+      {!ride && !loading && onRetry ? (
+        <Button variant="secondary" className="mt-4" onClick={onRetry}>
+          Check the outcome again
+        </Button>
+      ) : null}
+
+      {journey ? (
         <Facts
           className="mt-5 text-left"
           items={[
-            { label: "From", value: lastRide.pickup.name },
-            { label: "To", value: lastRide.destination.name },
-            { label: "Requested", value: formatTime(lastRide.requestedAt) },
-            lastRide.timeline?.droppedOffAt
-              ? { label: "Dropped off", value: formatTime(lastRide.timeline.droppedOffAt) }
+            { label: "From", value: journey.pickup.name },
+            { label: "To", value: journey.destination.name },
+            { label: "Requested", value: formatTime(journey.requestedAt) },
+            // The *request's* own instants, not the pool's: a passenger is
+            // delivered while the car may still be carrying somebody else.
+            journey.completedAt
+              ? { label: "Completed", value: formatTime(journey.completedAt) }
               : null,
-            lastRide.sharedFare
-              ? { label: "Fare", value: formatMoney(lastRide.sharedFare.fare, lastRide.sharedFare.currency) }
+            journey.cancelledAt
+              ? { label: "Cancelled", value: formatTime(journey.cancelledAt) }
+              : null,
+            journey.driver?.displayName
+              ? { label: "Driver", value: journey.driver.displayName }
+              : null,
+            journey.sharedFare
+              ? {
+                  label: "Fare",
+                  value: formatMoney(journey.sharedFare.fare, journey.sharedFare.currency),
+                }
               : null,
           ].filter(Boolean)}
         />
+      ) : null}
+
+      {ride?.timeline?.length > 0 ? (
+        <div className="mt-5 text-left">
+          <p className="text-xs uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
+            What happened
+          </p>
+          <ol className="mt-2 flex flex-col gap-2">
+            {ride.timeline.map((entry) => (
+              // `sequence` is the event's own ordinal, so two events that happen to
+              // share a phase and a wording still get distinct keys.
+              <li key={entry.sequence} className="flex items-baseline justify-between gap-4 text-sm">
+                <span className="text-zinc-900 dark:text-zinc-50">{entry.label}</span>
+                <span className="tabular-nums text-zinc-500">{formatTime(entry.at)}</span>
+              </li>
+            ))}
+          </ol>
+        </div>
       ) : null}
 
       <div className="mt-5 flex justify-center gap-3">

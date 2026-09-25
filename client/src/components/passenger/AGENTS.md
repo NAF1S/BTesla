@@ -8,7 +8,7 @@ client, and it is deliberately the only passenger-side folder that imports
 | ---- | ---------- |
 | `sign-up-form.js` | Name, email, password -> `POST /auth/register` as a `PASSENGER` |
 | `ride-request-panel.js` | Two locations -> a quote -> a ride request |
-| `ride-tracker.js` | The current ride, polled every few seconds |
+| `ride-tracker.js` | The current ride, polled every few seconds — and its outcome once it ends |
 
 Signing in and out used to live here. They moved to `../auth/` when the driver's
 screens arrived and needed them too: a person signs in **before** they are a
@@ -76,20 +76,28 @@ Two more things the tracker does itself, both about honesty rather than traffic:
   once the first poll has a clock. Rendering "58 seconds ago" on the server is a
   guaranteed hydration mismatch — see `../../lib/AGENTS.md`.
 
-## `null` does not say which way it ended
+## `null` does not say which way it ended — so the tracker asks
 
 `current-ride` returns active rides only. A ride that reached `COMPLETED` or
-`CANCELLED` therefore arrives as `null`, and the response does **not** say which.
-The tracker shows "this ride is no longer active" and the last things it knew.
-Calling it completed or cancelled would be a guess about somebody's money; the
-answer needs the ride-detail endpoint, which is a later milestone.
+`CANCELLED` therefore arrives as `null`, and that response does not say which.
+
+The tracker's answer is `getRideDetail`: the moment the active ride disappears it
+reads the ride's own record once and reports the API's own `status`. That endpoint
+has no status filter, so it settles a finished ride where the polling endpoint cannot.
+
+This replaced an inference. The screen used to decide "completed" from the presence of
+a drop-off timestamp on the last *active* read — usually right, and the sort of claim
+that should not be guessed at the one moment somebody cares most. It also brings the
+audience-filtered `timeline`, which is why the finished view lists events while the
+live view lists instants.
 
 ## Depends on / depended on by
 
-Depends on `../../lib/passenger-api.js` (fares and rides), `../../lib/location-api.js`
-(the two place lists), `../../lib/format.js`, `../../lib/ride-status.js` and
-`../../lib/use-polling.js`, plus `../ui.js`, `../status-chip.js` and
-`../async-state.js` for markup. Depended on by `../../app/{signup,ride,track}/page.js`.
+Depends on `../../lib/passenger-api.js` (fares, rides and the ride detail),
+`../../lib/location-api.js` (the two place lists), `../../lib/format.js`,
+`../../lib/ride-status.js` and `../../lib/use-polling.js`, plus `../ui.js`,
+`../status-chip.js` and `../async-state.js` for markup. Depended on by
+`../../app/{signup,ride,track}/page.js`.
 
 **Never import `lib/session.js` from a file in this folder.** It uses
 `next/headers` and only works on the server; a client component that imports it

@@ -15,10 +15,9 @@ passenger's screen changes. Eight routes, all dynamic — `/` redirects, `/signi
 `/signup`, `/ride`, `/track`, `/driver`, and `/status` (the scaffold's diagnostics
 page, kept because it is the only screen that explains a broken environment).
 
-There is **no trip-execution UI, no history screen, no map, no cancellation, no
-payment and no admin screen**. The server supports all of those and documents them;
-this client calls only the endpoints it needs. Nothing here pushes: polling is the
-transport.
+There is **no history screen, no map, no cancellation, no payment and no admin
+screen**. The server supports all of those and documents them; this client calls only
+the endpoints it needs. Nothing here pushes: polling is the transport.
 
 Everything above the `END` marker is written and re-added by `next dev`; everything
 below it is ours and survives regeneration.
@@ -31,12 +30,16 @@ the sign-in form, because a form they would immediately re-submit is a loop.
 
 * The server is the source of truth for what either role may do next. Do not compute
   a transition, a permission or a fare here — read `stage` and `nextAction`
-  (passenger), `canGoOnline`, `canGoOffline`, an offer's `expired` and
-  `allowedActions` (driver) and render them.
+  (passenger), `canGoOnline`, `canGoOffline` and an offer's `expired` (driver), and
+  render the driver's trip controls one-for-one from `allowedActions`.
 * **`current-ride` answers with an *active* ride only**, and `200 { ride: null }`
-  otherwise. A ride that reached `COMPLETED` or `CANCELLED` therefore arrives as
-  `null`, and the response does not say which. Do not guess; the ride-detail endpoint
-  is a later milestone.
+  otherwise — so a finished ride arrives as `null` and does not say whether the
+  passenger arrived or was cancelled on. The tracker asks
+  `GET /passengers/me/rides/:id` at that moment, which has no status filter, rather
+  than inferring anything from the absence.
+* The six trip commands take **no body** — every identifier is in the path, and
+  idempotency is state, not a key: sending one twice returns the state it produced the
+  first time. A `409` means the ride moved on while the page was stale; re-read it.
 * The ride request is **quote-first**: `POST /api/fare-quotes` returns a quote the
   passenger owns, and `POST /api/ride-requests` is created *from* it with a required
   `Idempotency-Key` (8–128 characters, one per intent — not per attempt). A screen

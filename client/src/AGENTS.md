@@ -16,13 +16,15 @@ screen changes.
 
 | Half | Screens |
 | ---- | ------- |
-| Passenger | sign up, choose two places, see a price, request a ride, watch it |
-| Driver | sign in, go online, see the offer, accept or decline, see the pool |
+| Passenger | sign up, choose two places, see a price, request a ride, watch it to its outcome |
+| Driver | sign in, go online, answer an offer, drive the ride to the end |
 
-Neither half is complete, and what is missing is deliberate: the trip controls (set
-off, arrive, collect, start, drop off, finish), history, maps, cancellation, payment
-and anything administrative. The server supports all of it and is tested for it; the
-client does not call it yet.
+For an MVP both halves are now complete: the passenger requests, the driver accepts
+and drives, and the passenger's screen follows along to `completed`.
+
+What is missing is deliberate: history, maps, cancellation, payment and anything
+administrative. The server supports all of it and is tested for it; the client does
+not call it yet.
 
 That makes this directory the place where the API contract gets tested by use. When
 something here is awkward to write, the contract is often the thing to fix.
@@ -45,7 +47,9 @@ something here is awkward to write, the contract is often the thing to fix.
 * What a passenger may do next is read from the API (`stage`, `nextAction`), and what
   a driver may do is read from it too (`canGoOnline`, `canGoOffline`, `expired`,
   `allowedActions`). `lib/ride-status.js` and `lib/driver-status.js` rename those
-  values for a screen and derive nothing.
+  values for a screen and derive nothing. The driver's trip controls are rendered
+  from `allowedActions` one-for-one, which is why the screen has no idea what a
+  `FORMING` pool is.
 * Where a screen has to decide *which control to draw*, it uses a published fact —
   `online` — rather than a status it would have to interpret. Where the fact it needs
   is missing ("may I move?" has no boolean), the control is left out and the DTO gap

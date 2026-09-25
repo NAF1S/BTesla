@@ -8,8 +8,10 @@ import {
   getCurrentPool,
   listOffers,
   rejectOffer,
+  runTripAction,
   setAvailability,
 } from "@/lib/driver-api";
+import { TRIP_ACTION } from "@/lib/driver-status";
 import { usePolling } from "@/lib/use-polling";
 import { formatTime } from "@/lib/format";
 import { Heading, Notice } from "@/components/ui";
@@ -237,6 +239,36 @@ export function DriverConsole({ initial }) {
       },
     });
 
+  /**
+   * One trip command, named by the server's own `allowedActions` entry.
+   *
+   * The console does not decide whether the action is legal — the button only
+   * exists because the server listed it — and it does not decide which stop or
+   * passenger it applies to: `runTripAction` resolves both from `nextStop`. What
+   * happens here is the bookkeeping every action shares: mark busy, show the pool
+   * the command returned, re-read everything else, and say what happened.
+   *
+   * `refresh` matters more here than anywhere: a delivery releases that passenger,
+   * a departure freezes the fare, and a completion frees the driver — three
+   * different parts of the screen move on one button.
+   */
+  const onTripAction = (action) =>
+    run(() => runTripAction({ pool, action }), {
+      scope: "trip",
+      after: async () => {
+        // The command's own response is the pool *as the command left it* — which
+        // for a completion is a finished pool the driver is no longer on. So the
+        // displayed state comes from the re-read rather than from that response:
+        // `refresh` is what answers "is this still my current pool", and it also
+        // picks up the two other things a trip command moves — the driver's own
+        // availability, and the offers that are still open.
+        await refresh();
+        // `done`, not `label`: the label is a verb phrase that expects the place or
+        // the name after it ("Arrive at", "Pick up") and reads wrong on its own.
+        setNotice(TRIP_ACTION[action]?.done ?? `${action} — done`);
+      },
+    });
+
   return (
     <div className="flex flex-col gap-6">
       <AvailabilityPanel
@@ -257,7 +289,14 @@ export function DriverConsole({ initial }) {
 
       {notice ? <Notice tone="success">{notice}</Notice> : null}
 
-      {pool ? <CurrentPoolPanel pool={pool} /> : null}
+      {pool ? (
+        <CurrentPoolPanel
+          pool={pool}
+          busy={busy}
+          error={actionError?.scope === "trip" ? actionError.error : null}
+          onAction={onTripAction}
+        />
+      ) : null}
 
       <section className="flex flex-col gap-4">
         <Heading level={2} description="An offer goes to one driver at a time, and it expires.">
