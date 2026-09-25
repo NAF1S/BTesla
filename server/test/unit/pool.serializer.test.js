@@ -144,6 +144,19 @@ describe('toPoolDto', () => {
     // is the pickup -- even though the rows arrived drop-off first.
     assert.strictEqual(dto.nextStop.stopId, 'eeeeeeee-1111-1111-1111-111111111111');
     assert.strictEqual(dto.nextStop.stopType, 'PICKUP');
+
+    // `nextStop` is a whole stop, and the same one as in `stops` -- not a
+    // rule-shaped stub. Asserting only its id and type let a bug through where it
+    // carried `servicePoint: null` while the identical row in `stops` named the
+    // place, so the two are compared field by field here.
+    assert.deepStrictEqual(
+      dto.nextStop,
+      dto.stops.find((stop) => stop.stopId === dto.nextStop.stopId),
+      'the next stop must be the same stop the plan lists, in full',
+    );
+    assert.strictEqual(dto.nextStop.servicePoint.code, 'banani-road-11');
+    assert.strictEqual(dto.nextStop.plannedArrivalAt, '2026-09-25T03:03:34.645Z');
+
     assert.deepStrictEqual(
       dto.stops.map((stop) => stop.sequence),
       [1, 2],

@@ -124,6 +124,20 @@ export const toPoolDto = (pool) => {
   const context = toRuleContext(pool);
   const next = nextActionableStop(context.stops);
 
+  /**
+   * The next stop, as a *loaded row* rather than as a rule-shaped one.
+   *
+   * `nextActionableStop` is given the stripped stops from `toRuleContext` -- the
+   * four fields the rules read -- so the stop it returns has no `servicePoint` and
+   * no planned arrival. Serializing *that* produced a `nextStop` naming a stop the
+   * client could not name: `servicePoint: null` beside the identical stop in
+   * `stops[]`, which carried the place all along.
+   *
+   * So the decision comes from the rules and the data comes from the row: the two
+   * are matched by id, which is the one field both shapes carry for certain.
+   */
+  const nextRow = next ? pool.stops.find((stop) => stop.id === next.id) ?? null : null;
+
   return {
     poolId: pool.id,
     status: pool.status,
@@ -143,7 +157,7 @@ export const toPoolDto = (pool) => {
     stops: orderedStops(pool.stops).map(toStopDto),
     // The lowest-sequence stop that is not done: where the driver goes next, and
     // the only stop they may serve. Null once every stop is finished.
-    nextStop: next ? toStopDto(next) : null,
+    nextStop: nextRow ? toStopDto(nextRow) : null,
     // What the driver may do now, computed from the state (see the note above).
     allowedActions: allowedActions(context),
     // Whether the fare is settled: a boolean and a version, never an amount. A
