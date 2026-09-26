@@ -1651,13 +1651,14 @@ describe('acceptance', () => {
 
     // The event's fare and the request's stored fare are the same amount, shown
     // at the two precisions they are kept at: the timeline is audience-facing and
-    // formatted at the policy's scale, the column holds the exact accepted value.
+    // presents a charged fare as the whole number of taka it is, while the column
+    // holds the exact accepted value.
     const [{ fare }] = (
       await pool.query(`SELECT accepted_fare::text AS fare FROM ride_requests WHERE id = $1::uuid`, [
         rafiqRequest.id,
       ])
     ).rows;
-    assert.strictEqual(allocationEvent.metadata.acceptedSoloFare, Number(fare).toFixed(2));
+    assert.strictEqual(allocationEvent.metadata.acceptedSoloFare, Number(fare).toFixed(0));
 
     const acceptedEvent = (await listRideEvents(rafiqRequest.id)).find(
       (event) => event.eventType === 'POOL_JOIN_ACCEPTED',

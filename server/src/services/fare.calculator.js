@@ -40,9 +40,11 @@ import { Prisma } from '@prisma/client';
  *     trafficMultiplier      = rushHourMultiplier | normalTrafficMultiplier
  *     trafficAdjustment      = preTrafficSubtotal × (trafficMultiplier - 1)                 [rounded]
  *     trafficAdjustedFare    = preTrafficSubtotal + trafficAdjustment
- *     finalFare              = max(minimumFare, trafficAdjustedFare)
+ *     unroundedFare          = max(minimumFare, trafficAdjustedFare)
+ *     finalFare              = round(unroundedFare / fareRoundingUnit) × fareRoundingUnit   [snapped]
+ *     fareRoundingAdjustment = finalFare - unroundedFare
  *
- * Rounding is **HALF_UP to `roundingScale` decimals**, and it happens at exactly
+ * Rounding to `roundingScale` decimals is **HALF_UP**, and it happens at exactly
  * two kinds of boundary, both marked [rounded] above:
  *
  *   1. when a money figure is produced (each edge's distance charge, the time
@@ -50,16 +52,34 @@ import { Prisma } from '@prisma/client';
  *   2. when a configured *amount* enters the calculation (baseFare, minimumFare
  *      are expressed at `roundingScale`).
  *
- * Nothing else is rounded, and no figure is rounded twice. Rates are *not*
- * rounded: a rate is a price per unit, not an amount, so it keeps the precision
- * it was configured with.
+ * Nothing else is rounded at that scale, and no figure is rounded twice. Rates
+ * are *not* rounded: a rate is a price per unit, not an amount, so it keeps the
+ * precision it was configured with.
  *
  * The consequence is the property that makes a stored quote auditable: every
  * figure is an amount at `roundingScale`, so the stored components add up
  * exactly -- `distanceFare` is literally the sum of the per-edge charges in the
  * snapshot, `preTrafficSubtotal` is literally the sum of the three components,
- * and `finalFare` is literally the subtotal plus the traffic adjustment (or the
- * minimum fare). The database enforces the last two with CHECK constraints.
+ * and `unroundedFare` is literally the subtotal plus the traffic adjustment (or
+ * the minimum fare). The database enforces the last two with CHECK constraints.
+ *
+ * ...and then there is the *charged* fare, which is money in a different sense.
+ * `unroundedFare` is the right number to compute with and the wrong one to ask
+ * anybody for: nobody hands over sixty-three poisha. So one further snap is
+ * applied, once, to the protected fare and to nothing else --
+ *
+ *     finalFare = the nearest whole multiple of the policy's `fareRoundingUnit`
+ *
+ * -- and the difference is recorded as `fareRoundingAdjustment` rather than left
+ * as a gap between two numbers. Rounding is signed, because it goes whichever
+ * way is nearer: `130.63` becomes `130` (adjustment `-0.63`) and `126.00`
+ * becomes `130` (`+4.00`), so its magnitude never exceeds half a unit.
+ *
+ * **Only the charged fare is snapped.** The components that explain it keep
+ * `roundingScale`, which is what keeps the per-edge audit trail reproducible --
+ * snapping each edge's `59.78` to `60` would corrupt the breakdown to make the
+ * total look rounder. A charged fare is therefore a whole number while its
+ * components are not, and a client should present it that way (`CHARGE_SCALE`).
  *
  * The traffic multiplier is applied **once**, as `subtotal + adjustment`, never
  * as `subtotal × multiplier` after some other adjustment. `normalTrafficMultiplier`
@@ -86,6 +106,30 @@ export const MULTIPLIER_MINIMUM_PRECISION = 2;
 export const DEFAULT_ROUNDING_SCALE = 2;
 /** fare_quotes stores numeric(14,6), so 6 decimals is the widest usable scale. */
 export const MAX_ROUNDING_SCALE = 6;
+
+/**
+ * The decimals a *charged* fare is presented with.
+ *
+ * Zero, in one place, because a charged fare is a whole number: the policy's
+ * `fareRoundingUnit` is a whole number of at least 1, so a multiple of it has no
+ * fractional part. Every serializer that presents a fare -- as opposed to a
+ * component of one -- uses `chargeScale` below rather than the policy's
+ * `roundingScale`.
+ */
+export const CHARGE_SCALE = 0;
+
+/**
+ * The scale to present a charged fare at: a whole number needs no decimals.
+ *
+ * Derived from the amount rather than from a stored flag, which is what makes it
+ * safe on a fare written before the rounding rule existed. Such a quote holds
+ * `130.63` and nothing that says it was never rounded, so presenting it at
+ * `CHARGE_SCALE` would print `131` -- a price nobody was ever quoted. Reading the
+ * amount instead means a whole number is shown as one and anything else keeps
+ * `fallback`, which is the scale the row was stored with.
+ */
+export const chargeScale = (value, fallback = DEFAULT_ROUNDING_SCALE) =>
+  toExactDecimal(value, 'amount').isInteger() ? CHARGE_SCALE : fallback;
 
 /** numeric(14,6) holds up to 99,999,999.999999; anything past this cannot be stored. */
 export const MAX_STORABLE_AMOUNT = new Decimal('100000000');
@@ -152,6 +196,32 @@ export const roundTo = (value, scale) => value.toDecimalPlaces(scale, ROUNDING_M
 /** Rounds toward zero, which is what "the share before the residual" means. */
 export const roundDown = (value, scale) => value.toDecimalPlaces(scale, Decimal.ROUND_DOWN);
 
+/**
+ * Snap an amount to the nearest whole multiple of `unit`.
+ *
+ * This is how a *charged* fare is produced, and the only place it happens: the
+ * amount before it is the fare the formula produced, and the difference between
+ * the two is recorded rather than discarded. It is deliberately not a scale --
+ * `10` is a step, not a number of decimals, so a multiple of it is a round
+ * number of taka rather than a differently-punctuated one.
+ *
+ * HALF_UP, the same rule as every other money rounding here, so the same input
+ * always produces the same price.
+ */
+export const roundToUnit = (value, unit) => {
+  const step = toExactDecimal(unit, 'fare rounding unit');
+  if (!step.isInteger() || step.lt(1)) {
+    throw new FareCalculationError(
+      `a fare rounding unit must be a whole number of at least 1 (got ${step.toString()})`,
+    );
+  }
+
+  return toExactDecimal(value, 'amount')
+    .div(step)
+    .toDecimalPlaces(0, ROUNDING_MODE)
+    .times(step);
+};
+
 export const requirePositiveInteger = (value, label) => {
   const number = Number(value);
   if (!Number.isInteger(number) || number <= 0) {
@@ -202,6 +272,10 @@ export const readPolicy = (policy) => {
   const rushHourMultiplier = toExactDecimal(policy.rushHourMultiplier, `${label} rushHourMultiplier`);
   const configuredMinimumFare = toExactDecimal(policy.minimumFare, `${label} minimumFare`);
   const configuredBaseFare = toExactDecimal(policy.baseFare, `${label} baseFare`);
+  const configuredFareRoundingUnit = toExactDecimal(
+    policy.fareRoundingUnit,
+    `${label} fareRoundingUnit`,
+  );
 
   if (perKilometerRate.isNegative() || perMinuteRate.isNegative()) {
     throw new FareCalculationError(`${label} has a negative rate`);
@@ -212,12 +286,34 @@ export const readPolicy = (policy) => {
   if (normalTrafficMultiplier.lte(0) || rushHourMultiplier.lte(0)) {
     throw new FareCalculationError(`${label} has a multiplier that is not positive`);
   }
+  if (configuredFareRoundingUnit.lt(1) || !configuredFareRoundingUnit.isInteger()) {
+    throw new FareCalculationError(
+      `${label} has a fareRoundingUnit of ${configuredFareRoundingUnit.toString()}, ` +
+        'but a charged fare is rounded to a whole multiple of at least 1',
+    );
+  }
+
+  const baseFare = roundTo(configuredBaseFare, scale);
+  const minimumFare = roundTo(configuredMinimumFare, scale);
+
+  // The unit must divide the minimum fare, and that is the entire proof that
+  // rounding cannot undercut it: if the fare before rounding is at least the
+  // minimum, and the minimum is itself a whole number of units, the nearest
+  // multiple of the unit is at least the minimum too. A minimum of 85 with a
+  // unit of 10 would let an 86 fare round down to 80 and break the floor.
+  if (!minimumFare.div(configuredFareRoundingUnit).isInteger()) {
+    throw new FareCalculationError(
+      `${label} has a minimumFare of ${minimumFare.toString()}, which is not a whole number ` +
+        `of its fareRoundingUnit (${configuredFareRoundingUnit.toString()})`,
+    );
+  }
 
   return {
     code: policy.code,
     version,
     currency: policy.currency,
     roundingScale: scale,
+    fareRoundingUnit: configuredFareRoundingUnit,
     quoteTtlSeconds,
     perKilometerRate,
     perMinuteRate,
@@ -225,8 +321,8 @@ export const readPolicy = (policy) => {
     rushHourMultiplier,
     // Amounts enter the calculation at the policy's own money precision, so
     // every figure in the breakdown is an amount at `roundingScale`.
-    baseFare: roundTo(configuredBaseFare, scale),
-    minimumFare: roundTo(configuredMinimumFare, scale),
+    baseFare,
+    minimumFare,
   };
 };
 
@@ -386,7 +482,13 @@ export const calculateSoloFare = ({
   const trafficAdjustedFare = preTrafficSubtotal.plus(trafficAdjustment);
 
   const minimumFareApplied = priced.minimumFare.greaterThan(trafficAdjustedFare);
-  const finalFare = Decimal.max(priced.minimumFare, trafficAdjustedFare);
+
+  // The fare the protections produced, before the unit rounding. The database's
+  // identity check reconstructs it from the stored columns, which is why it is
+  // returned rather than kept local.
+  const unroundedFare = Decimal.max(priced.minimumFare, trafficAdjustedFare);
+  const finalFare = roundToUnit(unroundedFare, priced.fareRoundingUnit);
+  const fareRoundingAdjustment = finalFare.minus(unroundedFare);
 
   assertStorable({
     baseFare: priced.baseFare,
@@ -396,6 +498,8 @@ export const calculateSoloFare = ({
     trafficAdjustment,
     trafficAdjustedFare,
     minimumFare: priced.minimumFare,
+    unroundedFare,
+    fareRoundingAdjustment,
     finalFare,
   });
 
@@ -405,6 +509,7 @@ export const calculateSoloFare = ({
     pricingVersion: priced.version,
     roundingScale: scale,
     roundingMode: MONEY_ROUNDING_MODE,
+    fareRoundingUnit: priced.fareRoundingUnit,
     quoteTtlSeconds: priced.quoteTtlSeconds,
     trafficProfile: profile,
 
@@ -432,6 +537,8 @@ export const calculateSoloFare = ({
     trafficAdjustedFare,
     minimumFare: priced.minimumFare,
     minimumFareApplied,
+    unroundedFare,
+    fareRoundingAdjustment,
     finalFare,
   };
 };

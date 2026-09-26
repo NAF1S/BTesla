@@ -1,4 +1,6 @@
 import {
+  CHARGE_SCALE,
+  chargeScale,
   DEFAULT_ROUNDING_SCALE,
   formatKilometers,
   formatMinutes,
@@ -77,7 +79,15 @@ export const toFareQuoteDto = ({ quote, origin, destination }) => {
       trafficMultiplier: formatMultiplier(quote.trafficMultiplier, scale),
       trafficAdjustment: formatMoney(quote.trafficAdjustment, scale),
       minimumFareApplied: quote.minimumFareApplied,
-      finalFare: formatMoney(quote.finalFare, scale),
+      // The components above are arithmetic; these two are the price. The fare
+      // before the unit rounding, and what the rounding did to it -- so a client
+      // can see `130.63 -> 130` rather than a breakdown that does not add up.
+      //
+      // The pre-rounding fare is not a column: the database derives it from the
+      // adjustment in `fare_quotes_total_consistent`, and so does this.
+      unroundedFare: formatMoney(quote.finalFare.minus(quote.fareRoundingAdjustment), scale),
+      fareRoundingAdjustment: formatMoney(quote.fareRoundingAdjustment, scale),
+      finalFare: formatMoney(quote.finalFare, chargeScale(quote.finalFare, scale)),
     },
     expiresAt: toIsoString(quote.expiresAt),
   };

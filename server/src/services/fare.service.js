@@ -3,6 +3,7 @@ import { prisma } from '../db/prisma.js';
 import { ApiError } from '../utils/ApiError.js';
 import {
   calculateSoloFare,
+  CHARGE_SCALE,
   FareCalculationError,
   formatKilometers,
   formatMinutes,
@@ -199,7 +200,13 @@ const toFareBreakdown = (fare) => ({
   pricingCode: fare.pricingCode,
   pricingVersion: fare.pricingVersion,
   trafficProfile: fare.trafficProfile,
-  rounding: { scale: fare.roundingScale, mode: fare.roundingMode },
+  // `unit` is the fare rounding step, not a scale: the charged fare below is a
+  // whole multiple of it, while every component keeps `scale` decimals.
+  rounding: {
+    scale: fare.roundingScale,
+    mode: fare.roundingMode,
+    unit: formatMoney(fare.fareRoundingUnit, CHARGE_SCALE),
+  },
   quantities: {
     distanceMeters: fare.distanceMeters,
     distanceKilometers: formatKilometers(fare.distanceMeters),
@@ -224,7 +231,12 @@ const toFareBreakdown = (fare) => ({
     trafficAdjustment: formatMoney(fare.trafficAdjustment, fare.roundingScale),
     minimumFare: formatMoney(fare.minimumFare, fare.roundingScale),
     minimumFareApplied: fare.minimumFareApplied,
-    finalFare: formatMoney(fare.finalFare, fare.roundingScale),
+    // The fare the protections produced, and what the unit rounding did to it.
+    // `finalFare` is the money that changes hands, so it is the one figure here
+    // presented as a whole number rather than at the policy's scale.
+    unroundedFare: formatMoney(fare.unroundedFare, fare.roundingScale),
+    fareRoundingAdjustment: formatMoney(fare.fareRoundingAdjustment, fare.roundingScale),
+    finalFare: formatMoney(fare.finalFare, CHARGE_SCALE),
   },
 });
 
@@ -328,6 +340,8 @@ export const createSoloFareQuote = async ({
         minimumFare: fare.minimumFare,
         minimumFareApplied: fare.minimumFareApplied,
         finalFare: fare.finalFare,
+        fareRoundingUnit: fare.fareRoundingUnit,
+        fareRoundingAdjustment: fare.fareRoundingAdjustment,
         routeSnapshot: toRouteSnapshot(route, fare),
         fareBreakdown: toFareBreakdown(fare),
         expiresAt,

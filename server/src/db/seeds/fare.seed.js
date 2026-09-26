@@ -101,6 +101,23 @@ export const assertFareSeedDataIsCoherent = () => {
       throw new Error(`Fare policy ${label} must have a roundingScale between 0 and ${MAX_ROUNDING_SCALE}`);
     }
 
+    // A charged fare is a whole number of `fareRoundingUnit`, so the unit is a
+    // whole number of at least 1 -- and it has to divide `minimumFare`, or
+    // rounding could snap a fare below the floor the minimum fare promises.
+    const fareRoundingUnit = assertDecimalString(
+      policy.fareRoundingUnit,
+      `${label} fareRoundingUnit`,
+      { allowZero: false },
+    );
+    if (!fareRoundingUnit.isInteger()) {
+      throw new Error(`Fare policy ${label} must have a whole-number fareRoundingUnit`);
+    }
+    if (!new Prisma.Decimal(policy.minimumFare).div(fareRoundingUnit).isInteger()) {
+      throw new Error(
+        `Fare policy ${label} must have a minimumFare that is a whole number of its fareRoundingUnit`,
+      );
+    }
+
     const from = new Date(policy.effectiveFrom);
     if (Number.isNaN(from.getTime())) throw new Error(`Fare policy ${label} has an invalid effectiveFrom`);
 
@@ -126,6 +143,7 @@ const toPolicyData = (policy) => ({
   rushHourMultiplier: policy.rushHourMultiplier,
   quoteTtlSeconds: policy.quoteTtlSeconds,
   roundingScale: policy.roundingScale,
+  fareRoundingUnit: policy.fareRoundingUnit,
   active: policy.active ?? true,
   effectiveFrom: new Date(policy.effectiveFrom),
   effectiveTo: policy.effectiveTo ? new Date(policy.effectiveTo) : null,

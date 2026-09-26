@@ -53,6 +53,11 @@ export const FARE_POLICIES = [
     rushHourMultiplier: '1.1000',
     quoteTtlSeconds: 300,
     roundingScale: 2,
+    // Every charged fare is a whole number of taka, and 10 is the demo's step:
+    // a journey is quoted at 130, never at 130.63. The components of the fare
+    // still carry `roundingScale` decimals, because they are arithmetic rather
+    // than price. The unit must divide `minimumFare`, which 80 is.
+    fareRoundingUnit: '10',
     effectiveFrom: RETAIL_FROM,
     effectiveTo: null,
     active: true,

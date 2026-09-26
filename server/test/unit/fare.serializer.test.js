@@ -34,10 +34,13 @@ const quote = (overrides = {}) => ({
   trafficAdjustment: new Prisma.Decimal('11.880000'),
   minimumFare: new Prisma.Decimal('80.000000'),
   minimumFareApplied: false,
-  finalFare: new Prisma.Decimal('130.630000'),
+  unroundedFare: new Prisma.Decimal('130.630000'),
+  fareRoundingUnit: new Prisma.Decimal('10.000000'),
+  fareRoundingAdjustment: new Prisma.Decimal('-0.630000'),
+  finalFare: new Prisma.Decimal('130.000000'),
   expiresAt: new Date('2026-09-24T02:46:00.000Z'),
   routeSnapshot: { edges: [{ edgeCode: 'edge-a-to-b', fareWeight: '1.500' }] },
-  fareBreakdown: { rounding: { scale: 2, mode: 'HALF_UP' } },
+  fareBreakdown: { rounding: { scale: 2, mode: 'HALF_UP', unit: '10' } },
   ...overrides,
 });
 
@@ -65,6 +68,7 @@ describe('toFareQuoteDto', () => {
       'baseFare',
       'currency',
       'distanceFare',
+      'fareRoundingAdjustment',
       'finalFare',
       'minimumFareApplied',
       'preTrafficSubtotal',
@@ -73,6 +77,7 @@ describe('toFareQuoteDto', () => {
       'timeFare',
       'trafficAdjustment',
       'trafficMultiplier',
+      'unroundedFare',
     ]);
 
     assert.deepStrictEqual(Object.keys(dto().route).sort(), [
@@ -83,7 +88,7 @@ describe('toFareQuoteDto', () => {
     ]);
   });
 
-  it('returns money as exact two-decimal strings', () => {
+  it('returns money as exact decimal strings', () => {
     const fare = dto().fare;
 
     assert.strictEqual(fare.baseFare, '40.00');
@@ -91,11 +96,20 @@ describe('toFareQuoteDto', () => {
     assert.strictEqual(fare.timeFare, '18.97');
     assert.strictEqual(fare.preTrafficSubtotal, '118.75');
     assert.strictEqual(fare.trafficAdjustment, '11.88');
-    assert.strictEqual(fare.finalFare, '130.63');
     assert.strictEqual(fare.currency, 'BDT');
     assert.strictEqual(fare.pricingCode, 'dhaka-solo');
     assert.strictEqual(fare.pricingVersion, 1);
     assert.strictEqual(fare.minimumFareApplied, false);
+  });
+
+  it('presents the charged fare with no decimals, and the rounding that got it there', () => {
+    const fare = dto().fare;
+
+    // 118.75 + 11.88 = 130.63, which is charged as the nearest whole 10 taka.
+    // The difference is a field, not a gap: a client can show the arithmetic.
+    assert.strictEqual(fare.unroundedFare, '130.63');
+    assert.strictEqual(fare.fareRoundingAdjustment, '-0.63');
+    assert.strictEqual(fare.finalFare, '130');
   });
 
   it('formats every money field as a decimal string, never a number', () => {
@@ -108,10 +122,13 @@ describe('toFareQuoteDto', () => {
         continue;
       }
       assert.strictEqual(typeof value, 'string', `${field} must be a string`);
-      assert.match(value, /^\d+\.\d{2}$/, `${field} must be a two-decimal amount`);
+      // Signed, because the rounding adjustment goes whichever way is nearer, and
+      // with no decimals at all on the one field that is a price.
+      assert.match(value, /^-?\d+(\.\d{1,6})?$/, `${field} must be an exact decimal amount`);
     }
 
     assert.strictEqual(fare.trafficMultiplier, '1.10');
+    assert.strictEqual(fare.finalFare, '130');
   });
 
   it('formats kilometres and minutes as strings, without float noise', () => {
@@ -177,8 +194,10 @@ describe('toFareQuoteDto', () => {
         timeFare: new Prisma.Decimal('0'),
         preTrafficSubtotal: new Prisma.Decimal('41'),
         trafficAdjustment: new Prisma.Decimal('0'),
+        unroundedFare: new Prisma.Decimal('41'),
+        fareRoundingAdjustment: new Prisma.Decimal('0'),
         finalFare: new Prisma.Decimal('41'),
-        fareBreakdown: { rounding: { scale: 0, mode: 'HALF_UP' } },
+        fareBreakdown: { rounding: { scale: 0, mode: 'HALF_UP', unit: '1' } },
       }),
       origin,
       destination,
@@ -190,9 +209,11 @@ describe('toFareQuoteDto', () => {
 
   it('falls back to two decimals when the stored rule is unreadable', () => {
     // A quote that exists should still be returnable, so an unexpected scale
-    // degrades to the default rather than throwing.
+    // degrades to the default rather than throwing. The fare here is also the
+    // pre-rounding shape -- a fraction that no unit produced -- and it must keep
+    // its decimals rather than being rounded into a price nobody was quoted.
     for (const fareBreakdown of [null, {}, { rounding: {} }, { rounding: { scale: 'two' } }, { rounding: { scale: 99 } }]) {
-      const result = dto({ fareBreakdown });
+      const result = dto({ fareBreakdown, finalFare: new Prisma.Decimal('130.630000') });
       assert.strictEqual(result.fare.finalFare, '130.63');
     }
   });

@@ -214,8 +214,12 @@ describe('the examples in the document', () => {
   });
 
   it('shows the money as strings, because that is what the API sends', () => {
-    assert.match(spec, /fare: '130\.63'/, 'the accepted solo fare, as a string');
-    assert.match(spec, /totalPassengerFare: '126\.63'/, 'the pool total, as a string');
+    assert.match(spec, /fare: '130'/, 'the accepted solo fare, as a whole number of taka');
+    assert.match(spec, /totalPassengerFare: '130'/, 'the pool total, as a string');
+    // The components that explain a fare keep their decimals, which is what makes
+    // the rounding visible rather than something a client has to infer.
+    assert.match(spec, /unroundedFare: '126\.63'/, 'the fare before the unit rounding');
+    assert.match(spec, /fareRoundingAdjustment: '3\.37'/, 'what the rounding moved');
   });
 
   it('documents the errors a client has to handle', () => {

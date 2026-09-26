@@ -185,6 +185,10 @@ model FarePolicy {
   rushHourMultiplier      Decimal     @map("rush_hour_multiplier") @db.Decimal(6, 4)
   quoteTtlSeconds         Int         @map("quote_ttl_seconds")
   roundingScale           Int         @default(2) @map("rounding_scale") @db.SmallInt
+  /// The unit a charged fare is rounded to: a whole number of taka, so the
+  /// price a passenger is given is never a fraction. `minimumFare` must be a
+  /// whole number of units, which is what proves rounding cannot undercut it.
+  fareRoundingUnit        Decimal     @default(10) @map("fare_rounding_unit") @db.Decimal(12, 4)
   active                  Boolean     @default(true)
   effectiveFrom           DateTime    @map("effective_from") @db.Timestamptz(6)
   effectiveTo             DateTime?   @map("effective_to") @db.Timestamptz(6)
@@ -236,6 +240,11 @@ model FareQuote {
   minimumFare               Decimal           @map("minimum_fare") @db.Decimal(14, 6)
   minimumFareApplied        Boolean           @map("minimum_fare_applied")
   finalFare                 Decimal           @map("final_fare") @db.Decimal(14, 6)
+  /// The unit `finalFare` was rounded to (a whole number of taka). NULL only for
+  /// a quote written before the rule existed; nothing writes NULL now.
+  fareRoundingUnit          Decimal?          @map("fare_rounding_unit") @db.Decimal(14, 6)
+  /// `finalFare` minus the fare before rounding. Signed, and at most half a unit.
+  fareRoundingAdjustment    Decimal           @default(0) @map("fare_rounding_adjustment") @db.Decimal(14, 6)
   routeSnapshot             Json              @map("route_snapshot")
   fareBreakdown             Json              @map("fare_breakdown")
   expiresAt                 DateTime          @map("expires_at") @db.Timestamptz(6)
@@ -735,6 +744,12 @@ model PoolFareCalculation {
   totalFinalPassengerFare     Decimal                   @map("total_final_passenger_fare") @db.Decimal(14, 6)
   totalSoloCapReduction       Decimal                   @map("total_solo_cap_reduction") @db.Decimal(14, 6)
   totalNoIncreaseReduction    Decimal                   @map("total_no_increase_reduction") @db.Decimal(14, 6)
+  /// The sum of the per-passenger fare rounding adjustments: money the rounding
+  /// to whole taka added to or took off the pool.
+  totalFareRoundingAdjustment Decimal                   @default(0) @map("total_fare_rounding_adjustment") @db.Decimal(14, 6)
+  /// The unit every passenger's fare was rounded to. NULL for a calculation made
+  /// before the rule existed.
+  fareRoundingUnit            Decimal?                  @map("fare_rounding_unit") @db.Decimal(14, 6)
   createdAt                   DateTime                  @default(now()) @map("created_at") @db.Timestamptz(6)
   /// Set when the driver departs: the fare the trip is running under, frozen so
   /// that a settlement milestone has one answer to settle.
@@ -812,6 +827,12 @@ model PassengerFareAllocation {
   soloCapReduction         Decimal             @map("solo_cap_reduction") @db.Decimal(14, 6)
   noIncreaseReduction      Decimal             @map("no_increase_reduction") @db.Decimal(14, 6)
   finalFare                Decimal             @map("final_fare") @db.Decimal(14, 6)
+  /// The unit `finalFare` was rounded to, denormalised from the policy so this
+  /// row can prove its own divisibility: a CHECK cannot read another table.
+  fareRoundingUnit         Decimal?            @map("fare_rounding_unit") @db.Decimal(14, 6)
+  /// `finalFare` minus this passenger's fare before rounding. Signed, and at
+  /// most half a unit.
+  fareRoundingAdjustment   Decimal             @default(0) @map("fare_rounding_adjustment") @db.Decimal(14, 6)
   currency                 String
   createdAt                DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
   fareCalculation          PoolFareCalculation @relation(fields: [fareCalculationId], references: [id], onDelete: Cascade, onUpdate: NoAction)

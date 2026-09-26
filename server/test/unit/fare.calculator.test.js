@@ -7,6 +7,7 @@ import { Prisma } from '@prisma/client';
 
 import {
   calculateSoloFare,
+  CHARGE_SCALE,
   FareCalculationError,
   formatKilometers,
   formatMinutes,
@@ -46,6 +47,10 @@ const policy = (overrides = {}) => ({
   rushHourMultiplier: '2.00',
   quoteTtlSeconds: 300,
   roundingScale: 2,
+  // The same unit the seeded `dhaka-solo` policy uses, so this fixture describes
+  // the product rather than a second pricing scheme. `minimumFare` is 0.00, which
+  // is a whole number of any unit.
+  fareRoundingUnit: '10',
   ...overrides,
 });
 
@@ -97,6 +102,12 @@ const money = (result) => ({
   trafficMultiplier: formatMultiplier(result.trafficMultiplier, result.roundingScale),
   trafficAdjustment: formatMoney(result.trafficAdjustment, result.roundingScale),
   minimumFare: formatMoney(result.minimumFare, result.roundingScale),
+  // The fare the formula produced, and the difference the unit rounding made to
+  // it. `finalFare` is a whole number of taka, but it is formatted at the
+  // policy's scale here so the whole breakdown reads at one precision; the
+  // charge scale is the serialiser's business and is asserted separately.
+  unroundedFare: formatMoney(result.unroundedFare, result.roundingScale),
+  fareRoundingAdjustment: formatMoney(result.fareRoundingAdjustment, result.roundingScale),
   finalFare: formatMoney(result.finalFare, result.roundingScale),
 });
 
@@ -119,7 +130,11 @@ describe('exact decimal money', () => {
     assert.strictEqual(money(result).baseFare, '0.10');
     assert.strictEqual(money(result).distanceFare, '0.20');
     assert.strictEqual(money(result).timeFare, '3.00');
-    assert.strictEqual(money(result).finalFare, '3.30');
+    // 0.10 + 0.20 + 3.00, exactly. The charged fare is not asserted here: this
+    // test is about decimal addition, and the rounding to the unit is the fare
+    // rounding suite's subject.
+    assert.strictEqual(money(result).preTrafficSubtotal, '3.30');
+    assert.strictEqual(money(result).unroundedFare, '3.30');
   });
 
   it('keeps every money figure an exact Decimal, never a JavaScript number', () => {
@@ -208,7 +223,7 @@ describe('the fare formula', () => {
     assert.strictEqual(money(result).distanceFare, '65.81');
   });
 
-  it('keeps the stored components adding up to the final fare', () => {
+  it('keeps the stored components adding up to the fare the unit then rounds', () => {
     const result = price({
       policy: policy({ baseFare: '40.00', minimumFare: '0.00', rushHourMultiplier: '1.10' }),
       trafficProfile: 'RUSH_HOUR',
@@ -216,7 +231,10 @@ describe('the fare formula', () => {
 
     const subtotal = result.baseFare.plus(result.distanceFare).plus(result.timeFare);
     assert.ok(subtotal.equals(result.preTrafficSubtotal));
-    assert.ok(result.preTrafficSubtotal.plus(result.trafficAdjustment).equals(result.finalFare));
+    assert.ok(result.preTrafficSubtotal.plus(result.trafficAdjustment).equals(result.unroundedFare));
+    // ...and the one figure that is not the sum of anything: the rounding, which
+    // is recorded so that the charged fare is explainable from the row alone.
+    assert.ok(result.unroundedFare.plus(result.fareRoundingAdjustment).equals(result.finalFare));
   });
 
   it('makes the final fare the greater of the floor and the adjusted subtotal', () => {
@@ -229,16 +247,19 @@ describe('the fare formula', () => {
       trafficProfile: 'RUSH_HOUR',
     });
 
-    assert.strictEqual(money(above).finalFare, '130.63');
+    assert.strictEqual(money(above).unroundedFare, '130.63');
+    assert.strictEqual(money(below).unroundedFare, '80.00');
+    // ...and 130.63 is charged as 130 once it is snapped to the 10 taka unit.
+    assert.strictEqual(money(above).finalFare, '130.00');
     assert.strictEqual(money(below).finalFare, '80.00');
     assert.ok(
       Prisma.Decimal.max(above.minimumFare, above.preTrafficSubtotal.plus(above.trafficAdjustment)).equals(
-        above.finalFare,
+        above.unroundedFare,
       ),
     );
     assert.ok(
       Prisma.Decimal.max(below.minimumFare, below.preTrafficSubtotal.plus(below.trafficAdjustment)).equals(
-        below.finalFare,
+        below.unroundedFare,
       ),
     );
   });
@@ -354,7 +375,8 @@ describe('traffic multiplier', () => {
     });
 
     assert.strictEqual(money(result).trafficAdjustment, '11.88');
-    assert.strictEqual(money(result).finalFare, '130.63');
+    assert.strictEqual(money(result).unroundedFare, '130.63');
+    assert.strictEqual(money(result).finalFare, '130.00');
   });
 
   it('rejects an unknown or absent traffic profile rather than guessing one', () => {
@@ -463,7 +485,9 @@ describe('rounding', () => {
 
     // 40.50 at scale 0 is 41 by half-up, not 40.
     assert.strictEqual(formatMoney(result.baseFare, result.roundingScale), '41');
-    assert.strictEqual(formatMoney(result.finalFare, result.roundingScale), '41');
+    assert.strictEqual(formatMoney(result.unroundedFare, result.roundingScale), '41');
+    // The unit rounding is a separate, later step: 41 is not a multiple of 10.
+    assert.strictEqual(formatMoney(result.finalFare, CHARGE_SCALE), '40');
   });
 
   it('expresses configured amounts at the policy scale', () => {
@@ -484,6 +508,82 @@ describe('rounding', () => {
     });
 
     assert.strictEqual(result.policy.perKilometerRate.toString(), '0.005');
+  });
+});
+
+describe('the fare rounding unit', () => {
+  /** A fare made of nothing but a base fare, so the other components stay zero. */
+  const flatFare = (baseFare, overrides = {}) =>
+    price({
+      policy: policy({ baseFare, perKilometerRate: '0.00', perMinuteRate: '0.00', ...overrides }),
+    });
+
+  it('snaps the charged fare to a whole number of the unit', () => {
+    const result = flatFare('123.40');
+
+    assert.strictEqual(money(result).unroundedFare, '123.40');
+    assert.strictEqual(money(result).fareRoundingAdjustment, '-3.40');
+    assert.strictEqual(money(result).finalFare, '120.00');
+  });
+
+  it('rounds to the nearest unit, in both directions, and half up at the midpoint', () => {
+    assert.strictEqual(money(flatFare('123.40')).finalFare, '120.00');
+    assert.strictEqual(money(flatFare('150.15')).finalFare, '150.00');
+    assert.strictEqual(money(flatFare('126.00')).finalFare, '130.00');
+    // Exactly half a unit rounds up, like every other money rounding here.
+    assert.strictEqual(money(flatFare('125.00')).finalFare, '130.00');
+  });
+
+  it('records the rounding as a signed adjustment of at most half a unit', () => {
+    const down = flatFare('123.40');
+    const up = flatFare('126.00');
+
+    assert.strictEqual(money(down).fareRoundingAdjustment, '-3.40');
+    assert.strictEqual(money(up).fareRoundingAdjustment, '4.00');
+    assert.ok(down.fareRoundingAdjustment.abs().times(2).lte(down.fareRoundingUnit));
+    assert.ok(up.fareRoundingAdjustment.abs().times(2).lte(up.fareRoundingUnit));
+  });
+
+  it('leaves a fare that is already a whole number of units alone', () => {
+    const result = flatFare('120.00');
+
+    assert.strictEqual(money(result).fareRoundingAdjustment, '0.00');
+    assert.strictEqual(money(result).finalFare, '120.00');
+  });
+
+  it('presents the charge with no decimals while the components keep the policy scale', () => {
+    const result = flatFare('123.40');
+
+    assert.strictEqual(formatMoney(result.finalFare, CHARGE_SCALE), '120');
+    assert.strictEqual(formatMoney(result.unroundedFare, result.roundingScale), '123.40');
+  });
+
+  it('honours a unit that is not ten', () => {
+    assert.strictEqual(money(flatFare('123.40', { fareRoundingUnit: '5' })).finalFare, '125.00');
+  });
+
+  it('never rounds a fare below the minimum, which is why the minimum must divide by the unit', () => {
+    // 86 is above the 80 floor and rounds up to 90, so the charge still respects
+    // the floor. The interesting case is the one the policy constraint forbids: a
+    // minimum of 81 with a unit of 10 would let an 81 fare round *down* to 80.
+    const result = flatFare('86.00', { minimumFare: '80.00' });
+
+    assert.ok(result.finalFare.greaterThanOrEqualTo(result.minimumFare));
+    assert.strictEqual(money(result).finalFare, '90.00');
+  });
+
+  it('rejects a unit that is not a whole number of at least one', () => {
+    expectFailure(() => flatFare('10.00', { fareRoundingUnit: '0.50' }), /fareRoundingUnit/);
+    expectFailure(() => flatFare('10.00', { fareRoundingUnit: '0' }), /fareRoundingUnit/);
+    expectFailure(() => flatFare('10.00', { fareRoundingUnit: '-10' }), /fareRoundingUnit/);
+    expectFailure(() => flatFare('10.00', { fareRoundingUnit: undefined }), /fareRoundingUnit/);
+  });
+
+  it('rejects a minimum fare that is not a whole number of units', () => {
+    expectFailure(
+      () => flatFare('86.00', { minimumFare: '81.00' }),
+      /minimumFare of 81, which is not a whole number/,
+    );
   });
 });
 

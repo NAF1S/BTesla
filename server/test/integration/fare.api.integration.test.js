@@ -61,8 +61,13 @@ const MONEY_FIELDS = [
   'preTrafficSubtotal',
   'trafficMultiplier',
   'trafficAdjustment',
+  'unroundedFare',
+  'fareRoundingAdjustment',
   'finalFare',
 ];
+
+/** The money that is a component of the fare rather than the price of it. */
+const COMPONENT_FIELDS = MONEY_FIELDS.filter((field) => field !== 'finalFare');
 
 let api;
 let authCookie = null;
@@ -154,6 +159,14 @@ const expectedFare = async ({ originServicePointCode, destinationServicePointCod
   const trafficAdjustment = round(preTrafficSubtotal.times(trafficMultiplier.minus(1)));
   const trafficAdjustedFare = preTrafficSubtotal.plus(trafficAdjustment);
 
+  // The last step: the protected fare snapped to a whole number of the policy's
+  // unit, with the difference recorded rather than lost.
+  const unroundedFare = Prisma.Decimal.max(minimumFare, trafficAdjustedFare);
+  const finalFare = unroundedFare
+    .div(policy.fareRoundingUnit)
+    .toDecimalPlaces(0, Prisma.Decimal.ROUND_HALF_UP)
+    .times(policy.fareRoundingUnit);
+
   return {
     route,
     policy,
@@ -163,7 +176,9 @@ const expectedFare = async ({ originServicePointCode, destinationServicePointCod
     preTrafficSubtotal: preTrafficSubtotal.toFixed(scale),
     trafficMultiplier: trafficMultiplier.toFixed(2),
     trafficAdjustment: trafficAdjustment.toFixed(scale),
-    finalFare: Prisma.Decimal.max(minimumFare, trafficAdjustedFare).toFixed(scale),
+    unroundedFare: unroundedFare.toFixed(scale),
+    fareRoundingAdjustment: finalFare.minus(unroundedFare).toFixed(scale),
+    finalFare: finalFare.toFixed(0),
     minimumFare: minimumFare.toFixed(scale),
     minimumFareApplied: minimumFare.greaterThan(trafficAdjustedFare),
     durationMinutes: durationMinutes.toFixed(2),
@@ -251,6 +266,7 @@ describe('POST /api/fare-quotes', () => {
       'baseFare',
       'currency',
       'distanceFare',
+      'fareRoundingAdjustment',
       'finalFare',
       'minimumFareApplied',
       'preTrafficSubtotal',
@@ -259,6 +275,7 @@ describe('POST /api/fare-quotes', () => {
       'timeFare',
       'trafficAdjustment',
       'trafficMultiplier',
+      'unroundedFare',
     ]);
 
     const serialized = JSON.stringify(body);
@@ -281,14 +298,20 @@ describe('POST /api/fare-quotes', () => {
     }
   });
 
-  it('returns money as exact two-decimal strings that add up', async () => {
+  it('returns money as exact decimal strings, with the charge a whole number', async () => {
     const body = await quoteOk(request());
     const fare = body.fare;
 
-    for (const field of MONEY_FIELDS) {
+    // The components are amounts at the policy's scale, so they keep their
+    // decimals -- the snap applies to the fare and to nothing underneath it.
+    for (const field of COMPONENT_FIELDS) {
       assert.strictEqual(typeof fare[field], 'string', `${field} must be a string`);
-      assert.match(fare[field], /^\d+\.\d{2}$/, `${field} must be a two-decimal amount`);
+      assert.match(fare[field], /^-?\d+\.\d{2}$/, `${field} must be a two-decimal amount`);
     }
+
+    // The money that changes hands is a whole number of taka.
+    assert.strictEqual(typeof fare.finalFare, 'string');
+    assert.match(fare.finalFare, /^\d+$/, 'the charged fare must be a whole number');
 
     // A client can check the arithmetic from the response alone.
     const base = new Prisma.Decimal(fare.baseFare);
@@ -296,10 +319,15 @@ describe('POST /api/fare-quotes', () => {
     const time = new Prisma.Decimal(fare.timeFare);
     const subtotal = new Prisma.Decimal(fare.preTrafficSubtotal);
     const adjustment = new Prisma.Decimal(fare.trafficAdjustment);
+    const unrounded = new Prisma.Decimal(fare.unroundedFare);
+    const rounding = new Prisma.Decimal(fare.fareRoundingAdjustment);
     const final = new Prisma.Decimal(fare.finalFare);
 
     assert.ok(subtotal.equals(base.plus(distance).plus(time)), 'the components must add up');
-    assert.ok(final.equals(subtotal.plus(adjustment)), 'the total must be subtotal + adjustment');
+    assert.ok(unrounded.equals(subtotal.plus(adjustment)), 'the pre-rounding total must be subtotal + adjustment');
+    assert.ok(final.equals(unrounded.plus(rounding)), 'the charge must be the rounding applied to it');
+    assert.ok(final.div(10).isInteger(), 'the charge must be a whole number of 10 taka');
+    assert.ok(rounding.abs().times(2).lte(10), 'rounding never moves a fare more than half a unit');
   });
 
   it('formats kilometres to the metre and minutes to the second', async () => {
@@ -361,7 +389,7 @@ describe('POST /api/fare-quotes', () => {
     // The off-peak multiplier is 1.00, so there is no traffic adjustment at all:
     // the peak surcharge is the only traffic adjustment in the formula.
     assert.strictEqual(normal.fare.trafficAdjustment, '0.00');
-    assert.strictEqual(normal.fare.finalFare, normal.fare.preTrafficSubtotal);
+    assert.strictEqual(normal.fare.unroundedFare, normal.fare.preTrafficSubtotal);
     assert.notStrictEqual(rush.fare.trafficAdjustment, '0.00');
     assert.ok(new Prisma.Decimal(rush.fare.finalFare).greaterThan(normal.fare.finalFare));
   });
@@ -375,7 +403,7 @@ describe('POST /api/fare-quotes', () => {
     const adjustment = new Prisma.Decimal(fare.trafficAdjustment);
 
     assert.ok(adjustment.equals(subtotal.times(multiplier.minus(1)).toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP)));
-    assert.ok(new Prisma.Decimal(fare.finalFare).equals(subtotal.plus(adjustment)));
+    assert.ok(new Prisma.Decimal(fare.unroundedFare).equals(subtotal.plus(adjustment)));
     // A second application would be subtotal × 1.10 × 1.10.
     assert.notStrictEqual(
       fare.finalFare,
@@ -402,8 +430,9 @@ describe('POST /api/fare-quotes', () => {
       'the calculated fare has to be under the floor for this to be a minimum-fare case',
     );
     assert.strictEqual(body.fare.minimumFareApplied, true);
-    assert.strictEqual(body.fare.finalFare, expected.minimumFare);
-    assert.strictEqual(body.fare.finalFare, '80.00');
+    assert.strictEqual(body.fare.unroundedFare, expected.minimumFare);
+    assert.strictEqual(body.fare.finalFare, expected.finalFare);
+    assert.strictEqual(body.fare.finalFare, '80');
 
     // The floor is a floor, not a substitution: the components are still recorded.
     assert.strictEqual(body.fare.baseFare, '40.00');
@@ -420,10 +449,10 @@ describe('POST /api/fare-quotes', () => {
       'this journey is above the floor',
     );
     assert.ok(
-      new Prisma.Decimal(fare.finalFare).equals(
+      new Prisma.Decimal(fare.unroundedFare).equals(
         new Prisma.Decimal(fare.preTrafficSubtotal).plus(fare.trafficAdjustment),
       ),
-      'without a floor, the total is simply the adjusted subtotal',
+      'without a floor, the protected fare is simply the adjusted subtotal',
     );
   });
 });
@@ -501,7 +530,12 @@ describe('the stored quote', () => {
     assert.strictEqual(stored.pricingCode, policy.code);
     assert.strictEqual(stored.pricingVersion, policy.version);
     assert.strictEqual(stored.currency, 'BDT');
-    assert.strictEqual(stored.finalFare.toFixed(2), body.fare.finalFare);
+    assert.strictEqual(stored.finalFare.toFixed(0), body.fare.finalFare);
+    assert.strictEqual(stored.fareRoundingUnit.toFixed(0), '10');
+    assert.strictEqual(
+      stored.fareRoundingAdjustment.toFixed(2),
+      body.fare.fareRoundingAdjustment,
+    );
   });
 
   it('stores an auditable snapshot of the edges that were priced', async () => {
@@ -552,7 +586,7 @@ describe('the stored quote', () => {
 
     assert.strictEqual(breakdown.currency, 'BDT');
     assert.strictEqual(breakdown.pricingVersion, body.fare.pricingVersion);
-    assert.deepStrictEqual(breakdown.rounding, { scale: 2, mode: 'HALF_UP' });
+    assert.deepStrictEqual(breakdown.rounding, { scale: 2, mode: 'HALF_UP', unit: '10' });
     for (const field of MONEY_FIELDS) {
       assert.strictEqual(breakdown.components[field], body.fare[field], `components.${field}`);
     }

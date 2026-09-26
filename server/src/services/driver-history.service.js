@@ -1,7 +1,7 @@
 import { env } from '../config/env.js';
 import { prisma } from '../db/prisma.js';
 import { requireDriverProfileId } from '../middleware/auth.js';
-import { formatMoney } from './fare.calculator.js';
+import { chargeScale, formatMoney } from './fare.calculator.js';
 import { ApiError } from '../utils/ApiError.js';
 
 /**
@@ -80,10 +80,9 @@ const toRouteDto = (pool) => ({
  * the fare is settled.
  */
 const toFareSummary = (calculation) => {
-  if (!calculation) return null;
+  if (!calculation?.pricingPolicy) return null;
 
-  const scale = calculation.pricingPolicy?.roundingScale;
-  if (scale === undefined || scale === null) return null;
+  const scale = calculation.pricingPolicy.roundingScale;
 
   return {
     fareStatus: calculation.status === 'FINALIZED' ? 'FINALIZED' : 'ESTIMATED',
@@ -92,7 +91,10 @@ const toFareSummary = (calculation) => {
     currency: calculation.currency,
     poolVersion: calculation.poolVersion,
     // The whole pool: what every passenger in it was charged, added up.
-    totalPassengerFare: formatMoney(calculation.totalFinalPassengerFare, scale),
+    totalPassengerFare: formatMoney(
+      calculation.totalFinalPassengerFare,
+      chargeScale(calculation.totalFinalPassengerFare, scale),
+    ),
   };
 };
 

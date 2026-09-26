@@ -10,6 +10,7 @@ import {
   requirePositiveInteger,
   roundDown,
   roundTo,
+  roundToUnit,
   toExactDecimal,
 } from './fare.calculator.js';
 
@@ -57,12 +58,34 @@ import {
  * order (their member id). The shares of a leg therefore add up to exactly the
  * leg's cost -- never a unit more, never a unit less -- and each share records
  * the residual it received. The database enforces the same sum on commit.
+ *
+ * ---------------------------------------------------------------------------
+ * A CHARGED FARE IS A WHOLE NUMBER, AND THE SHARES ARE NOT
+ * ---------------------------------------------------------------------------
+ * Each passenger's fare is snapped once, at the end, to the nearest whole
+ * multiple of the policy's `fareRoundingUnit` -- the same rule a solo quote
+ * follows, applied to every passenger rather than to one. The difference is
+ * recorded per passenger as `fareRoundingAdjustment`, and the pool's total is the
+ * sum of them, so rounding is money that is accounted for rather than a gap.
+ *
+ * The snap is applied to the *fare* and to nothing underneath it. The leg costs
+ * and the leg shares keep the policy's rounding scale, which is what keeps
+ * `passenger_fare_leg_shares_sum_is_exact` true: splitting a leg is arithmetic,
+ * and a leg whose shares were each snapped to ten taka would no longer add up to
+ * the leg.
+ *
+ * It follows that the caps stay intact. A cap is itself a fare -- an accepted
+ * solo quote, or this passenger's own fare from the previous pool version -- so
+ * it is already a whole number of units, and rounding to the nearest unit cannot
+ * carry a fare past one. `final_fare <= accepted_solo_fare` and
+ * `final_fare <= previous_pooled_fare_cap` still hold, and are still enforced by
+ * the database rather than asserted here.
  */
 
 const { Decimal } = Prisma;
 
 /** Bumped whenever the arithmetic below changes what anybody is charged. */
-export const SHARED_FARE_RULE_VERSION = 'pool-leg-share-v1';
+export const SHARED_FARE_RULE_VERSION = 'pool-leg-share-v2';
 
 /**
  * CURRENT is what the pool owes now. SUPERSEDED is a previous answer, kept for
@@ -438,14 +461,17 @@ export const allocateLegShares = ({ totalLegCost, onboardMemberIds, scale }) => 
  *     uncappedPooledFare = baseFare + allocatedLegCost
  *     afterMinimum       = max(minimumFare, uncappedPooledFare)
  *     afterSoloCap       = min(acceptedSoloFare, afterMinimum)
- *     finalFare          = min(previousPooledFareCap ?? afterSoloCap, afterSoloCap)
+ *     unroundedFare      = min(previousPooledFareCap ?? afterSoloCap, afterSoloCap)
+ *     finalFare          = round(unroundedFare / fareRoundingUnit) × fareRoundingUnit
+ *     fareRoundingAdjustment = finalFare - unroundedFare
  *
  * The order matters and is the product's: the **minimum fare** is what the pool
  * would like to charge, the **solo cap** is what the passenger was promised when
  * they accepted their quote, and the **no-increase cap** is what they were
  * promised the last time this pool was priced. When they disagree, the passenger
  * wins and the difference is recorded -- it is money the platform does not
- * collect, not money that disappears.
+ * collect, not money that disappears. The unit rounding is then applied on top of
+ * whatever survived all three, and what it moved is recorded the same way.
  *
  * A passenger who has just joined has no previous pooled fare, which is what
  * makes their first pooled fare a fresh calculation rather than another cap.
@@ -476,8 +502,15 @@ export const computePassengerFare = ({
   const afterSoloCap = Decimal.min(soloFare, afterMinimum);
 
   const soloCapReduction = afterMinimum.minus(afterSoloCap);
-  const finalFare = previousCap === null ? afterSoloCap : Decimal.min(previousCap, afterSoloCap);
-  const noIncreaseReduction = afterSoloCap.minus(finalFare);
+  const unroundedFare = previousCap === null ? afterSoloCap : Decimal.min(previousCap, afterSoloCap);
+  const noIncreaseReduction = afterSoloCap.minus(unroundedFare);
+
+  // The last step, and the only one that changes what a passenger is asked for:
+  // the protected fare is snapped to a whole number of the policy's unit. Both
+  // caps above were fares themselves, so both are already whole numbers of units
+  // and the snap cannot carry this fare past either of them.
+  const finalFare = roundToUnit(unroundedFare, priced.fareRoundingUnit);
+  const fareRoundingAdjustment = finalFare.minus(unroundedFare);
 
   return {
     previousPooledFareCap: previousCap === null ? null : roundTo(previousCap, scale),
@@ -490,6 +523,9 @@ export const computePassengerFare = ({
     noIncreaseCapApplied: noIncreaseReduction.greaterThan(0),
     soloCapReduction: roundTo(soloCapReduction, scale),
     noIncreaseReduction: roundTo(noIncreaseReduction, scale),
+    unroundedFare: roundTo(unroundedFare, scale),
+    fareRoundingUnit: priced.fareRoundingUnit,
+    fareRoundingAdjustment: roundTo(fareRoundingAdjustment, scale),
     finalFare: roundTo(finalFare, scale),
   };
 };
@@ -509,6 +545,7 @@ export const totalise = ({ legs, allocations }) => {
   const finalFare = sumAmounts(allocations.map((allocation) => allocation.finalFare));
   const soloReduction = sumAmounts(allocations.map((allocation) => allocation.soloCapReduction));
   const noIncreaseReduction = sumAmounts(allocations.map((allocation) => allocation.noIncreaseReduction));
+  const fareRounding = sumAmounts(allocations.map((allocation) => allocation.fareRoundingAdjustment));
 
   // How much the minimum fare added on top of the pooled shares, across every
   // passenger. It is the part of a fare no passenger produced, so it is recorded
@@ -528,6 +565,9 @@ export const totalise = ({ legs, allocations }) => {
     totalFinalPassengerFare: finalFare,
     totalSoloCapReduction: soloReduction,
     totalNoIncreaseReduction: noIncreaseReduction,
+    // Signed, like the per-passenger adjustments it adds up: the unit rounding
+    // moved some fares up and some down, and the pool's total is the net.
+    totalFareRoundingAdjustment: fareRounding,
   };
 };
 

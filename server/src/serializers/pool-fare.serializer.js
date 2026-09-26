@@ -1,4 +1,4 @@
-import { formatMoney } from '../services/fare.calculator.js';
+import { chargeScale, formatMoney } from '../services/fare.calculator.js';
 
 /**
  * The passenger's view of what they are being charged.
@@ -35,29 +35,43 @@ export const toPassengerFareDto = ({
     calculationStatus: calculation.status,
     currency: calculation.currency,
 
-    // The numbers that answer "what do I owe, and why".
-    acceptedSoloFare: formatMoney(allocation.acceptedSoloFare, scale),
-    currentPooledFare: formatMoney(allocation.finalFare, scale),
+    // The numbers that answer "what do I owe, and why". A charged fare is a
+    // whole number of taka, so it is presented with no decimals while the leg
+    // cost and the base fare it was built from keep the policy's scale.
+    acceptedSoloFare: formatMoney(allocation.acceptedSoloFare, chargeScale(allocation.acceptedSoloFare, scale)),
+    currentPooledFare: formatMoney(allocation.finalFare, chargeScale(allocation.finalFare, scale)),
     baseFare: formatMoney(allocation.baseFare, scale),
     allocatedLegCost: formatMoney(allocation.allocatedLegCost, scale),
     uncappedPooledFare: formatMoney(allocation.uncappedPooledFare, scale),
     minimumFare: formatMoney(allocation.minimumFare, scale),
     minimumFareApplied: allocation.minimumFareApplied,
+    // What the unit rounding did to this passenger's fare: `unroundedFare` is
+    // the fare all the protections produced, and the adjustment below is the
+    // difference between it and the price above.
+    unroundedFare: formatMoney(
+      allocation.finalFare.minus(allocation.fareRoundingAdjustment),
+      scale,
+    ),
+    fareRoundingAdjustment: formatMoney(allocation.fareRoundingAdjustment, scale),
     legsPaidFor,
 
     // The protections, and what each of them took off.
     previousPooledFare:
       allocation.previousPooledFareCap === null
         ? null
-        : formatMoney(allocation.previousPooledFareCap, scale),
+        : formatMoney(
+            allocation.previousPooledFareCap,
+            chargeScale(allocation.previousPooledFareCap, scale),
+          ),
     soloCapApplied: allocation.soloCapApplied,
     noIncreaseCapApplied: allocation.noIncreaseCapApplied,
     soloCapReduction: formatMoney(allocation.soloCapReduction, scale),
     noIncreaseReduction: formatMoney(allocation.noIncreaseReduction, scale),
     totalReduction: formatMoney(totalReduction, scale),
+    // A difference between two charged fares, so it is a whole number too.
     savedAgainstSoloFare: formatMoney(
       allocation.acceptedSoloFare.minus(allocation.finalFare),
-      scale,
+      chargeScale(allocation.acceptedSoloFare.minus(allocation.finalFare), scale),
     ),
 
     // Which rules produced this number. A client can show them; a client cannot

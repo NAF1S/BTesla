@@ -48,8 +48,9 @@ This is the boundary a frontend sees, and the last place a leak can be stopped.
 * A list is `{ data: [...], pagination: { limit, offset, returned, total, hasMore } }`.
 * A single resource is the object itself. An "allowance" read is wrapped in the
   key it is about: `{ ride: … }`, `{ pool: … }`.
-* Money is a string with the currency's scale (`"130.63"`), with `currency` beside
-  it.
+* Money is a string. A **charged fare** is a whole number of taka (`"130"`), because
+  every fare is rounded to the policy's `fareRoundingUnit`; every other amount is a
+  string at the policy's own scale (`"59.78"`). `currency` always sits beside it.
 
 ## Depends on / depended on by
 

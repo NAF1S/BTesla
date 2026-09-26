@@ -30,7 +30,8 @@ import {
  *
  * The fixture policy is the seeded one, at its real rates: 40.00 base, 18.00 per
  * kilometre, 2.00 per minute, 80.00 minimum, 1.00 off-peak and 1.10 at rush
- * hour, rounded HALF_UP to two decimals.
+ * hour, rounded HALF_UP to two decimals, with every charged fare snapped to a
+ * whole 10 taka.
  */
 
 const { Decimal } = Prisma;
@@ -47,6 +48,7 @@ const POLICY = Object.freeze({
   minimumFare: new Decimal('80.0000'),
   normalTrafficMultiplier: new Decimal('1.0000'),
   rushHourMultiplier: new Decimal('1.1000'),
+  fareRoundingUnit: new Decimal('10.0000'),
 });
 
 /** One routed edge of a kilometre in two minutes: 18.00 of distance, 4.00 of time. */
@@ -75,7 +77,7 @@ const legsFor = (stops, capacities = 3, members = [...new Set(stops.map((s) => s
 
 describe('the shared-fare rule version', () => {
   it('names itself and tells an older calculation apart', () => {
-    assert.strictEqual(SHARED_FARE_RULE_VERSION, 'pool-leg-share-v1');
+    assert.strictEqual(SHARED_FARE_RULE_VERSION, 'pool-leg-share-v2');
     assert.strictEqual(isCurrentRuleVersion(SHARED_FARE_RULE_VERSION), true);
     assert.strictEqual(isCurrentRuleVersion('pool-leg-share-v0'), false);
     assert.strictEqual(isCurrentRuleVersion(null), false);
@@ -554,12 +556,15 @@ describe('passenger protections', () => {
   });
 
   it('reduces a fare to the fare that passenger was last given (categories 21, 22)', () => {
-    const fare = fareFor({ previousPooledFareCap: new Decimal('95.00') });
+    // The cap is a whole number of units, as every stored fare is -- see the
+    // caps-are-whole-units test below for what happens when it is not.
+    const fare = fareFor({ previousPooledFareCap: new Decimal('90.00') });
 
     assert.strictEqual(fare.uncappedPooledFare.toFixed(2), '140.00');
-    assert.strictEqual(fare.finalFare.toFixed(2), '95.00', 'the previous fare is a ceiling');
+    assert.strictEqual(fare.unroundedFare.toFixed(2), '90.00');
+    assert.strictEqual(fare.finalFare.toFixed(2), '90.00', 'the previous fare is a ceiling');
     assert.strictEqual(fare.noIncreaseCapApplied, true);
-    assert.strictEqual(fare.noIncreaseReduction.toFixed(2), '45.00');
+    assert.strictEqual(fare.noIncreaseReduction.toFixed(2), '50.00');
     assert.strictEqual(fare.soloCapApplied, false);
   });
 
@@ -579,6 +584,36 @@ describe('passenger protections', () => {
     assert.strictEqual(fare.noIncreaseCapApplied, true);
   });
 
+  it('snaps the protected fare to the unit and records what that moved (category 26)', () => {
+    const fare = fareFor({ allocatedLegCost: new Decimal('100.63') });
+
+    // 40.00 base + 100.63 of legs = 140.63, which a whole number of 10 taka
+    // rounds to 140. The components keep their two decimals; only the charge is
+    // snapped, and the 0.63 is written down rather than lost.
+    assert.strictEqual(fare.uncappedPooledFare.toFixed(2), '140.63');
+    assert.strictEqual(fare.unroundedFare.toFixed(2), '140.63');
+    assert.strictEqual(fare.fareRoundingAdjustment.toFixed(2), '-0.63');
+    assert.strictEqual(fare.finalFare.toFixed(2), '140.00');
+    assert.strictEqual(fare.fareRoundingUnit.toString(), '10');
+  });
+
+  it('rounds up to a cap without ever going past it (categories 20, 21)', () => {
+    // 40.00 + 49.63 = 89.63, whose nearest multiple of 10 is 90 -- exactly the
+    // cap. The protection holds because both caps are whole numbers of units:
+    // the nearest multiple of a unit to a fare at or below a cap cannot be above
+    // that cap.
+    const fare = fareFor({
+      allocatedLegCost: new Decimal('49.63'),
+      acceptedSoloFare: new Decimal('90.00'),
+      previousPooledFareCap: new Decimal('90.00'),
+    });
+
+    assert.strictEqual(fare.unroundedFare.toFixed(2), '89.63');
+    assert.strictEqual(fare.finalFare.toFixed(2), '90.00');
+    assert.ok(fare.finalFare.lte(fare.previousPooledFareCap));
+    assert.ok(fare.finalFare.lte('90.00'));
+  });
+
   it('never lets the minimum fare override a passenger protection (category 23)', () => {
     // A very short journey: 6.00 of legs plus the base fare is under the 80.00
     // minimum, so the minimum wants to charge 80.00 -- but this passenger was
@@ -586,13 +621,13 @@ describe('passenger protections', () => {
     const short = fareFor({
       allocatedLegCost: new Decimal('6.00'),
       acceptedSoloFare: new Decimal('50.00'),
-      previousPooledFareCap: new Decimal('45.00'),
+      previousPooledFareCap: new Decimal('40.00'),
     });
 
     assert.strictEqual(short.uncappedPooledFare.toFixed(2), '46.00');
     assert.strictEqual(short.minimumFare.toFixed(2), '80.00');
     assert.strictEqual(short.minimumFareApplied, true, 'the minimum was considered');
-    assert.strictEqual(short.finalFare.toFixed(2), '45.00', 'and the protections still win');
+    assert.strictEqual(short.finalFare.toFixed(2), '40.00', 'and the protections still win');
     assert.strictEqual(short.noIncreaseCapApplied, true);
     assert.strictEqual(
       short.finalFare.plus(short.soloCapReduction).plus(short.noIncreaseReduction).toFixed(2),
@@ -655,6 +690,7 @@ describe('the totals a calculation stores', () => {
         finalFare: new Decimal('140.00'),
         soloCapReduction: new Decimal('0.00'),
         noIncreaseReduction: new Decimal('0.00'),
+        fareRoundingAdjustment: new Decimal('0.00'),
       },
       {
         baseFare: new Decimal('40.00'),
@@ -663,6 +699,7 @@ describe('the totals a calculation stores', () => {
         finalFare: new Decimal('80.00'),
         soloCapReduction: new Decimal('15.00'),
         noIncreaseReduction: new Decimal('0.00'),
+        fareRoundingAdjustment: new Decimal('0.00'),
       },
     ];
 
@@ -678,17 +715,43 @@ describe('the totals a calculation stores', () => {
     assert.strictEqual(totals.totalFinalPassengerFare.toFixed(2), '220.00');
     assert.strictEqual(totals.totalSoloCapReduction.toFixed(2), '15.00');
     assert.strictEqual(totals.totalNoIncreaseReduction.toFixed(2), '0.00');
+    assert.strictEqual(totals.totalFareRoundingAdjustment.toFixed(2), '0.00');
 
     // The identity the database enforces, checked here too: what the passengers
-    // were charged plus every reduction accounts for the fares and for whatever
-    // the minimum fare added on top of them.
+    // were charged plus every reduction plus the rounding accounts for the fares
+    // and for whatever the minimum fare added on top of them.
     assert.strictEqual(
       totals.totalFinalPassengerFare
         .plus(totals.totalSoloCapReduction)
         .plus(totals.totalNoIncreaseReduction)
         .toFixed(2),
-      totals.totalUncappedPassengerFare.plus(totals.totalMinimumFareUplift).toFixed(2),
+      totals.totalUncappedPassengerFare
+        .plus(totals.totalMinimumFareUplift)
+        .plus(totals.totalFareRoundingAdjustment)
+        .toFixed(2),
     );
+  });
+
+  it('adds the per-passenger rounding into one signed pool total', () => {
+    // Rounding goes whichever way is nearer, so a pool's total is a net: one
+    // passenger's 0.63 given away against another's 4.00 added.
+    const totals = totalise({
+      legs: [{ totalLegCost: new Decimal('10.00') }],
+      allocations: [
+        { fareRoundingAdjustment: new Decimal('-0.63') },
+        { fareRoundingAdjustment: new Decimal('4.00') },
+      ].map((rounding) => ({
+        baseFare: new Decimal('0.00'),
+        uncappedPooledFare: new Decimal('0.00'),
+        minimumFare: new Decimal('0.00'),
+        finalFare: new Decimal('0.00'),
+        soloCapReduction: new Decimal('0.00'),
+        noIncreaseReduction: new Decimal('0.00'),
+        ...rounding,
+      })),
+    });
+
+    assert.strictEqual(totals.totalFareRoundingAdjustment.toFixed(2), '3.37');
   });
 
   it('records the part of a fare that only the minimum fare produced', () => {

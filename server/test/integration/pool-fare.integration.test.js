@@ -617,13 +617,14 @@ describe('the calculation a pool starts with', () => {
     assert.strictEqual(allocated.metadata.poolVersion, 1);
     assert.strictEqual(allocated.metadata.sharedFareRuleVersion, SHARED_FARE_RULE_VERSION);
 
-    // The event's fare is this passenger's own, at the policy's scale.
+    // The event's fare is this passenger's own, as a whole number of taka, while
+    // the leg cost it was built from keeps the policy's scale.
     const calculation = await currentCalculation(poolId);
     const [allocation] = await allocationsOf(calculation.id);
-    assert.strictEqual(allocated.metadata.finalFare, money(allocation.final_fare).toFixed(2));
+    assert.strictEqual(allocated.metadata.finalFare, money(allocation.final_fare).toFixed(0));
     assert.strictEqual(
       allocated.metadata.acceptedSoloFare,
-      money(allocation.accepted_solo_fare).toFixed(2),
+      money(allocation.accepted_solo_fare).toFixed(0),
     );
 
     const poolEvents = await listPoolEvents(poolId);
@@ -1257,12 +1258,14 @@ describe('versioning', () => {
                 shared_fare_rule_version, status, currency, traffic_profile, route_distance_meters,
                 route_duration_seconds, total_variable_route_cost, total_passenger_base_fare,
                 total_uncapped_passenger_fare, total_minimum_fare_uplift, total_final_passenger_fare,
-                total_solo_cap_reduction, total_no_increase_reduction)
+                total_solo_cap_reduction, total_no_increase_reduction,
+                fare_rounding_unit, total_fare_rounding_adjustment)
              SELECT ride_pool_id, pool_version + 5, pricing_policy_id, pricing_code, pricing_version,
                     shared_fare_rule_version, 'CURRENT', currency, traffic_profile, route_distance_meters,
                     route_duration_seconds, total_variable_route_cost, total_passenger_base_fare,
                     total_uncapped_passenger_fare, total_minimum_fare_uplift, total_final_passenger_fare,
-                    total_solo_cap_reduction, total_no_increase_reduction
+                    total_solo_cap_reduction, total_no_increase_reduction,
+                    fare_rounding_unit, total_fare_rounding_adjustment
                FROM pool_fare_calculations WHERE id = $1::uuid`,
             calculation.id,
           ),
@@ -1291,12 +1294,14 @@ describe('versioning', () => {
                 shared_fare_rule_version, status, currency, traffic_profile, route_distance_meters,
                 route_duration_seconds, total_variable_route_cost, total_passenger_base_fare,
                 total_uncapped_passenger_fare, total_minimum_fare_uplift, total_final_passenger_fare,
-                total_solo_cap_reduction, total_no_increase_reduction)
+                total_solo_cap_reduction, total_no_increase_reduction,
+                fare_rounding_unit, total_fare_rounding_adjustment)
              SELECT ride_pool_id, pool_version, pricing_policy_id, pricing_code, pricing_version,
                     shared_fare_rule_version, 'SUPERSEDED', currency, traffic_profile, route_distance_meters,
                     route_duration_seconds, total_variable_route_cost, total_passenger_base_fare,
                     total_uncapped_passenger_fare, total_minimum_fare_uplift, total_final_passenger_fare,
-                    total_solo_cap_reduction, total_no_increase_reduction
+                    total_solo_cap_reduction, total_no_increase_reduction,
+                    fare_rounding_unit, total_fare_rounding_adjustment
                FROM pool_fare_calculations WHERE id = $1::uuid`,
             calculation.id,
           ),
@@ -1323,7 +1328,7 @@ describe('versioning', () => {
       ],
       [`UPDATE pool_fare_calculations SET pool_version = pool_version + 1 WHERE id = $1::uuid`, [calculation.id]],
       [
-        `UPDATE pool_fare_calculations SET shared_fare_rule_version = 'pool-leg-share-v2' WHERE id = $1::uuid`,
+        `UPDATE pool_fare_calculations SET shared_fare_rule_version = 'pool-leg-share-v9' WHERE id = $1::uuid`,
         [calculation.id],
       ],
       [`UPDATE passenger_fare_allocations SET final_fare = 0 WHERE fare_calculation_id = $1::uuid`, [calculation.id]],
@@ -1580,8 +1585,8 @@ describe('privacy', () => {
     const nusratAllocation = allocations.find((a) => a.ride_request_id === nusratRequest.id);
     const rafiqAllocation = allocations.find((a) => a.ride_request_id === rafiqRequest.id);
 
-    assert.strictEqual(hers.body.currentPooledFare, money(nusratAllocation.final_fare).toFixed(2));
-    assert.strictEqual(his.body.currentPooledFare, money(rafiqAllocation.final_fare).toFixed(2));
+    assert.strictEqual(hers.body.currentPooledFare, money(nusratAllocation.final_fare).toFixed(0));
+    assert.strictEqual(his.body.currentPooledFare, money(rafiqAllocation.final_fare).toFixed(0));
 
     // The two answers are different, and the difference is in the passenger's own
     // numbers: each is told the fare they accepted, and neither payload contains

@@ -1,4 +1,4 @@
-import { formatMoney } from '../services/fare.calculator.js';
+import { chargeScale, formatMoney } from '../services/fare.calculator.js';
 import { isCancellable } from '../services/ride.status.js';
 import { passengerTripStage } from '../services/trip.rules.js';
 import { quoteRoundingScale } from './fare.serializer.js';
@@ -19,8 +19,8 @@ import { quoteRoundingScale } from './fare.serializer.js';
  *     which name pools, offers and drivers.
  *
  * The accepted money is a frozen copy made at request time, so it cannot drift:
- * the format is the quote's own (see `quoteRoundingScale`), because the accepted
- * fare is exactly that amount.
+ * it is presented as the whole number of taka it is, or at the quote's own scale
+ * if it predates the rounding rule.
  *
  * ---------------------------------------------------------------------------
  * THE TRIP IS OPTIONAL, AND THAT IS DELIBERATE
@@ -103,7 +103,10 @@ const toPassengerTripDto = ({ member, pool, stops, events }, requestStatus) => {
  * is WAITING, which is also the only status the cancellation operation accepts.
  */
 export const toRideRequestDto = (request, { trip = null } = {}) => {
-  const scale = quoteRoundingScale(request.fareQuote);
+  const acceptedFareScale = chargeScale(
+    request.acceptedFare,
+    quoteRoundingScale(request.fareQuote),
+  );
 
   return {
     id: request.id,
@@ -119,7 +122,7 @@ export const toRideRequestDto = (request, { trip = null } = {}) => {
     },
     acceptedQuote: {
       fareQuoteId: request.fareQuoteId,
-      fare: formatMoney(request.acceptedFare, scale),
+      fare: formatMoney(request.acceptedFare, acceptedFareScale),
       currency: request.currency,
       pricingCode: request.acceptedPricingCode,
       pricingVersion: request.acceptedPricingVersion,

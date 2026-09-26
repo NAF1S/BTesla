@@ -20,7 +20,8 @@ openapi: 3.1.0
 #
 # The examples use the demo cast (`02-seed.sql`): Nusrat and Rafiq travel, Jashim
 # drives, and the Banani Road 11 → Mohakhali Bus Terminal journey is the reference
-# trip (2214 m, 569 s at rush hour, BDT 130.63 quoted solo).
+# trip (2214 m, 569 s at rush hour, BDT 130 quoted solo -- 118.75 of subtotal plus
+# 11.88 of peak adjustment, rounded to a whole number of 10 taka).
 # ---------------------------------------------------------------------------
 
 info:
@@ -222,12 +223,12 @@ paths:
                       cancelledAt: null
                       route: { distanceMeters: 2214, durationSeconds: 569 }
                       soloEstimate:
-                        fare: '130.63'
+                        fare: '130'
                         currency: BDT
                         pricingCode: dhaka-solo
                         pricingVersion: 1
                       sharedFare:
-                        fare: '126.63'
+                        fare: '130'
                         currency: BDT
                         finalized: true
                         poolVersion: 1
@@ -341,11 +342,11 @@ paths:
                         cancelledAt: null
                         route: { distanceMeters: 2214, durationSeconds: 569 }
                         soloEstimate:
-                          fare: '130.63'
+                          fare: '130'
                           currency: BDT
                           pricingCode: dhaka-solo
                           pricingVersion: 1
-                        sharedFare: { fare: '126.63', currency: BDT, finalized: true, poolVersion: 1 }
+                        sharedFare: { fare: '130', currency: BDT, finalized: true, poolVersion: 1 }
                         driver: { displayName: Jashim }
                         vehicle: { name: Bullet, seatCapacity: 3 }
                         passengerCount: 1
@@ -406,8 +407,8 @@ paths:
                 completedAt: '2026-09-25T12:17:07.895Z'
                 cancelledAt: null
                 route: { distanceMeters: 2214, durationSeconds: 569 }
-                soloEstimate: { fare: '130.63', currency: BDT, pricingCode: dhaka-solo, pricingVersion: 1 }
-                sharedFare: { fare: '126.63', currency: BDT, finalized: true, poolVersion: 1 }
+                soloEstimate: { fare: '130', currency: BDT, pricingCode: dhaka-solo, pricingVersion: 1 }
+                sharedFare: { fare: '130', currency: BDT, finalized: true, poolVersion: 1 }
                 driver: { displayName: Jashim }
                 vehicle: { name: Bullet, seatCapacity: 3 }
                 passengerCount: 1
@@ -924,7 +925,7 @@ paths:
                           finalizedAt: '2026-09-25T12:17:07.382Z'
                           currency: BDT
                           poolVersion: 1
-                          totalPassengerFare: '126.63'
+                          totalPassengerFare: '130'
                     pagination: { limit: 20, offset: 0, returned: 1, total: 1, hasMore: false }
                 empty:
                   summary: A driver who has not driven yet
@@ -1029,7 +1030,7 @@ paths:
                   finalizedAt: '2026-09-25T12:17:07.382Z'
                   currency: BDT
                   poolVersion: 1
-                  totalPassengerFare: '126.63'
+                  totalPassengerFare: '130'
                 allowedActions: []
                 timeline:
                   - sequence: 1
@@ -1631,13 +1632,15 @@ paths:
                 fareStatus: FINALIZED
                 calculationStatus: FINALIZED
                 currency: BDT
-                acceptedSoloFare: '130.63'
-                currentPooledFare: '126.63'
+                acceptedSoloFare: '130'
+                currentPooledFare: '130'
                 baseFare: '40.00'
                 allocatedLegCost: '86.63'
                 uncappedPooledFare: '126.63'
                 minimumFare: '80.00'
                 minimumFareApplied: false
+                unroundedFare: '126.63'
+                fareRoundingAdjustment: '3.37'
                 legsPaidFor: 1
                 previousPooledFare: null
                 soloCapApplied: false
@@ -1645,10 +1648,10 @@ paths:
                 soloCapReduction: '0.00'
                 noIncreaseReduction: '0.00'
                 totalReduction: '0.00'
-                savedAgainstSoloFare: '4.00'
+                savedAgainstSoloFare: '0'
                 pricingCode: dhaka-solo
                 pricingVersion: 1
-                sharedFareRuleVersion: pool-leg-share-v1
+                sharedFareRuleVersion: pool-leg-share-v2
                 poolVersion: 1
                 calculatedAt: '2026-09-25T12:17:06.902Z'
         '400':
@@ -2279,7 +2282,7 @@ components:
       description: A solo fare quote, frozen at the instant it was priced.
       properties:
         id: { type: string, format: uuid }
-        fare: { type: string, example: '130.63' }
+        fare: { type: string, description: 'A whole number of taka: every fare is rounded to the policy''s unit.', example: '130' }
         currency: { type: string, example: BDT }
         distanceMeters: { type: integer, example: 2214 }
         durationSeconds: { type: integer, example: 569 }
@@ -2306,13 +2309,27 @@ components:
         fareStatus: { type: string, enum: [ESTIMATED, FINALIZED] }
         calculationStatus: { type: string, enum: [CURRENT, SUPERSEDED, FINALIZED] }
         currency: { type: string, example: BDT }
-        acceptedSoloFare: { type: string, example: '130.63' }
-        currentPooledFare: { type: string, example: '126.63' }
+        acceptedSoloFare:
+          type: string
+          description: The quote this passenger accepted, as a whole number of taka.
+          example: '130'
+        currentPooledFare:
+          type: string
+          description: What this passenger owes now, as a whole number of taka.
+          example: '130'
         baseFare: { type: string, example: '40.00' }
         allocatedLegCost: { type: string, example: '86.63' }
         uncappedPooledFare: { type: string, example: '126.63' }
         minimumFare: { type: string, example: '80.00' }
         minimumFareApplied: { type: boolean }
+        unroundedFare:
+          type: string
+          description: '`currentPooledFare` before the rounding to whole taka. A component, so it keeps the policy''s decimals.'
+          example: '126.63'
+        fareRoundingAdjustment:
+          type: string
+          description: 'Signed: `currentPooledFare - unroundedFare`. What the rounding to the unit moved, at most half a unit in either direction.'
+          example: '3.37'
         legsPaidFor: { type: integer, example: 1 }
         previousPooledFare: { type: string, nullable: true }
         soloCapApplied: { type: boolean }
@@ -2320,10 +2337,10 @@ components:
         soloCapReduction: { type: string, example: '0.00' }
         noIncreaseReduction: { type: string, example: '0.00' }
         totalReduction: { type: string, example: '0.00' }
-        savedAgainstSoloFare: { type: string, example: '4.00' }
+        savedAgainstSoloFare: { type: string, example: '0' }
         pricingCode: { type: string, example: dhaka-solo }
         pricingVersion: { type: integer, example: 1 }
-        sharedFareRuleVersion: { type: string, example: pool-leg-share-v1 }
+        sharedFareRuleVersion: { type: string, example: pool-leg-share-v2 }
         poolVersion: { type: integer, example: 1 }
         calculatedAt: { type: string, format: date-time }
 
@@ -2342,7 +2359,7 @@ components:
           type: object
           properties:
             fareQuoteId: { type: string, format: uuid }
-            fare: { type: string, example: '130.63' }
+            fare: { type: string, description: 'A whole number of taka: every fare is rounded to the policy''s unit.', example: '130' }
             currency: { type: string, example: BDT }
             pricingCode: { type: string, example: dhaka-solo }
             pricingVersion: { type: integer, example: 1 }
@@ -2519,7 +2536,7 @@ components:
       description: The solo fare the passenger accepted when the request was made, frozen.
       required: [fare, currency, pricingCode, pricingVersion]
       properties:
-        fare: { type: string, example: '130.63' }
+        fare: { type: string, description: 'A whole number of taka: every fare is rounded to the policy''s unit.', example: '130' }
         currency: { type: string, example: BDT }
         pricingCode: { type: string, example: dhaka-solo }
         pricingVersion: { type: integer, example: 1 }
@@ -2532,7 +2549,7 @@ components:
         an answer.
       required: [fare, currency, finalized, poolVersion]
       properties:
-        fare: { type: string, example: '126.63' }
+        fare: { type: string, description: 'What this passenger is charged, as a whole number of taka.', example: '130' }
         currency: { type: string, example: BDT }
         finalized:
           type: boolean
@@ -2881,7 +2898,7 @@ components:
         finalizedAt: { type: string, format: date-time, nullable: true }
         currency: { type: string, example: BDT }
         poolVersion: { type: integer }
-        totalPassengerFare: { type: string, description: 'Every passenger in the pool, added up.', example: '126.63' }
+        totalPassengerFare: { type: string, description: 'Every passenger in the pool, added up. A whole number of taka, like every fare.', example: '130' }
 
     DriverRideSummary:
       type: object

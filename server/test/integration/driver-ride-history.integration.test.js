@@ -486,7 +486,7 @@ describe('one of the driver\'s pools in detail', () => {
       'totalPassengerFare',
     ]);
     assert.strictEqual(ride.fare.fareStatus, 'FINALIZED');
-    assert.match(ride.fare.totalPassengerFare, /^\d+\.\d{2}$/);
+    assert.match(ride.fare.totalPassengerFare, /^\d+$/, 'a charged fare is a whole number of taka');
 
     // What the passenger was charged, per person, is not in the response.
     const payload = JSON.stringify(ride);

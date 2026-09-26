@@ -1,4 +1,4 @@
-import { formatMoney } from '../services/fare.calculator.js';
+import { chargeScale, formatMoney } from '../services/fare.calculator.js';
 import { isCancellable } from '../services/ride.status.js';
 import { passengerNextAction, passengerTripStage } from '../services/trip.rules.js';
 import { TIMELINE_AUDIENCE, toTimeline } from '../services/timeline.rules.js';
@@ -60,13 +60,12 @@ const toVehicleSummary = (pool) =>
  * that has not started.
  */
 const toFareSummary = (fare) => {
-  if (!fare) return null;
+  if (!fare || !fare.fareCalculation?.pricingPolicy) return null;
 
-  const scale = fare.fareCalculation?.pricingPolicy?.roundingScale;
-  if (scale === undefined || scale === null) return null;
+  const scale = fare.fareCalculation.pricingPolicy.roundingScale;
 
   return {
-    fare: formatMoney(fare.finalFare, scale),
+    fare: formatMoney(fare.finalFare, chargeScale(fare.finalFare, scale)),
     currency: fare.currency,
     finalized: fare.fareCalculation?.status === 'FINALIZED',
     poolVersion: fare.fareCalculation?.poolVersion ?? null,
@@ -113,7 +112,6 @@ const toStage = (request, member, stops) =>
  * would be the wrong timestamp to show them.
  */
 export const toRideSummaryDto = ({ request, fare }) => {
-  const scale = quoteRoundingScale(request.fareQuote);
   const member = request.poolMember ?? null;
   const pool = member?.ridePool ?? null;
 
@@ -137,7 +135,10 @@ export const toRideSummaryDto = ({ request, fare }) => {
     },
 
     soloEstimate: {
-      fare: formatMoney(request.acceptedFare, scale),
+      fare: formatMoney(
+        request.acceptedFare,
+        chargeScale(request.acceptedFare, quoteRoundingScale(request.fareQuote)),
+      ),
       currency: request.currency,
       pricingCode: request.acceptedPricingCode,
       pricingVersion: request.acceptedPricingVersion,

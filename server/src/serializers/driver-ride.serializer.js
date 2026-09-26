@@ -1,4 +1,4 @@
-import { formatMoney } from '../services/fare.calculator.js';
+import { chargeScale, formatMoney } from '../services/fare.calculator.js';
 import { allowedActions, nextActionableStop, orderedStops } from '../services/trip.rules.js';
 import { TIMELINE_AUDIENCE, toTimeline } from '../services/timeline.rules.js';
 
@@ -80,10 +80,9 @@ const toStopDto = (stop) => ({
  * that passenger was charged.
  */
 const toFareSummary = (calculation) => {
-  if (!calculation) return null;
+  if (!calculation?.pricingPolicy) return null;
 
-  const scale = calculation.pricingPolicy?.roundingScale;
-  if (scale === undefined || scale === null) return null;
+  const scale = calculation.pricingPolicy.roundingScale;
 
   return {
     fareStatus: calculation.status === 'FINALIZED' ? 'FINALIZED' : 'ESTIMATED',
@@ -91,7 +90,10 @@ const toFareSummary = (calculation) => {
     finalizedAt: toIsoString(calculation.finalizedAt),
     currency: calculation.currency,
     poolVersion: calculation.poolVersion,
-    totalPassengerFare: formatMoney(calculation.totalFinalPassengerFare, scale),
+    totalPassengerFare: formatMoney(
+      calculation.totalFinalPassengerFare,
+      chargeScale(calculation.totalFinalPassengerFare, scale),
+    ),
   };
 };
 

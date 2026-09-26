@@ -129,6 +129,7 @@ erDiagram
         decimal rush_hour_multiplier
         int quote_ttl_seconds
         smallint rounding_scale
+        decimal fare_rounding_unit
         boolean active
         timestamptz effective_from
         timestamptz effective_to

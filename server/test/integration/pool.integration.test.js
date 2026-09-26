@@ -390,8 +390,9 @@ describe('accepting an offer', () => {
     const allocated = rideEvents[4];
     assert.strictEqual(allocated.metadata.poolVersion, 1);
     // This suite quotes at 08:41, so the accepted solo fare is the rush-hour
-    // reference fare for Banani Road 11 -> Mohakhali Bus Terminal.
-    assert.strictEqual(allocated.metadata.acceptedSoloFare, '130.63');
+    // reference fare for Banani Road 11 -> Mohakhali Bus Terminal: 118.75 + 11.88
+    // before the unit rounding, charged as a whole number of 10 taka.
+    assert.strictEqual(allocated.metadata.acceptedSoloFare, '130');
     assert.ok(allocated.metadata.fareCalculationId);
 
     const poolEvents = await listPoolEvents(created.id);

@@ -30,7 +30,7 @@ Two things per seeder: a `*.data.js` holding the values as plain data, and a
   ```text
   nusrat@example.com    passenger   (Banani Road 11 -> Mohakhali Bus Terminal
   rafiq@example.com     passenger    is the reference journey: 2214 m, 569 s,
-  shirin@example.com    passenger    BDT 130.63 quoted solo at rush hour)
+  shirin@example.com    passenger    BDT 130 quoted solo at rush hour)
   jashim@example.com    driver      one vehicle: "Bullet", 3 seats
   password: DemoPass123!  (unless DEMO_SEED_PASSWORD says otherwise)
   ```

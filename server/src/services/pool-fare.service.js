@@ -11,7 +11,13 @@ import {
   POOL_STOP_STATUS,
 } from './dispatch.rules.js';
 import { findEffectiveFarePolicy, loadFareWeights } from './fare.service.js';
-import { formatKilometers, formatMinutes, formatMoney } from './fare.calculator.js';
+import {
+  CHARGE_SCALE,
+  chargeScale,
+  formatKilometers,
+  formatMinutes,
+  formatMoney,
+} from './fare.calculator.js';
 import {
   POOL_FARE_STATUS,
   PoolFareError,
@@ -570,6 +576,8 @@ export const recalculatePoolFares = async ({
       totalFinalPassengerFare: totals.totalFinalPassengerFare,
       totalSoloCapReduction: totals.totalSoloCapReduction,
       totalNoIncreaseReduction: totals.totalNoIncreaseReduction,
+      totalFareRoundingAdjustment: totals.totalFareRoundingAdjustment,
+      fareRoundingUnit: policy.fareRoundingUnit,
       createdAt: now,
     },
     select: { id: true },
@@ -617,6 +625,8 @@ export const recalculatePoolFares = async ({
         soloCapReduction: allocation.fare.soloCapReduction,
         noIncreaseReduction: allocation.fare.noIncreaseReduction,
         finalFare: allocation.fare.finalFare,
+        fareRoundingUnit: allocation.fare.fareRoundingUnit,
+        fareRoundingAdjustment: allocation.fare.fareRoundingAdjustment,
         currency: policy.currency,
         createdAt: now,
       },
@@ -659,9 +669,17 @@ export const recalculatePoolFares = async ({
       routeDurationSeconds,
       totalVariableRouteCost: formatMoney(totals.totalVariableRouteCost, policy.roundingScale),
       totalMinimumFareUplift: formatMoney(totals.totalMinimumFareUplift, policy.roundingScale),
-      totalFinalPassengerFare: formatMoney(totals.totalFinalPassengerFare, policy.roundingScale),
+      totalFinalPassengerFare: formatMoney(
+        totals.totalFinalPassengerFare,
+        chargeScale(totals.totalFinalPassengerFare, policy.roundingScale),
+      ),
       totalSoloCapReduction: formatMoney(totals.totalSoloCapReduction, policy.roundingScale),
       totalNoIncreaseReduction: formatMoney(totals.totalNoIncreaseReduction, policy.roundingScale),
+      totalFareRoundingAdjustment: formatMoney(
+        totals.totalFareRoundingAdjustment,
+        policy.roundingScale,
+      ),
+      fareRoundingUnit: formatMoney(policy.fareRoundingUnit, CHARGE_SCALE),
       passengerCount: allocations.length,
     },
     now,
@@ -682,14 +700,27 @@ export const recalculatePoolFares = async ({
         sharedFareRuleVersion: SHARED_FARE_RULE_VERSION,
         pricingCode: policy.code,
         pricingVersion: policy.version,
-        acceptedSoloFare: formatMoney(allocation.request.acceptedFare, policy.roundingScale),
+        acceptedSoloFare: formatMoney(
+          allocation.request.acceptedFare,
+          chargeScale(allocation.request.acceptedFare, policy.roundingScale),
+        ),
         previousPooledFare:
           allocation.fare.previousPooledFareCap === null
             ? null
-            : formatMoney(allocation.fare.previousPooledFareCap, policy.roundingScale),
+            : formatMoney(
+                allocation.fare.previousPooledFareCap,
+                chargeScale(allocation.fare.previousPooledFareCap, policy.roundingScale),
+              ),
         allocatedLegCost: formatMoney(allocation.fare.allocatedLegCost, policy.roundingScale),
         baseFare: formatMoney(allocation.fare.baseFare, policy.roundingScale),
-        finalFare: formatMoney(allocation.fare.finalFare, policy.roundingScale),
+        finalFare: formatMoney(
+          allocation.fare.finalFare,
+          chargeScale(allocation.fare.finalFare, policy.roundingScale),
+        ),
+        fareRoundingAdjustment: formatMoney(
+          allocation.fare.fareRoundingAdjustment,
+          policy.roundingScale,
+        ),
         currency: policy.currency,
         legsPaidFor: allocation.shares.length,
       },
@@ -882,6 +913,7 @@ export const loadCurrentFareForRequest = async ({ rideRequestId }) => {
       soloCapReduction: true,
       noIncreaseReduction: true,
       finalFare: true,
+      fareRoundingAdjustment: true,
       createdAt: true,
       shares: { select: { poolFareLegId: true } },
     },
