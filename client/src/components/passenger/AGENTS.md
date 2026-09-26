@@ -9,6 +9,7 @@ client, and it is deliberately the only passenger-side folder that imports
 | `sign-up-form.js` | Name, email, password -> `POST /auth/register` as a `PASSENGER` |
 | `ride-request-panel.js` | Two locations -> a quote -> a ride request |
 | `ride-tracker.js` | The current ride, polled every few seconds — and its outcome once it ends |
+| `cancel-request.js` | Calling off a ride nobody has taken yet |
 
 Signing in and out used to live here. They moved to `../auth/` when the driver's
 screens arrived and needed them too: a person signs in **before** they are a
@@ -90,6 +91,26 @@ a drop-off timestamp on the last *active* read — usually right, and the sort o
 that should not be guessed at the one moment somebody cares most. It also brings the
 audience-filtered `timeline`, which is why the finished view lists events while the
 live view lists instants.
+
+## Cancelling: offered from `cancellable`, never from a status
+
+`cancel-request.js` renders only when the ride's `cancellable` flag is true, and that
+flag **is** the rule: the server computes it with `isCancellable(status)`, which is
+`status === "WAITING"`, and the endpoint enforces the same thing as a state
+transition — `WAITING -> CANCELLED` is in the machine, `MATCHED -> CANCELLED` is not.
+
+So the "only while waiting" requirement is asked for, not restated. Writing
+`ride.status === "WAITING"` here would give the same answer today and a worse one
+later: the two drift the moment a rule changes, and the hand-written comparison
+silently stops offering a cancel the server would allow — or offers one it refuses.
+
+The refusal itself is worth handling properly. A `409` means a driver accepted while
+the passenger was choosing a reason, so the control says *that* rather than "could
+not cancel", and the tracker's next poll re-renders the screen without it.
+
+After a success there is no new screen to build: the tracker sets the ride to `null`
+and reuses the terminal path it already had, which fetches the record that says
+`CANCELLED` and stops polling.
 
 ## Depends on / depended on by
 

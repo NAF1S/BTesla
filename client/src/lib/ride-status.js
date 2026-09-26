@@ -152,6 +152,27 @@ export const STOP_STATUS = {
 };
 
 /**
+ * The four reasons the product defines for calling a ride off.
+ *
+ * This list is closed and it is the API's: the value is stored on the request and
+ * shown back to the passenger in their own history, so a reason made up here would
+ * be a `400`. `OTHER` is the server's default when a cancellation says nothing —
+ * which is why it is offered last rather than first.
+ *
+ * Note what the reasons are *not*: an explanation the platform acts on. Nothing
+ * charges, refunds or penalises anybody for cancelling while a ride is still
+ * waiting; the reason is a record.
+ *
+ * @type {Array<{ value: import("./types").CancellationReason, label: string }>}
+ */
+export const CANCELLATION_REASONS = [
+  { value: "CHANGED_MIND", label: "I changed my mind" },
+  { value: "WRONG_LOCATION", label: "I picked the wrong place" },
+  { value: "WAIT_TOO_LONG", label: "It is taking too long" },
+  { value: "OTHER", label: "Another reason" },
+];
+
+/**
  * The statuses that mean there is nothing left to poll for.
  *
  * The `current-ride` endpoint answers with an *active* ride only, so a finished

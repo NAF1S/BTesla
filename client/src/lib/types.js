@@ -122,6 +122,16 @@
  * @typedef {"WAITING" | "MATCHED" | "IN_PROGRESS" | "COMPLETED" | "CANCELLED" | "EXPIRED"} RideRequestStatus
  */
 
+/**
+ * Why a passenger called a ride off. The closed list the API accepts.
+ *
+ * A cancellation is only ever permitted from `WAITING`, and `CANCELLED` is
+ * terminal — there is no un-cancel. Nothing charges or penalises anybody for it;
+ * the reason is a record that the passenger's own history shows back to them.
+ *
+ * @typedef {"CHANGED_MIND" | "WRONG_LOCATION" | "WAIT_TOO_LONG" | "OTHER"} CancellationReason
+ */
+
 /** Where the passenger is in their own journey, derived by the server.
  * @typedef {"DRIVER_ASSIGNED" | "DRIVER_EN_ROUTE" | "DRIVER_ARRIVED" | "PICKED_UP" | "IN_PROGRESS" | "RIDE_COMPLETED"} PassengerStage
  */
@@ -166,6 +176,11 @@
  *
  * `stage` and `nextAction` are computed on the server from the request's own
  * timestamps. The UI renders them; it never derives them.
+ *
+ * `cancellable` is the server's own answer to "may this be called off?" — true
+ * exactly while the request is `WAITING`. Render the cancel control from it rather
+ * than from `status`, so the screen cannot disagree with the endpoint that will
+ * refuse the call.
  *
  * `passengerCount` is the only fact about the other people in the car, and it is
  * a count — deliberately, because a count cannot be unpacked into a person.

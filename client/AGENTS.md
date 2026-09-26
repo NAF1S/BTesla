@@ -37,9 +37,12 @@ the sign-in form, because a form they would immediately re-submit is a loop.
   passenger arrived or was cancelled on. The tracker asks
   `GET /passengers/me/rides/:id` at that moment, which has no status filter, rather
   than inferring anything from the absence.
-* The six trip commands take **no body** — every identifier is in the path, and
+* **The six trip commands take no body** — every identifier is in the path, and
   idempotency is state, not a key: sending one twice returns the state it produced the
   first time. A `409` means the ride moved on while the page was stale; re-read it.
+* **Cancelling is a passenger write, and only from `WAITING`.** The ride DTO publishes
+  `cancellable`, true exactly then, and the endpoint refuses anything else with a
+  `409`. Render the control from that flag rather than from `status`.
 * The ride request is **quote-first**: `POST /api/fare-quotes` returns a quote the
   passenger owns, and `POST /api/ride-requests` is created *from* it with a required
   `Idempotency-Key` (8–128 characters, one per intent — not per attempt). A screen

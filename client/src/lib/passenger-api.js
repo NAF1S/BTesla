@@ -173,3 +173,36 @@ export const getCurrentRide = async ({ cookie } = {}) => {
  */
 export const getRideDetail = ({ rideRequestId, cookie }) =>
   apiFetch(`/passengers/me/rides/${rideRequestId}`, { cookie });
+
+/**
+ * Calls off a request that is still waiting for a driver.
+ *
+ * ---------------------------------------------------------------------------
+ * THE ONE PASSENGER-DRIVEN STATUS CHANGE, AND WHEN IT IS ALLOWED
+ * ---------------------------------------------------------------------------
+ * The API permits this **only while the request is `WAITING`**, as a transition
+ * rather than a special case: `WAITING -> CANCELLED` is in the state machine, and
+ * `MATCHED -> CANCELLED` is deliberately not. That is why this takes an id and a
+ * reason and nothing else — there is no "force", no override, and no way for a
+ * client to talk the server into it.
+ *
+ * A caller does not need to know the rule, because the server publishes its
+ * answer: a ride DTO carries `cancellable`, which is true exactly then. A screen
+ * renders the control from that rather than from `status === "WAITING"`, so the
+ * two cannot disagree — and if a later milestone makes a matched ride cancellable
+ * with conditions, every screen follows without being changed.
+ *
+ * Cancelling also withdraws any dispatch offer that is outstanding, in the same
+ * transaction: a driver who was being asked about this ride is told it is gone
+ * rather than left answering a question that no longer has an answer.
+ *
+ * The failures a caller must handle: `404` if the ride is not theirs (the same
+ * answer as an unknown id), and `409` if it stopped being cancellable while the
+ * passenger was deciding — which a driver accepting a ride at that exact moment
+ * does. A `409` is therefore not an error to retry; it is a re-read.
+ *
+ * @param {{ rideRequestId: string, reason?: import("./types").CancellationReason }} cancellation
+ * @returns {Promise<{ id: string, status: string, cancellationReason: string | null }>}
+ */
+export const cancelRideRequest = ({ rideRequestId, reason }) =>
+  apiPost(`/ride-requests/${rideRequestId}/cancel`, reason ? { reason } : {});

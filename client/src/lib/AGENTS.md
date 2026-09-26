@@ -10,7 +10,7 @@ only presentation.
 | `auth-api.js` | Sign in, sign up, sign out, "who am I" — role-independent | both |
 | `roles.js` | The roles, and where each of them lives | both |
 | `location-api.js` | Zones and service points — public reference data | both |
-| `passenger-api.js` | Fares, ride requests, the current ride, one ride in detail | both |
+| `passenger-api.js` | Fares, ride requests, the current ride, one ride in detail, cancelling | both |
 | `driver-api.js` | Availability, offers, the accepted pool, the six trip commands | both |
 | `session.js` | The route guard, and the cookie reader | **server only** |
 | `use-polling.js` | The polling policy, shared by both live screens | **client only** |

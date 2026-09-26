@@ -2,13 +2,14 @@
 
 import { useCallback, useState } from "react";
 
-import { getCurrentRide, getRideDetail } from "@/lib/passenger-api";
+import { cancelRideRequest, getCurrentRide, getRideDetail } from "@/lib/passenger-api";
 import { usePolling } from "@/lib/use-polling";
 import { formatDistance, formatDuration, formatMoney, formatElapsed, formatTime } from "@/lib/format";
 import { MEMBER_STATUS, NEXT_ACTION, PASSENGER_STAGE, POOL_STATUS, STOP_STATUS, isFinished } from "@/lib/ride-status";
 import { Button, Facts, Heading, LinkButton, Notice, Panel } from "@/components/ui";
 import { Chip, Labeled, PlaceLine, RideStatusChip } from "@/components/status-chip";
 import { EmptyState, ErrorState, Loading } from "@/components/async-state";
+import { CancelRequest } from "./cancel-request";
 
 /**
  * The passenger's live view of their ride.
@@ -75,6 +76,17 @@ export function RideTracker({ initialRide = null, pollIntervalMs = POLL_INTERVAL
    */
   const [finishedRide, setFinishedRide] = useState(null);
   const [finishing, setFinishing] = useState(false);
+
+  /**
+   * Calling the ride off, while the server still allows it.
+   *
+   * Two pieces of state rather than one: `busy` disables the form, and `cancelError`
+   * is handed to the control so it can say *where* the failure happened. A `409` in
+   * particular is not a failed cancellation — it is a driver having accepted at that
+   * exact moment, which the next poll will show.
+   */
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelError, setCancelError] = useState(null);
 
   /**
    * The browser's clock, or `null` until this component has run in a browser.
@@ -162,6 +174,39 @@ export function RideTracker({ initialRide = null, pollIntervalMs = POLL_INTERVAL
   }, [load, settleArrival]);
 
   usePolling(poll, { intervalMs: pollIntervalMs });
+
+  /**
+   * Calls the ride off, and hands the screen to the outcome it already knows how to
+   * show.
+   *
+   * There is no "cancelled" state to invent here. Setting `ride` to `null` is
+   * enough: the screen already treats "there was a ride and there is not one" as the
+   * terminal case, and `settleArrival` then reads the record that says *how* it
+   * ended — which for this ride is now `CANCELLED`, with the timeline and the reason
+   * beside it. The polling loop notices the null on its next tick and stops.
+   *
+   * A failure leaves the ride exactly where it was. The one that matters is a `409`:
+   * the server refusing because a driver accepted while the passenger was choosing a
+   * reason. Nothing was cancelled, and the honest response is to say so and re-read —
+   * which the poll does on its own.
+   */
+  const onCancel = useCallback(
+    async (reason) => {
+      setCancelling(true);
+      setCancelError(null);
+
+      try {
+        await cancelRideRequest({ rideRequestId: ride.rideRequestId, reason });
+        setRide(null);
+        await settleArrival();
+      } catch (err) {
+        setCancelError(err);
+      } finally {
+        setCancelling(false);
+      }
+    },
+    [ride, settleArrival],
+  );
 
   // "The ride ended" is derived, not stored: there was a ride, and now there is
   // not one. A passenger who never had one gets the empty state instead.
@@ -268,6 +313,16 @@ export function RideTracker({ initialRide = null, pollIntervalMs = POLL_INTERVAL
           ]}
         />
       </Panel>
+
+      {/*
+        The cancel control, offered only while the server says it may be. That flag
+        is `isCancellable(status)`, which is `WAITING` — so "only if the status is
+        waiting" is not restated here, it is asked for. Nothing about the ride's
+        status is inspected to decide this.
+      */}
+      {ride.cancellable ? (
+        <CancelRequest busy={cancelling} error={cancelError} onCancel={onCancel} />
+      ) : null}
 
       <Panel>
         <Heading level={3}>Your journey</Heading>

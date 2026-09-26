@@ -2354,18 +2354,65 @@ There is no push in this project, so the tracker asks. The interesting part is h
 * **A failed poll keeps the last good ride** and says the update failed, because the
   API being briefly unreachable is not the same as the ride disappearing.
 
-`null` does **not** say which way the ride ended. The screen says "this ride is no
-longer active" and shows the last things it knew; calling it completed or cancelled
-would be a guess about somebody's money. Distinguishing them needs
-`GET /passengers/me/rides/:id`, which is a later milestone.
+`null` does **not** say which way the ride ended, so the tracker asks
+`GET /passengers/me/rides/:id` the moment it happens — see
+[Driving the ride](#driving-the-ride) — rather than guessing from an absence.
+
+### Calling a ride off
+
+While a request is still waiting for a driver, the passenger can cancel it:
+
+```
+POST /ride-requests/:id/cancel    { reason? }
+```
+
+`reason` is one of `CHANGED_MIND`, `WRONG_LOCATION`, `WAIT_TOO_LONG` or `OTHER`, and
+defaults to `OTHER`. Calling it also withdraws any dispatch offer outstanding for
+that ride, in the same transaction: a driver who was being asked about it is told it
+is gone rather than left answering a question that no longer has an answer.
+
+**It is allowed in exactly one state, and the client does not decide that.** The rule
+is the state machine's — `WAITING -> CANCELLED` is a transition, `MATCHED -> CANCELLED`
+is not — and the ride DTO publishes its answer as `cancellable`, computed by
+`isCancellable(status)`, which is `status === "WAITING"`. So the screen renders the
+control from that flag rather than from a status it would have to interpret.
+
+That distinction is not pedantry. A hand-written `status === "WAITING"` gives the same
+answer today and a worse one the moment the rule changes: the two versions drift, and
+the copy in the browser silently stops offering a cancel the server would allow — or
+offers one it will refuse. Rendering from the flag also means the button cannot be
+*wrong*, because the endpoint that would refuse the call is the one that set it.
+
+Two consequences that are handled rather than ignored:
+
+* **a `409` is not a failure.** It means a driver accepted in the moment between the
+  passenger opening the form and confirming, so the screen says exactly that instead
+  of "could not cancel", and the next poll re-renders without the control;
+* **after a success there is no new screen.** The tracker sets the ride to `null` and
+  reuses the terminal path it already had: the ride detail reports `CANCELLED`, the
+  reason is recorded, and polling stops.
+
+Verified end to end, from both directions:
+
+| Ride state | Cancel control | Direct API call |
+| ---------- | -------------- | --------------- |
+| `WAITING` | offered | `200`, ride becomes `CANCELLED` |
+| `MATCHED` | **absent** | `409` — the server refuses it |
 
 ### What is deliberately not here
 
 **No driver screens, no pooling screens, no history screen, no map, no realtime
-socket, no passenger or driver cancellation, no payment and no admin workflow.** The
-server supports all of them; this client calls only the passenger endpoints it needs.
-Two of those limitations were closed by the next milestone — see
-[The driver's console](#the-drivers-console) — and the rest still stand.
+socket, no driver-side cancellation, no payment and no admin workflow.** The server
+supports all of them; this client calls only the endpoints it needs. Two of those
+limitations were closed by later milestones — see
+[The driver's console](#the-drivers-console) and [Driving the ride](#driving-the-ride)
+— and the rest still stand.
+
+One limitation worth naming: the cancellation **reason is recorded but not shown
+back**. `findRideForPassenger` reads the column, and `toRideRequestDto` publishes it,
+but the ride *detail* DTO does not — so the finished screen says the ride was
+cancelled without echoing why. Adding it to the detail DTO is a one-line change plus a
+test, and belongs with the history milestone that will display it.
 
 Two more honest limitations. The client has **no test suite** — `npm run lint` and
 `npm run build` are its automated checks, and the server's 1123 tests are what pin
@@ -2534,8 +2581,10 @@ learn.
 
 ### What is deliberately not here
 
-**No cancellation.** A passenger cannot cancel a matched ride and a driver cannot call
-one off; the API refuses both, and this milestone does not add either.
+**No driver-side cancellation.** A driver cannot call off a ride they have accepted,
+and a passenger cannot call off one that has been matched — the API refuses both. (A
+passenger *can* cancel while the ride is still waiting; see
+[Calling a ride off](#calling-a-ride-off).)
 
 **No history.** Both roles have read APIs for the rides they have finished
 (`/passengers/me/rides`, `/drivers/me/rides`) and neither has a screen.
